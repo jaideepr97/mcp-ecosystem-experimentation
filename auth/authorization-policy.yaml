@@ -8,7 +8,11 @@ spec:
     - group: gateway.networking.k8s.io
       kind: Gateway
       name: mcp-gateway
+  action: DENY
   rules:
     - from:
         - source:
-            requestPrincipals: ["*"]
+            notRequestPrincipals: ["*"]
+      to:
+        - operation:
+            ports: ["8080"]

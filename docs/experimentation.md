@@ -848,6 +848,147 @@ The end-to-end pipeline is now fully automated. A user browses the catalog, depl
 
 ---
 
+## Phase 12: Replacing mini-oidc with Keycloak
+
+> **Goal**: Replace the custom mini-oidc provider with Keycloak as the sole OIDC identity provider, establishing a production-grade auth foundation while keeping the deployment minimal.
+
+### Motivation
+
+mini-oidc was built from scratch to learn how OIDC works — an explicitly educational decision that paid off (Phase 4). But for the next stage of the experiment (multi-tenancy, role-based tool access, token exchange), a real identity provider with user management, groups, client roles, and standards-compliant flows is needed. Keycloak is the upstream choice for the mcp-gateway project.
+
+### Evaluating mcp-gateway's existing Keycloak setup
+
+> **User instruction**: *"Wait before you fly through the keycloak installation. I would like to better understand what's getting applied for keycloak."*
+
+The mcp-gateway repo already has `make keycloak-install` with full automation. Before using it, we examined every resource it creates:
+
+1. **Realm import** — a ConfigMap containing a Keycloak realm JSON with pre-configured clients (one per test server), per-tool roles, user groups, and a test user. This was too broad — it bundled test infrastructure we don't need.
+
+2. **Deployment** — Keycloak 26.3 in dev mode with `--import-realm` to auto-load the realm on startup.
+
+3. **Gateway patch** — adds an HTTPS listener on port 8002 with TLS termination via cert-manager.
+
+4. **HTTPRoute** — routes traffic with an OAuth discovery path rewrite. Keycloak uses `/realms/mcp/.well-known/oauth-authorization-server` but the OAuth spec expects `/.well-known/oauth-authorization-server/realms/mcp`. The HTTPRoute rewrites the path. This is a Keycloak-specific quirk — its multi-realm URL structure predates RFC 8414 standardization.
+
+5. **TLSPolicy + ClusterIssuer** — Kuadrant TLSPolicy with a self-signed cert-manager ClusterIssuer.
+
+6. **Post-install steps** — extracts the TLS CA cert, bind-mounts it into the Kind node, configures the Kubernetes API server to trust Keycloak as an OIDC issuer, and restarts the API server. This was specific to the kubernetes-mcp-server use case.
+
+### Decision: minimal Keycloak, no TLS
+
+> **User question**: *"These make targets are all likely too broad for our use case right now. Is the Kuadrant CRD all that is needed to get Keycloak up?"*
+
+This led to the realization that TLS (via TLSPolicy) required both the full Kuadrant operator *and* cert-manager — a significant dependency chain just for HTTPS on a Kind cluster.
+
+> **User instruction**: *"Let's do that [skip TLS]. Though I do plan to ramp up to have TLS soon."*
+
+Rather than using `make keycloak-install` wholesale, we stripped it down:
+
+- **Skipped TLS entirely** — the TLSPolicy requires Kuadrant operator + cert-manager, neither of which were installed yet. For a Kind experiment, HTTP is sufficient. TLS will be layered in when Kuadrant is introduced for AuthPolicy.
+- **Stripped the realm** to bare minimum. The pre-built realm included 5 clients (one per test server), per-tool roles, groups, and a test user. The user questioned this:
+
+> *"Those 5 clients you mentioned earlier — are they just examples or do they really get created out of the box? I imagine we would only want to create clients as and when required."*
+
+> *"Let's not even create any users yet. So what is the final list of resources to be created?"*
+
+The final realm contains only the `mcp-gateway` confidential client (with `serviceAccountsEnabled` for client_credentials grant), plus the `groups` and `roles` client scopes. No users, no server-specific clients, no roles, no groups. These will be added as needed.
+- **Skipped API server OIDC config** — not needed for gateway authentication, only for the kubernetes-mcp-server integration.
+- **Used HTTP gateway listener** on port 8002 instead of HTTPS, avoiding the cert-manager dependency chain.
+
+### Integration issues encountered
+
+#### 1. AuthorizationPolicy blocks Keycloak traffic
+
+> **User question**: *"Why does Keycloak need a dedicated gateway listener but mini-oidc didn't need one?"*
+
+Because mini-oidc bypassed the gateway entirely via a direct NodePort, while Keycloak routes through the gateway for TLS termination (later) and the OAuth discovery path rewrite. This meant the existing Istio `AuthorizationPolicy` — an ALLOW rule requiring a valid JWT on all gateway traffic — now blocked Keycloak on port 8002. You can't require a token to reach the service that issues tokens.
+
+**Fix**: Changed from ALLOW to DENY semantics:
+
+```yaml
+# Before (ALLOW): only allow requests WITH a JWT — blocks everything else
+action: ALLOW
+rules:
+  - from:
+      - source:
+          requestPrincipals: ["*"]
+
+# After (DENY): deny requests WITHOUT a JWT, but only on port 8080
+action: DENY
+rules:
+  - from:
+      - source:
+          notRequestPrincipals: ["*"]
+    to:
+      - operation:
+          ports: ["8080"]
+```
+
+The ALLOW approach is a whitelist — anything not explicitly allowed is denied, including new listeners. The DENY approach is a blacklist — only unauthenticated MCP traffic (port 8080) is blocked, leaving other listeners (port 8002 for Keycloak) open by default. The net effect on MCP traffic is identical.
+
+**Learning**: When adding new gateway listeners, existing auth policies may need restructuring. An ALLOW policy that was fine for a single-listener gateway becomes a trap when you add a second listener. This is the kind of issue that would also surface in production when adding any new service behind the gateway.
+
+#### 2. Keycloak client_credentials grant requires serviceAccountsEnabled
+
+The initial realm had `directAccessGrantsEnabled: true` on the `mcp-gateway` client, which enables username/password token requests. But `client_credentials` grant (no user, just the client itself) requires `serviceAccountsEnabled: true` — a separate Keycloak setting. The token endpoint returned `"unauthorized_client"` until this was added.
+
+**Fix**: Added `"serviceAccountsEnabled": true` to the client config and redeployed Keycloak (realm is imported on startup, so a pod restart was needed).
+
+#### 3. Istio RequestAuthentication issuer mismatch
+
+Keycloak tokens use issuer `http://keycloak.127-0-0-1.sslip.io:8002/realms/mcp`. The existing `RequestAuthentication` pointed to mini-oidc's issuer. Istio rejected Keycloak tokens with "Jwt issuer is not configured."
+
+**Fix**: Updated the `jwtRules` to point to Keycloak's issuer and JWKS endpoint (using the in-cluster URL for JWKS: `http://keycloak.keycloak.svc.cluster.local/realms/mcp/protocol/openid-connect/certs`).
+
+### Resources created
+
+| Resource | Namespace | Purpose |
+|----------|-----------|---------|
+| Namespace `keycloak` | — | Isolation for Keycloak resources |
+| ConfigMap `realm-import` | keycloak | Minimal realm JSON (mcp-gateway client + scopes) |
+| Deployment `keycloak` | keycloak | Keycloak 26.3 dev mode, HTTP only |
+| Service `keycloak` | keycloak | ClusterIP :80 → :8080 |
+| Gateway patch | gateway-system | HTTP listener on port 8002 for `keycloak.127-0-0-1.sslip.io` |
+| HTTPRoute `keycloak-route` | keycloak | Routes to Keycloak with OAuth discovery path rewrite |
+
+### Resources removed
+
+> **User instruction**: *"Let's take down mini-oidc and whatever resources are associated with it. We don't need to run multiple OIDC providers."*
+
+| Resource | Reason |
+|----------|--------|
+| mini-oidc Deployment + Services | Replaced by Keycloak |
+| mini-oidc YAML from experiment repo | No longer part of the setup |
+
+### Resources modified
+
+| Resource | Change |
+|----------|--------|
+| `RequestAuthentication` | Removed mini-oidc issuer, added Keycloak issuer + JWKS |
+| `AuthorizationPolicy` | Changed from ALLOW to DENY, scoped to port 8080 only |
+
+### Verification
+
+```bash
+# Get token from Keycloak
+KC_TOKEN=$(curl -s -X POST http://keycloak.127-0-0-1.sslip.io:8002/realms/mcp/protocol/openid-connect/token \
+  -d 'grant_type=client_credentials&client_id=mcp-gateway&client_secret=secret' \
+  | python3 -c "import sys,json; print(json.load(sys.stdin)['access_token'])")
+
+# Initialize MCP session
+SESSION=$(curl -si -H "Authorization: Bearer $KC_TOKEN" ... initialize ... | grep mcp-session-id)
+
+# List tools — returns all 5 test-server1 tools
+curl -H "Authorization: Bearer $KC_TOKEN" -H "Mcp-Session-Id: $SESSION" ... tools/list
+# → test_server1_add_tool, test_server1_greet, test_server1_headers, test_server1_slow, test_server1_time
+
+# Unauthenticated request — denied
+curl http://mcp.127-0-0-1.sslip.io:8001/mcp
+# → RBAC: access denied
+```
+
+---
+
 ## Key Learnings
 
 1. **Istio is not a service mesh here** — only istiod is used, purely as a Gateway API controller that programs Envoy. No sidecars, no ambient mode.
@@ -875,6 +1016,14 @@ The end-to-end pipeline is now fully automated. A user browses the catalog, depl
 12. **Annotations are a clean extension mechanism for downstream features** — the gateway integration uses annotations (`mcp.x-k8s.io/gateway-ref`) rather than spec fields, avoiding upstream schema changes and merge conflicts. Combined with a separate controller, this pattern lets downstream forks add capabilities without touching the core reconciliation logic. The trade-off is discoverability — annotations are less visible than spec fields — but for optional, downstream-specific integrations, it's the right call.
 
 13. **Existing PRs may be out of sync but architecturally sound** — the gateway integration PR was written against an old flat spec schema but its design (separate controller, annotation-driven, status patches, owner references) was solid. Adapting it to the current nested spec was mechanical — the architecture translated directly. This suggests that reviewing PRs for design quality is more valuable than checking whether they apply cleanly.
+
+14. **ALLOW auth policies don't compose well with multiple gateway listeners** — an ALLOW-based AuthorizationPolicy that requires JWT on all traffic works for a single-listener gateway. Adding a second listener (Keycloak) breaks it because the new listener is implicitly denied. Switching to DENY semantics scoped to specific ports avoids this. In production, Kuadrant AuthPolicy handles this at a per-route level rather than a per-gateway level.
+
+15. **Strip upstream make targets down to what you need** — mcp-gateway's `make keycloak-install` bundles TLS, API server OIDC config, per-server clients, test users, and host patching. Most of this is irrelevant at the foundation stage. Understanding each resource before applying it prevents unnecessary dependencies (cert-manager, Kuadrant) from being pulled in prematurely.
+
+16. **Keycloak's realm import is a one-shot operation** — the `--import-realm` flag loads the realm JSON on first startup. Changes to the ConfigMap require a pod restart. This is fine for development but means realm evolution (adding users, clients, roles) should be done via the Keycloak admin API or UI once the instance is running, not by editing the ConfigMap.
+
+17. **Istio auth resources are all Envoy filters under the hood** — RequestAuthentication becomes a JWT authn filter, AuthorizationPolicy becomes an RBAC filter, EnvoyFilter injects Lua directly. They all end up as configuration in the same Envoy proxy, executed in order. Understanding this makes debugging auth issues much clearer — you're always debugging Envoy filter chain behavior, not three separate systems.
 
 ---
 

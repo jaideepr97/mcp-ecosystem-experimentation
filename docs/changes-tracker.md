@@ -89,12 +89,30 @@ Without at least one of these, every new MCP server added to the catalog is a po
   - Fixed MCPServerRegistration GVR from `mcp.kagenti.com` to `mcp.kuadrant.io` (in RBAC; handler code still has old value — potential issue when deploying via launcher)
 - **Why:** Needed a UI to demonstrate the catalog → deploy flow. The launcher's ConfigMap-based catalog backend doesn't integrate with the model-registry catalog API.
 
-## Deployment Artifacts Created (not in any repo)
+### Keycloak (replacing mini-oidc)
+- **No changes to upstream Keycloak image.** Deployed `quay.io/keycloak/keycloak:26.3` as-is in dev mode.
+- Created a stripped-down realm (`mcp`) with only the `mcp-gateway` confidential client and `groups`/`roles` client scopes. No users, no server-specific clients, no roles.
+- Exposed via HTTP through the gateway on port 8002 (no TLS — avoids cert-manager/Kuadrant dependency).
+- **Observation:** Keycloak's multi-realm URL structure (`/realms/mcp/.well-known/...`) predates RFC 8414, requiring an HTTPRoute path rewrite. This is a Keycloak-specific quirk, not a general OIDC issue.
+
+### Istio auth resources (modified for Keycloak)
+- **AuthorizationPolicy** changed from ALLOW to DENY semantics, scoped to port 8080 only. The original ALLOW rule blocked all non-JWT traffic across the entire gateway, including the Keycloak listener on port 8002. DENY + port scoping allows Keycloak traffic through while still requiring JWT for MCP requests.
+- **RequestAuthentication** updated to point to Keycloak's issuer (`http://keycloak.127-0-0-1.sslip.io:8002/realms/mcp`) and JWKS endpoint (in-cluster: `http://keycloak.keycloak.svc.cluster.local/realms/mcp/protocol/openid-connect/certs`). Mini-oidc issuer removed.
+- **EnvoyFilter** (Lua 401 challenge) — no changes needed, already scoped to port 8080 and not referencing any specific OIDC provider.
+- **Observation:** ALLOW-based auth policies don't compose well when adding new gateway listeners. Each new listener needs explicit exemption. DENY-based policies scoped to specific ports are more extensible.
+
+### mini-oidc (removed)
+- **Removed from cluster and experiment repo.** Replaced entirely by Keycloak.
+- mini-oidc served its purpose as an educational tool for understanding OIDC flows (Phase 4). For multi-tenancy and role-based access control, Keycloak provides the necessary user/group/role management.
+
+## Deployment Artifacts Created (in experiment repo)
 - PostgreSQL StatefulSet + PVC + Secret + Service in `catalog-system`
 - Catalog ConfigMap (`mcp-catalog-sources`) with sources.yaml + mcp-servers.yaml
 - Catalog Deployment + Service in `catalog-system`
 - Launcher RBAC (ServiceAccount, ClusterRole, ClusterRoleBinding)
 - Launcher Deployment + Service + NodePort in `mcp-test`
-- Mini-oidc Deployment + Services in `mcp-test`
+- Keycloak namespace + ConfigMap (realm-import) + Deployment + Service in `keycloak`
+- Gateway patch (HTTP listener on port 8002) + HTTPRoute for Keycloak
 - EnvoyFilter `mcp-auth-401` in `gateway-system`
 - RequestAuthentication `mcp-jwt-auth` in `gateway-system`
+- AuthorizationPolicy `mcp-require-jwt` in `gateway-system`

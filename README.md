@@ -1,6 +1,6 @@
 # MCP Ecosystem Experimentation
 
-A reproducible experiment exploring how four MCP ecosystem projects work together end-to-end: **discovery** (model-registry catalog), **deployment** (lifecycle operator), **routing** (mcp-gateway), and **authentication** (Istio + custom OIDC provider).
+A reproducible experiment exploring how four MCP ecosystem projects work together end-to-end: **discovery** (model-registry catalog), **deployment** (lifecycle operator), **routing** (mcp-gateway), and **authentication** (Keycloak + Istio).
 
 ## Acknowledgements
 
@@ -118,12 +118,22 @@ curl -s http://localhost:8080/api/mcp_catalog/v1alpha1/mcp_servers | python3 -m 
 kill %1
 ```
 
-### Step 4: Authentication layer
-
-Deploy the OIDC provider and Istio auth resources:
+### Step 4: Keycloak (OIDC provider)
 
 ```bash
-kubectl apply -f mini-oidc/mini-oidc.yaml
+kubectl create namespace keycloak
+kubectl apply -f keycloak/realm-import.yaml
+kubectl apply -f keycloak/deployment.yaml
+kubectl patch gateway mcp-gateway -n gateway-system --type json -p "$(cat keycloak/gateway-patch.json)"
+kubectl apply -f keycloak/httproute.yaml
+
+# Wait for Keycloak to be ready (can take 30-60s)
+kubectl wait --for=condition=Ready pod -l app=keycloak -n keycloak --timeout=120s
+```
+
+Then apply the Istio auth resources:
+
+```bash
 kubectl apply -f auth/request-authentication.yaml
 kubectl apply -f auth/authorization-policy.yaml
 kubectl apply -f auth/envoyfilter-401.yaml
@@ -152,18 +162,28 @@ Or use the launcher's YAML editor to deploy interactively.
 |---------|-----|-------------|
 | MCP Gateway | http://mcp.127-0-0-1.sslip.io:8001/mcp | Envoy gateway (authenticated) |
 | MCP Launcher | http://localhost:8004 | Catalog UI + deployment |
-| Mini-OIDC | http://localhost:8003 | OIDC provider (token issuance) |
+| Keycloak | http://keycloak.127-0-0-1.sslip.io:8002 | OIDC provider (admin: admin/admin) |
+| Keycloak OIDC Discovery | http://keycloak.127-0-0-1.sslip.io:8002/realms/mcp/.well-known/openid-configuration | Realm endpoints |
 
 ### Quick test
 
 ```bash
-# Get a token from mini-oidc
-TOKEN=$(curl -s http://localhost:8003/token | python3 -c "import sys,json; print(json.load(sys.stdin)['access_token'])")
+# Get a token from Keycloak
+TOKEN=$(curl -s -X POST http://keycloak.127-0-0-1.sslip.io:8002/realms/mcp/protocol/openid-connect/token \
+  -d 'grant_type=client_credentials&client_id=mcp-gateway&client_secret=secret' \
+  | python3 -c "import sys,json; print(json.load(sys.stdin)['access_token'])")
+
+# Initialize an MCP session
+SESSION=$(curl -si -H "Authorization: Bearer $TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-03-26","capabilities":{},"clientInfo":{"name":"test","version":"1.0"}}}' \
+  http://mcp.127-0-0-1.sslip.io:8001/mcp | grep -i mcp-session-id | awk '{print $2}' | tr -d '\r')
 
 # List tools through the gateway
 curl -s -H "Authorization: Bearer $TOKEN" \
+  -H "Mcp-Session-Id: $SESSION" \
   -H "Content-Type: application/json" \
-  -d '{"jsonrpc":"2.0","id":1,"method":"tools/list"}' \
+  -d '{"jsonrpc":"2.0","id":2,"method":"tools/list"}' \
   http://mcp.127-0-0-1.sslip.io:8001/mcp
 ```
 
@@ -171,7 +191,7 @@ curl -s -H "Authorization: Bearer $TOKEN" \
 
 ```
 ├── docs/
-│   ├── experimentation.md         # Full experiment narrative (Phases 1-11)
+│   ├── experimentation.md         # Full experiment narrative (Phases 1-12)
 │   ├── changes-tracker.md         # Code changes + friction points
 │   └── diagrams/
 │       ├── component-architecture.mermaid  # Cluster component map
@@ -182,12 +202,15 @@ curl -s -H "Authorization: Bearer $TOKEN" \
 │   ├── postgres.yaml              # PostgreSQL backend
 │   ├── catalog-sources.yaml       # MCP server definitions
 │   └── catalog.yaml               # Catalog API deployment
+├── keycloak/                      # keycloak namespace
+│   ├── realm-import.yaml              # Minimal realm (mcp-gateway client + scopes)
+│   ├── deployment.yaml                # Keycloak 26.3 dev mode + Service
+│   ├── gateway-patch.json             # HTTP listener on port 8002
+│   └── httproute.yaml                 # Routes with OAuth discovery path rewrite
 ├── auth/                          # gateway-system namespace
-│   ├── request-authentication.yaml
-│   ├── authorization-policy.yaml
-│   └── envoyfilter-401.yaml
-├── mini-oidc/                     # mcp-test namespace
-│   └── mini-oidc.yaml
+│   ├── request-authentication.yaml    # JWT validation (Keycloak issuer)
+│   ├── authorization-policy.yaml      # DENY unauthenticated on port 8080
+│   └── envoyfilter-401.yaml           # Lua 401 + WWW-Authenticate response
 ├── launcher/                      # mcp-test namespace
 │   ├── rbac.yaml
 │   └── deployment.yaml
@@ -206,7 +229,7 @@ Pre-built images are available on quay.io:
 |-------|--------|
 | `quay.io/jrao/mcp-launcher:catalog-api` | [mcp-launcher](https://github.com/matzew/mcp-launcher) fork, branch `catalog-api-integration` — adds catalog REST API backend |
 | `quay.io/jrao/mcp-lifecycle-operator:gateway-integration` | [mcp-lifecycle-operator](https://github.com/kubernetes-sigs/mcp-lifecycle-operator) fork, branch `gateway-integration` — adds gateway controller for automatic HTTPRoute/MCPServerRegistration creation |
-| `quay.io/jrao/mini-oidc:latest` | Custom lightweight OIDC provider with OAuth 2.1 + PKCE support |
+| `quay.io/keycloak/keycloak:26.3` | Upstream Keycloak OIDC provider (no custom build) |
 
 ## Key findings
 
@@ -218,4 +241,4 @@ The experiment surfaced several integration friction points documented in detail
 
 3. **The annotation-based gateway integration pattern works well** — using `mcp.x-k8s.io/gateway-ref` annotations on MCPServer CRs avoids upstream spec changes while enabling automatic gateway registration.
 
-See [docs/experimentation.md](docs/experimentation.md) for the full narrative including the auth layer investigation (Istio 403 vs OAuth 401), the OIDC/PKCE flow, and the architectural evolution.
+See [docs/experimentation.md](docs/experimentation.md) for the full narrative including the auth layer investigation (Istio 403 vs OAuth 401), the OIDC/PKCE flow, the Keycloak migration, and the architectural evolution.
