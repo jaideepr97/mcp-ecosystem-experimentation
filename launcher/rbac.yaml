@@ -1,0 +1,39 @@
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: mcp-launcher
+  namespace: mcp-test
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: mcp-launcher
+rules:
+  - apiGroups: [""]
+    resources: [configmaps]
+    verbs: [get, list, create, delete]
+  - apiGroups: [""]
+    resources: [secrets]
+    verbs: [get, list, create, delete]
+  - apiGroups: [mcp.x-k8s.io]
+    resources: [mcpservers]
+    verbs: [get, list, watch, create, update, delete]
+  - apiGroups: [""]
+    resources: [serviceaccounts]
+    verbs: [list]
+  - apiGroups: [""]
+    resources: [namespaces]
+    verbs: [list]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: mcp-launcher
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: mcp-launcher
+subjects:
+  - kind: ServiceAccount
+    name: mcp-launcher
+    namespace: mcp-test

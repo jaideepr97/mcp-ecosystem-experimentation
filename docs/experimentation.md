@@ -1,0 +1,905 @@
+# MCP Ecosystem Experimentation
+
+A chronological record of an incremental, AI-assisted experiment exploring the MCP Gateway and MCP Lifecycle Operator projects — from initial analysis through deployment, request tracing, authentication, and OAuth integration with MCP Inspector.
+
+This document captures both the technical outcomes and the learning process: what the user asked at each step, how they scoped and directed the exploration, where they pushed back or changed direction, and how AI-assisted iteration allowed them to build deep understanding of complex distributed systems without prior expertise in every component.
+
+---
+
+## Phase 1: Project Analysis
+
+> **User instruction**: *"Are you able to look at the mcp-lifecycle-operator and the mcp-gateway projects in this directory? Do a cursory scan of both and talk about how they might be able to work together."*
+
+This was deliberately open-ended. The user had both project repositories locally and wanted a high-level read on how they related before investing time in either. No specific files or focus areas were specified — the intent was to see what an AI could extract from a cold scan and whether it would identify the integration points the user suspected existed.
+
+### What came back
+
+**mcp-lifecycle-operator**: A Kubebuilder-based Kubernetes operator that manages MCP server lifecycle via an `MCPServer` CRD (`mcp.x-k8s.io/v1alpha1`). For each MCPServer CR, the operator reconciles a Deployment and Service. Key file: `internal/controller/mcpserver_controller.go`.
+
+**mcp-gateway**: An Envoy-based gateway for Model Context Protocol servers. Single binary (`mcp-broker-router`) with three components:
+
+- **Router** — Envoy external processor (ext_proc gRPC on :50051). Parses MCP JSON-RPC requests, strips tool prefixes, rewrites `:authority` headers to steer Envoy routing.
+- **Broker** — HTTP service (:8080 /mcp). Handles `initialize` and `tools/list` by aggregating tools from multiple upstream MCP servers. Not touched during `tools/call`.
+- **Controller** — Watches `MCPServerRegistration` CRDs, discovers backends via HTTPRoutes, writes config.
+
+Custom CRDs: `MCPServerRegistration`, `MCPVirtualServer`, `MCPGatewayExtension` (all `mcp.kuadrant.io/v1alpha1`).
+
+**Integration point**: The lifecycle operator deploys MCP server pods. The gateway federates and routes to them. The bridge between the two is an HTTPRoute (pointing to the operator-created Service) and an MCPServerRegistration (registering the server with the gateway's broker/router). This confirmed the user's hypothesis — the two projects have a clean boundary with Gateway API resources as the glue.
+
+---
+
+## Phase 2: Bare-Minimum Deployment on Kind
+
+> **User instruction**: *"Can you spin up a kind cluster, and then deploy the operator on it along with a very simple mcp server? Also deploy the required gateway resources in the simplest deployment pattern possible such that the mcp server is accessible via the gateway. Ignore any non-basic features for either project, I am only interested in getting something absolutely bare minimum running."*
+
+The user was explicit about minimalism. Both projects have extensive feature sets (auth, virtual servers, Redis, scaling), but the user wanted the absolute simplest path to a working setup before layering complexity. This turned out to be important — even the "bare minimum" involved a significant number of moving parts, and each one surfaced a learning opportunity.
+
+### Infrastructure setup
+
+Used mcp-gateway's Makefile targets with `CONTAINER_ENGINE=podman`:
+
+1. `make tools` — installed helm, kind, kustomize, yq, istioctl, controller-gen to `./bin/`
+2. `make kind-create-cluster` — created "mcp-gateway" Kind cluster with port mappings (hostPort 8001 -> nodePort 30080, etc.)
+3. `make gateway-api-install` — Gateway API CRDs
+4. `make istio-install` — Istio via Sail operator (only istiod — NOT a service mesh, just a Gateway API provider)
+5. `make metallb-install` — MetalLB for LoadBalancer IPs in Kind
+6. `make build-and-load-image` — built and loaded mcp-gateway + mcp-controller images
+7. `make deploy-gateway` — deployed Istio Gateway + NodePort service
+8. `make deploy` — deployed CRDs + controller
+
+### Issues encountered along the way
+
+These were unplanned but highly educational. Each failure forced a deeper understanding of the underlying system.
+
+- **Podman machine not running**: `Cannot connect to Podman` — fixed with `podman machine start`. Trivial, but a reminder that podman's machine-based architecture differs from Docker's daemon model.
+- **Insufficient memory (2GB)**: istiod stuck in Pending with `Insufficient memory` — fixed by stopping podman machine, setting `--memory 8192`, restarting, and recreating the Kind cluster. Revealed that Istio's control plane has non-trivial resource requirements even in dev.
+- **Operator image name**: `localhost/controller:latest` failed to pull inside Kind node (localhost treated as a registry URL) — retagged to `docker.io/mcp-lifecycle/controller:latest` and loaded via `podman save` + `kind load image-archive`. Revealed that "localhost" means something different inside a Kind node's container runtime vs on the host.
+- **ImagePullPolicy Always for `:latest` tags**: Both operator and MCP server images — Kubernetes defaults to `Always` for `:latest`. Fixed by patching deployments with `imagePullPolicy: IfNotPresent`. A subtle Kubernetes convention that bites everyone working with pre-loaded images in Kind.
+- **MCP server container args**: `args: ["--http", "0.0.0.0:9090"]` overrode the Dockerfile's CMD entirely because Kubernetes `args` replaces Docker CMD, not appends to it. Error: `exec: "--http": executable file not found in $PATH`. Fixed by including the binary: `args: ["/mcp-test-server", "--http", "0.0.0.0:9090"]`. The distinction between Docker's CMD/ENTRYPOINT and Kubernetes' command/args was a concrete learning.
+
+### Deploying the operator and MCP server
+
+Applied an MCPServer CR using mcp-gateway's test-server1 image, then wired it into the gateway with an HTTPRoute and MCPServerRegistration:
+
+```yaml
+apiVersion: mcp.kuadrant.io/v1alpha1
+kind: MCPServerRegistration
+metadata:
+  name: operator-server
+  namespace: mcp-test
+spec:
+  toolPrefix: op_
+  targetRef:
+    group: gateway.networking.k8s.io
+    kind: HTTPRoute
+    name: operator-server-route
+```
+
+### Result
+
+Successfully accessed the MCP server through the gateway at `http://mcp.127-0-0-1.sslip.io:8001/mcp`. Tools appeared with `op_` prefix (e.g., `op_hi`, `op_time`). At this point the user had a working end-to-end setup but no understanding of how the request actually moved through all these components.
+
+---
+
+## Phase 3: Understanding the Request Flow
+
+> **User instruction**: *"Now walk me through every resource that didn't exist on the cluster before you applied it for the gateway to work. We can then walk through how a client request touches all of them before ending up at the mcp server service."*
+
+This was the pivotal learning phase. The user had a working system but wanted to understand every component and its role. The request was structured as a two-part ask: first inventory everything, then trace the request path.
+
+### Follow-up questions
+
+After the initial walkthrough, the user asked a series of targeted follow-up questions. Each one peeled back a layer:
+
+> *"http://mcp.127-0-0-1.sslip.io:8001/mcp — what does this endpoint point to?"*
+
+The user wanted to understand the full chain from the URL to the actual pod. This revealed the Kind port mapping -> NodePort -> Envoy -> Broker chain.
+
+> *"What exactly is Envoy and what is its relationship to the Gateway and Istio?"*
+
+The user realized they were conflating three things (the Gateway resource, Envoy the proxy, and Istio the controller) and needed them disentangled. The answer clarified that Gateway is declarative config, Envoy is the runtime data plane, and Istio is the control plane that translates one into the other.
+
+> *"Can you create a diagram that shows the request path going through all these components? Make sure that component relationships are also appropriately highlighted in the process."*
+
+The user wanted a visual. A Mermaid diagram was created (`mcp-gateway-request-flow.html`).
+
+> *"Can you update your diagram such that every box where the request physically touches is highlighted in some sense? So I can be clear on which components fall directly into the path of the request and which components exist to enable/manage these line of sight components."*
+
+A refinement — the user realized the first diagram didn't distinguish between components the request bytes flow through (data path) and components that configure/manage those components (control plane). The updated diagram used:
+- **Pink with thick borders** for data path components
+- **Gray** for control plane components
+- **Numbered solid arrows (1-6)** for the tools/call request path
+- **Dashed arrows** for control plane relationships
+
+> *"For the initialize path, presumably the flow is the same until it gets to the broker instead of router, then the broker speaks directly with the mcp server to get its tool list? And then how does it return this information?"*
+
+Testing a mental model. This revealed the key architectural insight: for `tools/call`, the Router rewrites `:authority` and Envoy routes directly to the upstream (Broker is never touched). For `initialize`/`tools/list`, the Router leaves `:authority` unchanged and Envoy routes to the Broker, which aggregates responses.
+
+> *"Is it safe to say that the number of HTTPRoutes in the system depend on the number of listeners in the gateway?"*
+
+Checking a generalization. The answer corrected the user — HTTPRoutes depend on the number of backends, not listeners. Multiple HTTPRoutes can attach to the same listener, distinguished by hostname.
+
+> *"How does the router know to pick the correct one?"*
+
+Understanding the routing decision. The Router reads the tool name prefix, looks up the corresponding MCPServerRegistration config, and sets `:authority` to that upstream's HTTPRoute hostname.
+
+> *"And what is the role of ReferenceGrant and MCPGatewayExtension here?"*
+
+Filling in the gaps — understanding cross-namespace permissions (ReferenceGrant) and how the controller knows which Gateway to attach to (MCPGatewayExtension).
+
+> *"Is this a very simplistic arrangement of these things? How close is this to a production setup on say an OpenShift AI cluster?"*
+
+Zooming out for perspective. The answer covered what production adds: TLS, auth (Kuadrant + Keycloak), multiple MCP server registrations, Redis for session caching, horizontal scaling, and monitoring.
+
+> *"What is MetalLB?"*
+
+Asked separately when it came up in conversation. MetalLB is needed specifically in bare-metal/Kind environments to assign IPs to LoadBalancer Services — without it, the Gateway stays in Pending and never reaches `Programmed: True`.
+
+### Resources involved
+
+| Resource | Namespace | Role |
+|----------|-----------|------|
+| Gateway `mcp-gateway` | gateway-system | Declares listeners (mcp, mcps). Istio reads this to program Envoy. |
+| Service `mcp-gateway-np` (NodePort) | gateway-system | Receives external traffic: hostPort 8001 -> nodePort 30080 -> port 8080 |
+| Envoy pod `mcp-gateway-istio` | gateway-system | L7 proxy. Programmed by Istio via xDS. Runs ext_proc filter. |
+| EnvoyFilter | gateway-system | Tells Istio to inject ext_proc filter into Envoy's chain |
+| ReferenceGrant | gateway-system | Permits cross-namespace Gateway reference from MCPGatewayExtension |
+| istiod | istio-system | Watches Gateway/HTTPRoute resources, programs Envoy |
+| MCPGatewayExtension | mcp-system | Declares: attach broker/router to Gateway's mcp listener |
+| HTTPRoute `mcp-gateway-route` | mcp-system | Routes `mcp.127-0-0-1.sslip.io` -> mcp-gateway:8080 (broker) |
+| Service `mcp-gateway` | mcp-system | Exposes broker (:8080) and router (:50051) |
+| Secret `mcp-gateway-config` | mcp-system | Upstream server list. Controller writes, broker reads. |
+| mcp-controller | mcp-system | Watches MCPServerRegistration, writes config |
+| MCPServerRegistration | mcp-test | Registers upstream with prefix, references HTTPRoute |
+| HTTPRoute `operator-server-route` | mcp-test | Routes `operator-server.mcp.local` -> operator-server:9090 |
+| Service `operator-server` | mcp-test | ClusterIP :9090 (created by lifecycle operator) |
+| MCP server pod | mcp-test | test-server1 container, handles tools/call |
+| MetalLB | metallb-system | Assigns LoadBalancer IP so Gateway reaches Programmed: True |
+
+### Request path for `tools/call op_greet`
+
+```
+Client (localhost:8001)
+  -> Kind nodePort 30080
+  -> NodePort Service -> Envoy pod (:8080)
+  -> ext_proc filter calls Router (gRPC :50051)
+  -> Router: parses JSON-RPC, strips "op_" prefix, sets :authority = operator-server.mcp.local
+  -> Returns to Envoy with modified headers
+  -> Envoy route matches on new :authority -> operator-server:9090
+  -> MCP server pod handles "greet" (prefix stripped)
+```
+
+---
+
+## Phase 4: Adding Authentication (JWT/OIDC)
+
+> **User instruction**: *"Let's step this up a bit and try to bring authn/authz into the fold. What is the simplest modification we can make to this current setup to simulate a functional OIDC/OAuth2 based auth workflow? Maybe update the fake MCP server to require an OIDC/OAuth token and set up a barebones OIDC provider? We can leave token exchange out for now."*
+
+This was a deliberate scope escalation — the user had understood the basic flow and wanted to add the next layer of real-world complexity. The instruction was explicit about leaving token exchange out; the user wanted to learn one thing at a time.
+
+### Scope decision: Rejecting the production auth stack
+
+The initial AI proposal was to install cert-manager, Kuadrant operator (Authorino), and Keycloak — the mcp-gateway's production auth stack. The user pushed back:
+
+> *"Before we jump to setting up full-blown Keycloak — can we not just set up a lightweight OIDC provider of our own? I simply want to understand the flow for now."*
+
+This was a key scoping decision. The user didn't want to learn "how to deploy Keycloak" — they wanted to understand "what does an OIDC provider actually do in this flow." Building one from scratch (even a minimal one) would teach far more than deploying a black box. This turned out to be one of the most valuable decisions in the experiment.
+
+### Custom OIDC provider: mini-oidc
+
+Built a lightweight OIDC provider in Go (`/Users/jrao/projects/mini-oidc/main.go`):
+
+- Generates RSA 2048-bit key pair at startup
+- Serves OIDC discovery at `/.well-known/openid-configuration`
+- Serves JWKS at `/jwks`
+- Issues RS256 JWTs with configurable issuer/audience
+- Simple `/token` endpoint for quick token issuance
+- Two env vars: `ISSUER` (internal URL for JWT `iss` claim) and `EXTERNAL_URL` (browser-reachable URL for discovery endpoints)
+
+### Istio-native JWT validation
+
+Used Istio's built-in resources (no Kuadrant needed):
+
+**RequestAuthentication** — tells Envoy how to validate JWTs:
+
+```yaml
+apiVersion: security.istio.io/v1
+kind: RequestAuthentication
+metadata:
+  name: mcp-jwt-auth
+  namespace: gateway-system
+spec:
+  targetRefs:
+  - group: gateway.networking.k8s.io
+    kind: Gateway
+    name: mcp-gateway
+  jwtRules:
+  - issuer: "http://mini-oidc.mcp-test.svc.cluster.local:9090"
+    jwksUri: "http://mini-oidc.mcp-test.svc.cluster.local:9090/jwks"
+    forwardOriginalToken: true
+```
+
+**AuthorizationPolicy** — requires a valid JWT principal, exempts `.well-known` endpoints:
+
+```yaml
+apiVersion: security.istio.io/v1
+kind: AuthorizationPolicy
+metadata:
+  name: mcp-require-jwt
+  namespace: gateway-system
+spec:
+  action: ALLOW
+  targetRefs:
+  - group: gateway.networking.k8s.io
+    kind: Gateway
+    name: mcp-gateway
+  rules:
+  - from:
+    - source:
+        requestPrincipals: ["*"]
+  - to:
+    - operation:
+        paths: ["/.well-known/*"]
+```
+
+### Result
+
+- 403 without token (RBAC: access denied)
+- 401 with bad/expired token
+- 200 with valid JWT from mini-oidc
+
+### Issue discovered: JWKS caching
+
+When mini-oidc restarts (regenerating RSA keys), Envoy continues using cached JWKS. Debugging revealed that Istio fetches JWKS once and bakes it as `local_jwks` inline in the Envoy config — it doesn't refetch dynamically. Fix: restart istiod + Envoy pod to force JWKS refresh. This is a known operational consideration — in production, OIDC providers persist their keys across restarts.
+
+---
+
+## Phase 5: MCP Inspector Integration (OAuth 2.1 + PKCE)
+
+> **User instruction**: *"How do I test this flow via the MCP Inspector as client?"*
+
+This question exposed a significant gap. MCP Inspector implements the full MCP auth spec (OAuth 2.1 with authorization code + PKCE), but mini-oidc only had a simple token endpoint. When asked whether to extend mini-oidc to support the full flow, the user confirmed:
+
+> *"Yes."*
+
+### Extended mini-oidc
+
+Added the following to support the full MCP auth spec:
+
+- **Authorization endpoint** (`/authorize`): GET shows HTML approve page, POST generates auth code and redirects with `?code=...&state=...`
+- **PKCE support**: S256 code challenge validation on token exchange
+- **Dynamic Client Registration** (`/register`): RFC 7591 — accepts client metadata, returns `client_id`. MCP Inspector uses this to register itself before starting the auth flow.
+- **OAuth AS metadata** (`/.well-known/oauth-authorization-server`): Same as OIDC discovery, needed by some OAuth clients.
+- **CORS middleware**: All endpoints wrapped with `Access-Control-Allow-Origin: *` for browser-based clients.
+
+Building these from scratch (rather than deploying Keycloak) meant each endpoint's purpose was understood concretely. PKCE in particular became tangible — it's not an abstract spec when you're writing the SHA256 verification yourself.
+
+### Exposing mini-oidc externally
+
+#### Failed approach: Through the gateway
+
+Attempted to route mini-oidc traffic through Envoy by adding an `oidc` listener to the Gateway and an HTTPRoute for `oidc.127-0-0-1.sslip.io`. This resulted in 404s.
+
+**Root cause**: The ext_proc (Router) unconditionally rewrites the `:authority` header on ALL requests arriving on port 8080 to the MCP gateway hostname — this happens in `HandleRequestHeaders()` before Envoy does route matching. Non-MCP traffic gets its host rewritten and 404s.
+
+```go
+// internal/mcp-router/request_handlers.go:198
+func (s *ExtProcServer) HandleRequestHeaders(_ *eppb.HttpHeaders) ([]*eppb.ProcessingResponse, error) {
+    requestHeaders := NewHeaders()
+    requestHeaders.WithAuthority(s.RoutingConfig.MCPGatewayExternalHostname)  // always rewrites
+    return response.WithRequestHeadersReponse(requestHeaders.Build()).Build(), nil
+}
+```
+
+This was a valuable debugging exercise — it required reading the Envoy config dump, comparing virtual host domains, and tracing through the ext_proc code to find the root cause. The insight was architectural: ext_proc operates on the entire port, not per-listener. Anything sharing that port gets processed by the Router.
+
+#### Working approach: Separate NodePort
+
+Exposed mini-oidc directly via a NodePort service (port 30471 -> host port 8003), bypassing Envoy entirely. mini-oidc accessible at `http://localhost:8003`.
+
+### Broker configuration
+
+Set `OAUTH_AUTHORIZATION_SERVERS=http://localhost:8003` on the broker so it serves OAuth protected resource metadata at `/.well-known/oauth-protected-resource`.
+
+---
+
+## Phase 6: The 401 vs 403 Problem
+
+When MCP Inspector was first tested, it returned error `-32001` (request timeout) before any OAuth flow started. This led to one of the most interesting discoveries in the experiment.
+
+### Problem chain
+
+1. MCP Inspector POSTs to `/mcp` without a token
+2. Istio's AuthorizationPolicy returns **403** with body "RBAC: access denied"
+3. MCP Inspector doesn't recognize 403 as an auth challenge — it expects **401** with a `WWW-Authenticate` header per RFC 6750
+4. Inspector retries until timeout (-32001)
+
+### User question: Is this a limitation of our custom setup?
+
+> *"Is this a limitation of using our custom OIDC provider/auth setup?"*
+
+The answer: no. This is a limitation of **Istio's AuthorizationPolicy** — it would be the same with Keycloak or any OIDC provider. The issue is at the gateway enforcement layer, not the identity provider.
+
+### User follow-up: Is this an intentional design decision?
+
+> *"Can you look through Envoy/Istio code/docs to see if this is an intentional design decision?"*
+
+The user wanted to know if this was a bug, a configuration gap, or a deliberate choice — because the answer determines whether to file an issue, work around it, or accept it.
+
+**Finding**: Confirmed as intentional by Istio maintainer Yangmin Zhu in [istio/istio#26559](https://github.com/istio/istio/issues/26559), closed as "working as designed":
+
+- **RequestAuthentication** validates JWTs but **allows requests with no token** (no token = nothing to validate). Returns 401 only for *invalid* tokens.
+- **AuthorizationPolicy** checks for principals. When no token was provided, no principal is set, so the ALLOW rule doesn't match. The RBAC filter **always returns 403** — this is hardcoded in Envoy with no configuration to change it.
+
+This is a strict authn/authz separation: authentication asks "is the token valid?" while authorization asks "is the principal allowed?" Semantically correct for RBAC, but incompatible with OAuth's expectation of 401 for "not yet authenticated."
+
+### User follow-up: How is this solved in production? Should this be raised?
+
+> *"How would this issue need to be solved in production? Is this something that should be raised?"*
+
+This question was about whether a real gap had been found worth reporting. It turned out the mcp-gateway team already solved this — they use **Kuadrant's AuthPolicy** (backed by Authorino), which acts as an external authorization server via Envoy's `ext_authz` protocol. AuthPolicy gives full control over the denial response, including custom status codes and headers. No issue needed — just a gap in the minimal setup caused by skipping Kuadrant.
+
+### User direction on the fix
+
+> *"Yeah, proceed with the light one for now."*
+
+The user accepted the Lua EnvoyFilter approach as a lightweight substitute for Kuadrant. The filter checks for Bearer tokens and returns a proper 401 with `WWW-Authenticate` header:
+
+```yaml
+apiVersion: networking.istio.io/v1alpha3
+kind: EnvoyFilter
+metadata:
+  name: mcp-auth-401
+  namespace: gateway-system
+spec:
+  workloadSelector:
+    labels:
+      gateway.networking.k8s.io/gateway-name: mcp-gateway
+  configPatches:
+  - applyTo: HTTP_FILTER
+    match:
+      context: GATEWAY
+      listener:
+        portNumber: 8080
+        filterChain:
+          filter:
+            name: envoy.filters.network.http_connection_manager
+            subFilter:
+              name: envoy.filters.http.router
+    patch:
+      operation: INSERT_BEFORE
+      value:
+        name: envoy.filters.http.lua
+        typed_config:
+          "@type": type.googleapis.com/envoy.extensions.filters.http.lua.v3.Lua
+          inline_code: |
+            function envoy_on_request(request_handle)
+              local path = request_handle:headers():get(":path")
+              local auth = request_handle:headers():get("authorization")
+              if path and path:find("^/.well%-known") then return end
+              local method = request_handle:headers():get(":method")
+              if method == "OPTIONS" then return end
+              if path and path:find("^/mcp") and (not auth or not auth:find("^Bearer ")) then
+                request_handle:respond(
+                  {
+                    [":status"] = "401",
+                    ["WWW-Authenticate"] = 'Bearer resource_metadata="http://mcp.127-0-0-1.sslip.io:8001/.well-known/oauth-protected-resource"',
+                    ["content-type"] = "application/json",
+                    ["access-control-allow-origin"] = "*",
+                    ["access-control-allow-headers"] = "Content-Type, Authorization",
+                    ["access-control-allow-methods"] = "GET, POST, OPTIONS"
+                  },
+                  '{"error":"Unauthorized","message":"Authentication required."}'
+                )
+              end
+            end
+```
+
+### Result
+
+All three scenarios work:
+- No token -> 401 Unauthorized with `WWW-Authenticate` header
+- `.well-known` endpoints -> 200 (no auth required)
+- Valid token -> 200 with MCP response
+
+---
+
+## Phase 7: End-to-End OAuth Flow via MCP Inspector
+
+MCP Inspector was pointed at `http://mcp.127-0-0-1.sslip.io:8001/mcp`. The complete flow worked:
+
+1. Inspector hits `/mcp` -> gets **401** with `WWW-Authenticate: Bearer resource_metadata="..."`
+2. Discovers auth server at `http://localhost:8003` via `/.well-known/oauth-protected-resource`
+3. Fetches `http://localhost:8003/.well-known/oauth-authorization-server` -> discovers endpoints
+4. Calls `/register` (RFC 7591 Dynamic Client Registration) -> gets `client_id`
+5. Redirects browser to `/authorize` with PKCE challenge
+6. User sees mini-oidc approve page, clicks "Approve"
+7. mini-oidc generates auth code, redirects back with `?code=...&state=...`
+8. Inspector exchanges auth code for JWT at `/token` with PKCE code_verifier
+9. mini-oidc validates PKCE, issues RS256 JWT
+10. Inspector sends authenticated requests -> Envoy validates JWT -> tools list returned
+
+> *User confirmation*: *"No other error, after redirection I could click on list tools."*
+
+### Token exchange discussion
+
+> **User question**: *"What if the MCP server required a special token? I assume this would be the token exchange case?"*
+
+This was a forward-looking question — having understood the basic auth flow, the user wanted to understand the next tier of complexity. Three tiers were identified:
+
+1. **Static API key swap**: MCPServerRegistration `credentialRef` points to a Secret. Router sets `x-mcp-api-key` header. Already built into mcp-gateway.
+2. **OAuth Token Exchange (RFC 8693)**: Kuadrant AuthPolicy pipeline — validate client token, try Vault for stored credentials, fall back to OAuth token exchange with Keycloak (swap broad-scope client token for server-scoped token with `audience` set to the target server). The gateway handles the exchange transparently; the client never needs to know about upstream auth requirements.
+3. **Cross-IDP federation**: Out of scope for mcp-gateway's phase 1.
+
+---
+
+## Architecture Summary
+
+### Components on the cluster
+
+```
+Kind Node (mcp-gateway)
+|
++-- gateway-system namespace
+|   +-- Envoy pod (mcp-gateway-istio) — L7 proxy, data path
+|   +-- NodePort Service (30080 -> 8080) — external ingress
+|   +-- Gateway resource — declarative listener config
+|   +-- ReferenceGrant — cross-namespace permissions
+|   +-- RequestAuthentication — JWT validation rules
+|   +-- EnvoyFilter (ext_proc) — injects Router into Envoy
+|   +-- EnvoyFilter (Lua) — 401 auth challenge for unauthenticated requests
+|
++-- istio-system namespace
+|   +-- istiod — programs Envoy via xDS
+|
++-- mcp-system namespace
+|   +-- mcp-gateway pod (broker + router + controller)
+|   +-- MCPGatewayExtension — attaches to Gateway
+|   +-- HTTPRoute (mcp-gateway-route) — routes to broker
+|   +-- Secret (config) — upstream server list
+|
++-- mcp-test namespace
+|   +-- operator-server pod (test MCP server, created by lifecycle operator)
+|   +-- operator-server Service (created by lifecycle operator)
+|   +-- MCPServer CR (lifecycle operator input)
+|   +-- MCPServerRegistration (gateway registration)
+|   +-- HTTPRoute (operator-server-route)
+|   +-- mini-oidc pod (custom OIDC provider)
+|   +-- mini-oidc Services (ClusterIP + NodePort 30471)
+|
++-- mcp-lifecycle-operator-system namespace
+|   +-- lifecycle operator pod
+|
++-- metallb-system namespace
+    +-- MetalLB (LoadBalancer IP assignment)
+```
+
+### External access
+
+| Port | Maps to | Service |
+|------|---------|---------|
+| localhost:8001 | nodePort 30080 -> Envoy :8080 | MCP Gateway |
+| localhost:8003 | nodePort 30471 -> mini-oidc :9090 | OIDC Provider |
+
+---
+
+## Phase 8: Introducing the Catalog (Model Registry)
+
+> **User instruction**: *"Can you move the catalog components to their own namespace, or will that cause operational issues? I would like to leave mcp-test as a deployment space for the actual servers and the lifecycle operator to use and manage."*
+
+With the gateway, operator, auth, and OAuth flows working, the user turned to the missing piece: **discovery**. How does a user find out what MCP servers are available to deploy? The user wanted to introduce the [model-registry](https://github.com/kubeflow/model-registry) catalog service — a metadata store that indexes MCP servers, their tools, artifacts, and runtime requirements.
+
+### Deploying the catalog
+
+The catalog service requires PostgreSQL as a metadata backend. Deployed into a dedicated `catalog-system` namespace to keep it separate from the MCP server deployment space (`mcp-test`):
+
+- **PostgreSQL**: StatefulSet + PVC + Secret + Service
+- **Catalog ConfigMap** (`mcp-catalog-sources`): Contains `sources.yaml` (pointing to a local YAML source) and `mcp-servers.yaml` (server definitions including test-server1 with OCI artifact, runtime metadata, tools, and prerequisites)
+- **Catalog Service**: Deployment + ClusterIP Service exposing the REST API on port 8080
+
+### Catalog API exploration
+
+The catalog API provides:
+
+- `GET /api/mcp_catalog/v1alpha1/mcp_servers` — lists all registered MCP servers with metadata (name, description, version, artifacts, runtimeMetadata, toolCount)
+- `GET /api/mcp_catalog/v1alpha1/mcp_servers/{id}/tools` — returns tools for a specific server
+- `GET /api/mcp_catalog/v1alpha1/filter_options` — returns available filter facets (returned empty for our YAML-based catalog)
+
+**Observation**: The list endpoint returns `toolCount` but not the tools themselves. A consumer building a UI must make N+1 API calls (one for the list, then one per server for tools). An `include=tools` query parameter or embedding tools in the list response would reduce round trips.
+
+---
+
+## Phase 9: Wiring Discovery to Deployment (mcp-launcher)
+
+> **User instruction**: *"How would we go about wiring the discovery in? We may need to expose the catalog service publicly and have some kind of UI to see what's available."*
+
+The user needed a bridge between "here's what the catalog says is available" and "deploy it on the cluster." The [mcp-launcher](https://github.com/matzew/mcp-launcher) project already had a web UI for browsing a catalog and deploying MCP servers — but it was hardcoded to read from Kubernetes ConfigMaps.
+
+> **User instruction**: *"Take a quick look at https://github.com/matzew/mcp-launcher/tree/main. I think this has done a lot of this already. I wonder if it is hardcoded for a set of servers already or if it can be repurposed for our needs."*
+
+After analyzing the launcher codebase, the approach was clear: fork it, extract a `Store` interface from the concrete `ConfigMapStore`, and add an `APIStore` backend that reads from the catalog REST API. This lets the launcher work with either backend depending on environment configuration.
+
+### Changes to mcp-launcher (branch: `catalog-api-integration`)
+
+1. **Extracted `Store` interface** from the concrete `ConfigMapStore` type in `catalog/catalog.go` — `List(ctx) ([]ServerEntry, error)` and `Get(ctx, name) (*ServerEntry, error)`
+
+2. **Added `APIStore` backend** (`catalog/api_store.go`):
+   - Reads from catalog REST API at `CATALOG_API_URL`
+   - Maps catalog API response schema to launcher's internal types: `artifacts` → `packages`, `runtimeMetadata` → `kubernetesExtensions`, `prerequisites` → environment variables / secret mounts
+   - Fetches tools per-server from the `/tools` endpoint
+   - Strips `oci://` prefix from artifact URIs
+
+3. **Added `Tool` type** to `ServerEntry` and updated `catalog.html` template to render tools as badges with hover descriptions
+
+4. **Removed all gateway awareness** — the launcher originally created HTTPRoutes and MCPServerRegistrations when deploying servers. The user explicitly directed this removal:
+
+   > *"The mcp launcher should not be aware of this detail."*
+   > *"Get rid of any code in the launcher that makes it aware of gateway resources."*
+
+   Removed: `GatewayConfig` struct, `createHTTPRoute()`, `createMCPServerRegistration()`, `toolPrefix()`, gateway resource creation from `Run`/`QuickDeploy`/`Delete` handlers, and gateway RBAC from the ClusterRole. The launcher now only bridges catalog → operator (MCPServer CR creation). Gateway routing registration is a separate concern for a future iteration.
+
+5. **Added editable YAML mode** to the configure page — an "Edit YAML" toggle that swaps the read-only preview for an editable textarea, with a `POST /apply` endpoint that accepts raw YAML and creates the MCPServer CR directly. This was added as a workaround for the catalog metadata gaps (see integration friction below) — when the generated YAML is missing required fields like container arguments, the user can manually edit it before deploying.
+
+### Deploying the launcher
+
+Deployed to `mcp-test` namespace with:
+- ServiceAccount + ClusterRole + ClusterRoleBinding (permissions for MCPServer CRs, Secrets, ConfigMaps, ServiceAccounts, Namespaces)
+- Deployment with `CATALOG_API_URL` pointing to the catalog service's ClusterIP
+- Service + NodePort (30472 → host port 8004)
+
+---
+
+## Phase 10: Catalog → Operator Deployment Flow
+
+### First deployment attempt
+
+Deploying test-server1 through the launcher UI failed immediately:
+
+```
+MCPServer.mcp.x-k8s.io "test-server1" is invalid: [spec.image: Required value, spec.port: Required value]
+```
+
+**Root cause**: The MCPServer CRD on the cluster was stale. When the operator was first deployed (Phase 2), the CRD used a flat schema (`spec.image`, `spec.port`). The operator repo had since been updated to a nested schema (`spec.source.containerImage.ref`, `spec.config.port`), but the CRD on the cluster was never updated. The launcher was generating the correct nested spec, but the CRD's validation rejected it.
+
+**Fix**: Re-ran `make install` from the operator repo to apply the updated CRD, then rebuilt and redeployed the operator binary to match the new types. Also had to delete a stale leader lease (`kubectl delete lease bed7462b.x-k8s.io`) because the new operator pod couldn't acquire the lease held by the old pod identity.
+
+### Second deployment attempt
+
+The MCPServer CR was accepted, and the operator created a Deployment + Service. But the pod was in `CrashLoopBackOff`:
+
+```
+2026/04/01 17:41:56 MCP handler use stdio
+```
+
+The container started, defaulted to stdio transport mode, and immediately exited. The pod had no `args` — the catalog metadata provided the image and port but nothing about how to start the server in HTTP mode.
+
+**Root cause**: This is friction point #1 — the catalog's `runtimeMetadata` has `defaultPort` and `mcpPath` but no field for container command or arguments. The image's default CMD (`["/mcp-test-server"]`) runs in stdio mode. It needs `["/mcp-test-server", "--http", "0.0.0.0:9090"]` to run as an HTTP server.
+
+Additionally, the operator defaults to restricted Pod Security Standards (`runAsNonRoot: true`), but the test-server1 image runs as root. The catalog has no field indicating this requirement.
+
+### Successful deployment
+
+With the editable YAML feature, the user manually added the missing fields:
+
+```yaml
+spec:
+  source:
+    type: ContainerImage
+    containerImage:
+      ref: ghcr.io/kuadrant/mcp-gateway/test-server1:latest
+  config:
+    port: 9090
+    path: /mcp
+    arguments:
+      - /mcp-test-server
+      - --http
+      - 0.0.0.0:9090
+  runtime:
+    security:
+      securityContext:
+        runAsNonRoot: false
+```
+
+The server deployed successfully, confirming the end-to-end flow: catalog API → launcher UI → MCPServer CR → operator → Deployment + Service → running pod.
+
+---
+
+## Phase 11: Closing the Operator → Gateway Gap
+
+> **User instruction**: *"From what I can tell the only remaining gap in the end to end flow between discovering a server and accessing it securely behind the gateway is the server registration piece. Is that accurate?"*
+
+The user identified the last missing piece: once the lifecycle operator deploys an MCP server (Deployment + Service), nothing automatically creates the HTTPRoute and MCPServerRegistration needed to make it routable through the gateway. In earlier phases this was done manually.
+
+> **User instruction**: *"There is a downstream version of the lifecycle operator project in the projects directory. Take a look at this PR https://github.com/openshift/mcp-lifecycle-operator/pull/3. It adds some changes to the operator to make it aware of gateway integration resources but it is probably very out of sync with the latest state of the project. I would like you to understand the changes it is trying to introduce, and integrate them in a new branch of the downstream operator."*
+
+### The PR's approach
+
+[openshift/mcp-lifecycle-operator#3](https://github.com/openshift/mcp-lifecycle-operator/pull/3) introduced a well-designed gateway integration pattern:
+
+- **Separate controller** (`MCPServerGatewayReconciler`) — avoids conflicts with the main reconciler by operating independently and using status patches only
+- **Annotation-driven** — no spec changes required, avoiding merge conflicts with upstream. Three annotations:
+  - `mcp.x-k8s.io/gateway-ref: namespace/name` (required — triggers gateway resource creation)
+  - `mcp.x-k8s.io/gateway-hostname: custom.example.com` (optional — defaults to `<name>.mcp.local`)
+  - `mcp.x-k8s.io/gateway-tool-prefix: kube_` (optional — defaults to `<name_underscored>_`)
+- **Creates two resources** with owner references for automatic garbage collection:
+  - **HTTPRoute** — routes traffic from the gateway to the server's Service
+  - **MCPServerRegistration** — registers the server with the gateway's broker for tool aggregation
+- **GatewayReady status condition** on the MCPServer CR — reports whether gateway resources are configured
+- **Graceful degradation** — if Gateway API or MCPServerRegistration CRDs aren't installed, sets `GatewayReady=False` with `CRDNotInstalled` reason instead of crashing
+- **Handles toolPrefix immutability** — MCPServerRegistration's `toolPrefix` is immutable in the CRD, so the controller deletes and recreates if the annotation changes
+
+### What needed adapting
+
+The PR was written against an older version of the operator with a flat spec schema. Three things needed updating:
+
+1. **Nested spec access**: `mcpServer.Spec.Port` → `mcpServer.Spec.Config.Port`, `mcpServer.Spec.Path` → `mcpServer.Spec.Config.Path`
+2. **MCPServerRegistration API group**: `mcp.kagenti.com` → `mcp.kuadrant.io` (matches what's deployed on the cluster — the CRD group appears to have changed at some point)
+3. **Test MCPServer construction**: flat `Image`/`Port` fields → nested `Source.ContainerImage` (pointer) / `Config.Port`
+
+### Integration
+
+Created branch `gateway-integration` on the downstream operator (`/Users/jrao/projects/mcp-lifecycle-operator`). Files added/modified:
+
+- `internal/controller/mcpserver_gateway_controller.go` — the gateway reconciler, adapted for nested spec
+- `internal/controller/mcpserver_gateway_controller_test.go` — comprehensive tests (no annotation, valid ref, defaults, custom values, malformed ref, annotation changes, annotation removal)
+- `config/crd/test/gateway/httproute-crd.yaml` — minimal HTTPRoute CRD for envtest
+- `config/crd/test/gateway/mcpserverregistration-crd.yaml` — minimal MCPServerRegistration CRD for envtest (using `mcp.kuadrant.io`)
+- `config/rbac/gateway_role.yaml` — ClusterRole for HTTPRoute and MCPServerRegistration CRUD
+- `config/rbac/gateway_role_binding.yaml` — ClusterRoleBinding for the operator's ServiceAccount
+- `config/rbac/kustomization.yaml` — updated to include gateway RBAC
+- `internal/controller/suite_test.go` — updated to load gateway test CRDs
+- `cmd/main.go` — registers the `MCPServerGatewayReconciler` alongside the main reconciler
+
+All tests pass (`make test`).
+
+### Deployment and verification
+
+Built and deployed the updated operator to the cluster. Then deployed test-server1 from the catalog via the launcher's YAML editor with the gateway annotation included:
+
+```yaml
+apiVersion: mcp.x-k8s.io/v1alpha1
+kind: MCPServer
+metadata:
+  name: test-server1
+  namespace: mcp-test
+  annotations:
+    mcp.x-k8s.io/gateway-ref: gateway-system/mcp-gateway
+spec:
+  source:
+    type: ContainerImage
+    containerImage:
+      ref: ghcr.io/kuadrant/mcp-gateway/test-server1:latest
+  config:
+    port: 9090
+    path: /mcp
+    arguments:
+      - /mcp-test-server
+      - --http
+      - 0.0.0.0:9090
+  runtime:
+    security:
+      securityContext:
+        runAsNonRoot: false
+```
+
+### Result
+
+The operator automatically created all resources:
+
+- **Deployment + Service** (main reconciler, as before)
+- **HTTPRoute** with hostname `test-server1.mcp.local` pointing to the gateway (gateway controller)
+- **MCPServerRegistration** with tool prefix `test_server1_` (gateway controller)
+
+Status conditions on the MCPServer CR:
+- `Ready: True` — "Deployment is available and ready"
+- `GatewayReady: True` — "HTTPRoute and MCPServerRegistration are configured"
+
+The gateway picked up the registration immediately — 5 tools visible, status `Ready`. The full pipeline is now automated:
+
+```
+Catalog API (catalog-system)          — "what's available"
+  ↓ REST API
+MCP Launcher (mcp-test)               — "browse, configure, deploy"
+  ↓ creates MCPServer CR (with gateway-ref annotation)
+Lifecycle Operator (operator-system)  — "make it run AND make it routable"
+  ↓ creates Deployment + Service + HTTPRoute + MCPServerRegistration
+Gateway (gateway-system)              — "route requests to the server"
+```
+
+### Why the annotation-based approach works well
+
+The decision to use annotations rather than spec fields was deliberate in the original PR and proved to be the right call:
+
+1. **No upstream spec changes** — the gateway integration is a downstream concern. Using annotations means the MCPServer CRD doesn't need to change, avoiding merge conflicts when syncing with upstream.
+2. **Opt-in per server** — servers without the annotation work exactly as before. Gateway integration is additive.
+3. **Separate controller** — the gateway reconciler can't interfere with the main reconciler's work. Status updates use patches to avoid write conflicts.
+4. **Clean lifecycle** — owner references mean deleting the MCPServer CR automatically cleans up the HTTPRoute and MCPServerRegistration. Removing the annotation also triggers cleanup.
+
+---
+
+## Integration Friction Points
+
+These are the significant integration gaps discovered during the catalog integration phases. They represent real contract mismatches between the catalog, operator, and gateway — not bugs in any individual project, but gaps in the interfaces between them.
+
+### 1. Catalog `runtimeMetadata` insufficient for deployment
+
+The catalog schema has `artifacts[].uri` (OCI image) and `runtimeMetadata.defaultPort`/`mcpPath`, but is missing:
+
+- **Container command/entrypoint**: No field for the binary path or entrypoint. The operator's `config.arguments` maps to Kubernetes `container.args` which *replaces* CMD for images without ENTRYPOINT. Without knowing the binary (e.g., `/mcp-test-server`), a deployer can't construct correct arguments.
+- **Container arguments**: No equivalent of the operator's `config.arguments`. Some images need specific flags (e.g., `--http 0.0.0.0:9090`), but this isn't captured in catalog metadata.
+- **Security context requirements**: The operator defaults to `runAsNonRoot: true`. The catalog has no field indicating whether an image requires root. A deployer reading only catalog metadata has no way to know deployment will fail.
+
+**Impact**: The catalog metadata alone is insufficient to deploy — you need out-of-band knowledge about each image.
+
+### 2. OCI image opacity — the systemic problem
+
+The friction points above are symptoms of a deeper structural issue: **OCI images are opaque, and catalog metadata doesn't carry enough operational context to deploy them reliably.** Each MCP server image can differ across multiple dimensions simultaneously:
+
+- **Entrypoint/CMD conventions**: Some use ENTRYPOINT (args append), some use CMD (args replace), some use both. Kubernetes `container.args` replaces CMD — destructive if the deployer gets it wrong.
+- **Transport selection**: Servers default to different transports (stdio, HTTP/SSE, streamable-HTTP). The flag to switch varies per image.
+- **Bind address conventions**: Some listen on `0.0.0.0`, some on `127.0.0.1`. Some accept `host:port`, others take separate `--port`/`--host` flags.
+- **Security context**: Root vs non-root, specific UID requirements, filesystem write needs.
+
+In the worst case, every MCP server image is a snowflake. The catalog becomes a registry of names without enough operational metadata to deploy anything. This is the most significant integration gap observed — it's not a single missing field but a **missing contract between image authors, catalog curators, and the deployment operator**.
+
+Possible solutions:
+1. **OCI image convention** — standardized ENTRYPOINT contract for MCP servers
+2. **Richer catalog metadata** — extend `runtimeMetadata` to cover command, args, security context
+3. **Deployment profiles** — a separate layer encoding per-image operational knowledge
+4. **Convention over configuration** — define an "MCP server image contract" (must use ENTRYPOINT, must accept `--port $PORT`, must run as non-root)
+
+No upstream issue exists yet for this — [kubeflow/model-registry#1139](https://github.com/kubeflow/model-registry/issues/1139) is the overarching MCP catalog feature request but doesn't discuss `runtimeMetadata` schema gaps.
+
+### 3. Operator → Gateway registration gap (resolved in Phase 11)
+
+Once the operator deploys an MCP server (Deployment + Service), there was no automated path to register it with the gateway (HTTPRoute + MCPServerRegistration). This was resolved by integrating the gateway controller from [openshift/mcp-lifecycle-operator#3](https://github.com/openshift/mcp-lifecycle-operator/pull/3) into the downstream operator. The annotation `mcp.x-k8s.io/gateway-ref` on the MCPServer CR triggers automatic creation of both gateway resources.
+
+### 4. Semantic gap in `arguments`
+
+mcp-launcher's `PackageArguments` are meant to be appended to the container command. The operator's `config.arguments` replaces CMD entirely. These are fundamentally different semantics — an integrator bridging the two must understand both conventions.
+
+### 5. Catalog API N+1 queries for tools
+
+The list endpoint returns `toolCount` but not the tools themselves. Tools require a separate per-server call. A consumer building a UI must make N+1 API calls.
+
+### Temporary workarounds implemented
+
+| Friction point | Workaround |
+|----------------|------------|
+| Missing command/args in catalog metadata | Added editable YAML mode to launcher UI — user manually adds `config.arguments` before deploying |
+| Missing security context in catalog metadata | User manually adds `runtime.security.securityContext.runAsNonRoot: false` in YAML editor |
+| Stale CRD on cluster (flat → nested schema) | Re-ran `make install` from operator repo; rebuilt and redeployed operator binary |
+| Stale leader lease after operator restart | Manually deleted lease: `kubectl delete lease bed7462b.x-k8s.io` |
+| N+1 API calls for tools | Launcher makes per-server `/tools` call in a loop during `List()` |
+| Gateway code in launcher | Removed entirely — launcher only bridges catalog → operator; gateway registration handled by operator's gateway controller via annotation |
+
+---
+
+## Updated Architecture Summary
+
+### Components on the cluster (after Phase 11)
+
+```
+Kind Node (mcp-gateway)
+|
++-- catalog-system namespace
+|   +-- PostgreSQL StatefulSet + PVC + Secret + Service (catalog metadata backend)
+|   +-- Catalog ConfigMap (mcp-catalog-sources: sources.yaml + mcp-servers.yaml)
+|   +-- Catalog Deployment + ClusterIP Service (REST API on :8080)
+|
++-- gateway-system namespace
+|   +-- Envoy pod (mcp-gateway-istio) — L7 proxy, data path
+|   +-- NodePort Service (30080 -> 8080) — external ingress
+|   +-- Gateway resource — declarative listener config
+|   +-- ReferenceGrant — cross-namespace permissions
+|   +-- RequestAuthentication — JWT validation rules
+|   +-- EnvoyFilter (ext_proc) — injects Router into Envoy
+|   +-- EnvoyFilter (Lua) — 401 auth challenge for unauthenticated requests
+|
++-- istio-system namespace
+|   +-- istiod — programs Envoy via xDS
+|
++-- mcp-system namespace
+|   +-- mcp-gateway pod (broker + router + controller)
+|   +-- MCPGatewayExtension — attaches to Gateway
+|   +-- HTTPRoute (mcp-gateway-route) — routes to broker
+|   +-- Secret (config) — upstream server list
+|
++-- mcp-test namespace
+|   +-- mcp-launcher pod (catalog UI + deployer)
+|   +-- mcp-launcher Service + NodePort (30472 -> host port 8004)
+|   +-- mcp-launcher RBAC (ServiceAccount, ClusterRole, ClusterRoleBinding)
+|   +-- test-server1 pod (test MCP server, created by lifecycle operator)
+|   +-- test-server1 Service (created by lifecycle operator)
+|   +-- test-server1 HTTPRoute (created by gateway controller, routes to gateway)
+|   +-- test-server1 MCPServerRegistration (created by gateway controller)
+|   +-- MCPServer CR (lifecycle operator input, with gateway-ref annotation)
+|   +-- mini-oidc pod (custom OIDC provider)
+|   +-- mini-oidc Services (ClusterIP + NodePort 30471)
+|
++-- mcp-lifecycle-operator-system namespace
+|   +-- lifecycle operator pod (main reconciler + gateway reconciler)
+|
++-- metallb-system namespace
+    +-- MetalLB (LoadBalancer IP assignment)
+```
+
+### External access
+
+| Port | Maps to | Service |
+|------|---------|---------|
+| localhost:8001 | nodePort 30080 → Envoy :8080 | MCP Gateway |
+| localhost:8003 | nodePort 30471 → mini-oidc :9090 | OIDC Provider |
+| localhost:8004 | nodePort 30472 → mcp-launcher :8080 | MCP Launcher UI |
+
+### The catalog → deploy → route pipeline (complete)
+
+```
+Catalog API (catalog-system)          — "what's available"
+  ↓ REST API
+MCP Launcher (mcp-test)               — "browse, configure, deploy"
+  ↓ creates MCPServer CR (with gateway-ref annotation)
+Lifecycle Operator (operator-system)  — "make it run AND make it routable"
+  ↓ creates Deployment + Service + HTTPRoute + MCPServerRegistration
+Gateway (gateway-system)              — "route requests to the server"
+```
+
+The end-to-end pipeline is now fully automated. A user browses the catalog, deploys a server, and the operator handles both deployment and gateway registration.
+
+---
+
+## Key Learnings
+
+1. **Istio is not a service mesh here** — only istiod is used, purely as a Gateway API controller that programs Envoy. No sidecars, no ambient mode.
+
+2. **ext_proc runs before route matching** — this is what makes the Router powerful (it can steer Envoy's routing decisions) but also means it affects ALL traffic on the port, including non-MCP traffic.
+
+3. **JWKS caching is aggressive** — Istio fetches JWKS once and bakes it inline in Envoy config as `local_jwks`. If the OIDC provider's keys change, istiod and Envoy must be restarted. Production OIDC providers persist keys across restarts.
+
+4. **Istio's 403 vs OAuth's 401** — an intentional design decision (istio/istio#26559). AuthorizationPolicy always returns 403 via Envoy's hardcoded RBAC filter. OAuth clients need 401 + WWW-Authenticate. The mcp-gateway project solves this with Kuadrant's AuthPolicy (ext_authz), which has full response control.
+
+5. **Kubernetes `:latest` tag semantics** — defaults to `imagePullPolicy: Always`, which fails in Kind where images are pre-loaded. Either use specific tags or patch to `IfNotPresent`.
+
+6. **Kubernetes `args` replaces Docker CMD entirely** — not appended. If the Dockerfile has `CMD ["/binary"]`, setting `args: ["--flag"]` in the pod spec means `--flag` is executed as the entrypoint. Must include the binary path in args.
+
+7. **Token exchange is a gateway concern** — the client authenticates to the gateway with one token; the gateway can swap it for a server-specific credential (API key from Vault or scoped token via RFC 8693) before forwarding. The upstream MCP server never sees the client's original token.
+
+8. **Catalog metadata is necessary but not sufficient for deployment** — the model-registry catalog provides discovery (what exists, what tools it has, what port it uses), but lacks the operational metadata needed to actually run an image (command, arguments, security context). This creates a manual gap between "I found a server in the catalog" and "I deployed it successfully."
+
+9. **OCI images are opaque to orchestrators** — without a standardized contract for MCP server images (entrypoint conventions, transport selection, bind address), every new server added to the catalog is a potential deployment failure. The catalog tells you *what exists*, the operator does *what it's told*, but nothing in between encodes *how to run it*.
+
+10. **CRD schema evolution breaks silently** — the operator's MCPServer CRD changed from flat (`spec.image`) to nested (`spec.source.containerImage.ref`) between deployments. The stale CRD on the cluster rejected valid specs with unhelpful validation errors. CRD versioning and migration deserves explicit tooling/process in multi-component ecosystems.
+
+11. **Separation of concerns matters at integration seams** — the user explicitly directed removing gateway awareness from the launcher, keeping each component focused: catalog = discovery, launcher = UI + CR creation, operator = deployment, gateway = routing. The temptation to bundle everything in one tool creates coupling that makes the system harder to reason about and evolve.
+
+12. **Annotations are a clean extension mechanism for downstream features** — the gateway integration uses annotations (`mcp.x-k8s.io/gateway-ref`) rather than spec fields, avoiding upstream schema changes and merge conflicts. Combined with a separate controller, this pattern lets downstream forks add capabilities without touching the core reconciliation logic. The trade-off is discoverability — annotations are less visible than spec fields — but for optional, downstream-specific integrations, it's the right call.
+
+13. **Existing PRs may be out of sync but architecturally sound** — the gateway integration PR was written against an old flat spec schema but its design (separate controller, annotation-driven, status patches, owner references) was solid. Adapting it to the current nested spec was mechanical — the architecture translated directly. This suggests that reviewing PRs for design quality is more valuable than checking whether they apply cleanly.
+
+---
+
+## Reflection: How AI Was Used in This Experiment
+
+### Pattern of interaction
+
+The experiment followed a consistent pattern that proved effective for learning complex systems:
+
+1. **Start with a broad, open-ended question** ("scan these projects, how do they work together") to get oriented
+2. **Request a minimal working deployment** ("bare minimum, ignore non-basic features") to have something concrete to poke at
+3. **Ask for a deep walkthrough** ("walk me through every resource") to build understanding from the running system
+4. **Ask clarifying questions** to test and correct mental models ("is it safe to say X?", "how does Y know to pick the right one?")
+5. **Request visualizations** to solidify understanding, then refine them ("highlight the data path vs control plane")
+6. **Scope up incrementally** ("let's add auth") with explicit boundaries ("leave token exchange out for now")
+7. **Push back on over-engineering** ("can we not just build our own lightweight OIDC provider?") to keep focus on understanding vs deployment
+8. **Investigate failures deeply** ("is this a limitation?" -> "is this intentional?" -> "how is it solved in production?") rather than just working around them
+
+### What worked well
+
+- **Building mini-oidc instead of deploying Keycloak** was the single best decision. Writing PKCE verification code taught more about OAuth 2.1 than any documentation could.
+- **Letting failures drive learning** — every error (image pull failures, OOM, JWKS caching, 403 vs 401) became a concrete lesson about the underlying systems.
+- **Testing mental models explicitly** — asking "is it safe to say X?" repeatedly caught incorrect generalizations early.
+- **Asking "why" after finding a limitation** — the 401 vs 403 investigation went from "it's broken" to "it's an intentional design decision" to "here's how production solves it" to "no issue needed." That chain of inquiry built real architectural understanding.
+
+### What this approach is good for
+
+This AI-assisted incremental exploration works well when the goal is to understand **how multiple complex systems interact** without deep prior expertise in all of them. The AI handles the boilerplate (deploying infrastructure, writing YAML, debugging container issues) while the user directs the learning — choosing what to explore next, when to go deeper, when to simplify, and what questions will build the most useful mental models.

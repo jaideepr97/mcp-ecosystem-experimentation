@@ -1,0 +1,14 @@
+apiVersion: security.istio.io/v1
+kind: RequestAuthentication
+metadata:
+  name: mcp-jwt-auth
+  namespace: gateway-system
+spec:
+  targetRefs:
+    - group: gateway.networking.k8s.io
+      kind: Gateway
+      name: mcp-gateway
+  jwtRules:
+    - issuer: http://mini-oidc.mcp-test.svc.cluster.local:9090
+      jwksUri: http://mini-oidc.mcp-test.svc.cluster.local:9090/jwks
+      forwardOriginalToken: true

@@ -1,0 +1,35 @@
+%%{ init: { 'theme': 'base', 'sequence': { 'mirrorActors': false } } }%%
+
+sequenceDiagram
+    participant C as Client
+    participant O as mini-oidc<br/>(OIDC Provider)
+    participant E as Envoy Proxy<br/>(gateway-system)
+    participant R as Router<br/>(mcp-system)
+    participant S as MCP Server<br/>(mcp-test)
+
+    Note over C,S: 1. Token Acquisition
+    C->>O: GET /token
+    O-->>C: {"access_token": "eyJ..."}
+
+    Note over C,S: 2. Authenticated MCP Request
+    C->>E: POST /mcp<br/>Authorization: Bearer eyJ...<br/>{"jsonrpc":"2.0","method":"tools/call",<br/>"params":{"name":"op_greet"}}
+
+    Note over E: Istio RequestAuthentication<br/>validates JWT signature + issuer
+
+    alt Invalid/missing token
+        E-->>C: 401 Unauthorized<br/>WWW-Authenticate: Bearer<br/>(via Lua EnvoyFilter)
+    end
+
+    Note over E: ext_proc filter invoked
+
+    E->>R: gRPC ext_proc request<br/>(headers + body)
+
+    Note over R: 1. Parse JSON-RPC body<br/>2. Extract tool name "op_greet"<br/>3. Strip prefix → "greet"<br/>4. Look up MCPServerRegistration<br/>5. Set :authority = test-server1.mcp.local
+
+    R-->>E: Modified headers<br/>:authority = test-server1.mcp.local<br/>tool = "greet" (prefix stripped)
+
+    Note over E: Route matches on :authority<br/>via HTTPRoute → test-server1 Service
+
+    E->>S: POST /mcp<br/>{"jsonrpc":"2.0","method":"tools/call",<br/>"params":{"name":"greet"}}
+    S-->>E: {"jsonrpc":"2.0","result":{...}}
+    E-->>C: {"jsonrpc":"2.0","result":{...}}

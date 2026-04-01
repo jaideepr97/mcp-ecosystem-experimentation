@@ -1,0 +1,76 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: mcp-catalog
+  namespace: catalog-system
+  labels:
+    app: mcp-catalog
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: mcp-catalog
+  template:
+    metadata:
+      annotations:
+        sidecar.istio.io/inject: "false"
+      labels:
+        app: mcp-catalog
+    spec:
+      containers:
+        - name: catalog
+          image: ghcr.io/kubeflow/model-registry/server:latest
+          command:
+            - /model-registry
+          args:
+            - catalog
+            - --listen=0.0.0.0:8080
+            - --catalogs-path=/catalog/sources.yaml
+          env:
+            - name: PGHOST
+              value: mcp-catalog-postgres
+            - name: PGDATABASE
+              value: mcp_catalog
+            - name: PGUSER
+              valueFrom:
+                secretKeyRef:
+                  name: mcp-catalog-postgres
+                  key: POSTGRES_USER
+            - name: PGPASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: mcp-catalog-postgres
+                  key: POSTGRES_PASSWORD
+          ports:
+            - name: http-api
+              containerPort: 8080
+          livenessProbe:
+            tcpSocket:
+              port: http-api
+            initialDelaySeconds: 30
+            periodSeconds: 5
+          readinessProbe:
+            tcpSocket:
+              port: http-api
+            initialDelaySeconds: 3
+            periodSeconds: 5
+          volumeMounts:
+            - name: catalog-config
+              mountPath: /catalog
+      volumes:
+        - name: catalog-config
+          configMap:
+            name: mcp-catalog-sources
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: mcp-catalog
+  namespace: catalog-system
+spec:
+  selector:
+    app: mcp-catalog
+  ports:
+    - name: http
+      port: 8080
+      targetPort: 8080

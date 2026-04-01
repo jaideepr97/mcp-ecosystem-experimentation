@@ -1,0 +1,23 @@
+apiVersion: mcp.x-k8s.io/v1alpha1
+kind: MCPServer
+metadata:
+  name: test-server1
+  namespace: mcp-test
+  annotations:
+    mcp.x-k8s.io/gateway-ref: gateway-system/mcp-gateway
+spec:
+  source:
+    type: ContainerImage
+    containerImage:
+      ref: ghcr.io/kuadrant/mcp-gateway/test-server1:latest
+  config:
+    port: 9090
+    path: /mcp
+    arguments:
+      - /mcp-test-server
+      - --http
+      - 0.0.0.0:9090
+  runtime:
+    security:
+      securityContext:
+        runAsNonRoot: false

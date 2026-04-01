@@ -1,0 +1,56 @@
+%%{ init: { 'theme': 'base' } }%%
+
+flowchart LR
+    subgraph discovery["Discovery"]
+        catalog["Catalog API<br/>(model-registry)"]
+        sources[("PostgreSQL +<br/>ConfigMap")]
+        sources --> catalog
+    end
+
+    subgraph deployment["Deployment"]
+        launcher["MCP Launcher<br/>(browse + configure)"]
+        mcpserver["MCPServer CR<br/>(with gateway-ref<br/>annotation)"]
+        operator["Lifecycle Operator"]
+        deploy["Deployment +<br/>Service"]
+    end
+
+    subgraph routing["Routing"]
+        gw-controller["Gateway Reconciler<br/>(in operator)"]
+        httproute["HTTPRoute"]
+        registration["MCPServer<br/>Registration"]
+        gateway["MCP Gateway<br/>(Envoy + Router)"]
+    end
+
+    subgraph auth["Authentication"]
+        oidc["OIDC Provider"]
+        istio["Istio<br/>(JWT validation)"]
+    end
+
+    %% Pipeline flow
+    catalog -->|"REST API<br/>/api/mcp_catalog/..."| launcher
+    launcher -->|"creates"| mcpserver
+    mcpserver -->|"watched by"| operator
+    operator -->|"creates"| deploy
+
+    mcpserver -->|"watched by<br/>(if gateway-ref<br/>annotation present)"| gw-controller
+    gw-controller -->|"creates"| httproute
+    gw-controller -->|"creates"| registration
+
+    httproute -->|"configures route"| gateway
+    registration -->|"registers server"| gateway
+
+    oidc -.->|"issues tokens"| istio
+    istio -.->|"validates JWT"| gateway
+
+    %% Styling
+    classDef discoveryStyle fill:#e3f2fd,stroke:#1565C0,stroke-width:2px
+    classDef deployStyle fill:#fff3e0,stroke:#E65100,stroke-width:2px
+    classDef routeStyle fill:#e8f5e9,stroke:#2E7D32,stroke-width:2px
+    classDef authStyle fill:#fce4ec,stroke:#C62828,stroke-width:2px
+    classDef crStyle fill:#f3e5f5,stroke:#7B1FA2,stroke-width:1px
+
+    class catalog,sources discoveryStyle
+    class launcher,operator deployStyle
+    class mcpserver,deploy crStyle
+    class gw-controller,httproute,registration,gateway routeStyle
+    class oidc,istio authStyle

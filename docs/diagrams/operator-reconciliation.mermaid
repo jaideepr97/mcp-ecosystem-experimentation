@@ -1,0 +1,50 @@
+%%{ init: { 'theme': 'base' } }%%
+
+flowchart TD
+    cr["MCPServer CR created/updated"]
+
+    cr --> main["Main Reconciler<br/>(MCPServerReconciler)"]
+    cr --> gw["Gateway Reconciler<br/>(MCPServerGatewayReconciler)"]
+
+    main --> check-deploy{"Deployment<br/>exists?"}
+    check-deploy -->|No| create-deploy["Create Deployment<br/>(image, args, port,<br/>security context)"]
+    check-deploy -->|Yes| update-deploy["Update Deployment<br/>(if spec changed)"]
+
+    create-deploy --> check-svc{"Service<br/>exists?"}
+    update-deploy --> check-svc
+    check-svc -->|No| create-svc["Create Service<br/>(port mapping)"]
+    check-svc -->|Yes| done-main["Done ✓"]
+    create-svc --> done-main
+
+    gw --> check-ann{"Has gateway-ref<br/>annotation?"}
+    check-ann -->|No| skip["Skip<br/>(no gateway integration)"]
+    check-ann -->|Yes| parse["Parse annotation<br/>namespace/name"]
+
+    parse --> check-hr{"HTTPRoute<br/>exists?"}
+    check-hr -->|No| create-hr["Create HTTPRoute<br/>(parentRef → Gateway,<br/>hostname, backendRef → Service)"]
+    check-hr -->|Yes| update-hr["Update HTTPRoute<br/>(if changed)"]
+
+    create-hr --> check-reg{"MCPServerRegistration<br/>exists?"}
+    update-hr --> check-reg
+    check-reg -->|No| create-reg["Create MCPServerRegistration<br/>(toolPrefix, targetRef)"]
+    check-reg -->|Yes| check-prefix{"toolPrefix<br/>changed?"}
+    check-prefix -->|No| status["Set GatewayReady<br/>status condition"]
+    check-prefix -->|Yes| recreate["Delete + Recreate<br/>(toolPrefix is immutable)"]
+    create-reg --> status
+    recreate --> status
+
+    status --> done-gw["Done ✓"]
+
+    note1["Owner references set on all<br/>created resources — automatic<br/>garbage collection on CR deletion"]
+
+    classDef decision fill:#fff9c4,stroke:#F9A825,stroke-width:2px
+    classDef action fill:#e8f4fd,stroke:#2196F3,stroke-width:1px
+    classDef start fill:#e8f5e9,stroke:#4CAF50,stroke-width:2px
+    classDef done fill:#c8e6c9,stroke:#2E7D32,stroke-width:1px
+    classDef note fill:#f5f5f5,stroke:#9E9E9E,stroke-width:1px,stroke-dasharray:3 3
+
+    class cr start
+    class check-deploy,check-svc,check-ann,check-hr,check-reg,check-prefix decision
+    class create-deploy,update-deploy,create-svc,create-hr,update-hr,create-reg,recreate,status,parse action
+    class done-main,done-gw,skip done
+    class note1 note

@@ -1,0 +1,103 @@
+%%{ init: { 'theme': 'base', 'themeVariables': { 'primaryColor': '#e8f4fd', 'primaryBorderColor': '#2196F3', 'secondaryColor': '#fff3e0', 'tertiaryColor': '#e8f5e9' } } }%%
+
+graph TB
+    subgraph kind["Kind Cluster (mcp-gateway)"]
+
+        subgraph catalog-system["catalog-system namespace"]
+            postgres[(PostgreSQL)]
+            catalog-cm[/"ConfigMap<br/>mcp-catalog-sources"/]
+            catalog-api["Catalog API<br/>(REST :8080)"]
+            catalog-api --> postgres
+            catalog-api --> catalog-cm
+        end
+
+        subgraph gateway-system["gateway-system namespace"]
+            envoy["Envoy Proxy<br/>(mcp-gateway-istio :8080)"]
+            gateway-res["Gateway Resource"]
+            ref-grant["ReferenceGrant"]
+            req-auth["RequestAuthentication<br/>(JWT validation)"]
+            authz-policy["AuthorizationPolicy"]
+            ef-extproc["EnvoyFilter<br/>(ext_proc → Router)"]
+            ef-lua["EnvoyFilter<br/>(Lua 401 challenge)"]
+            nodeport-gw["NodePort Service<br/>30080 → 8080"]
+            nodeport-gw --> envoy
+        end
+
+        subgraph istio-system["istio-system namespace"]
+            istiod["istiod<br/>(Gateway API controller)"]
+        end
+
+        subgraph mcp-system["mcp-system namespace"]
+            mcp-gw-pod["mcp-gateway pod<br/>(broker + router + controller)"]
+            mcp-gw-ext["MCPGatewayExtension"]
+            httproute-gw["HTTPRoute<br/>(mcp-gateway-route)"]
+            config-secret["Secret (config)"]
+        end
+
+        subgraph mcp-test["mcp-test namespace"]
+            launcher["MCP Launcher<br/>(catalog UI + deployer :8080)"]
+            launcher-rbac["RBAC<br/>(SA + ClusterRole + CRB)"]
+            mcpserver-cr["MCPServer CR<br/>(with gateway-ref annotation)"]
+            server-pod["test-server1 pod<br/>(MCP server :9090)"]
+            server-svc["test-server1 Service"]
+            server-httproute["HTTPRoute<br/>(test-server1)"]
+            server-reg["MCPServerRegistration<br/>(test-server1)"]
+            mini-oidc["mini-oidc pod<br/>(OIDC provider :9090)"]
+            nodeport-oidc["NodePort Service<br/>30471"]
+            nodeport-launcher["NodePort Service<br/>30472"]
+            nodeport-launcher --> launcher
+            nodeport-oidc --> mini-oidc
+            server-svc --> server-pod
+        end
+
+        subgraph operator-system["mcp-lifecycle-operator-system namespace"]
+            operator["Lifecycle Operator<br/>(main + gateway reconciler)"]
+        end
+
+        subgraph metallb-system["metallb-system namespace"]
+            metallb["MetalLB"]
+        end
+
+        %% Control plane relationships
+        istiod -.->|"programs via xDS"| envoy
+        operator -->|"creates"| server-pod
+        operator -->|"creates"| server-svc
+        operator -->|"creates"| server-httproute
+        operator -->|"creates"| server-reg
+        operator -.->|"watches"| mcpserver-cr
+
+        %% Data path
+        envoy -->|"ext_proc"| mcp-gw-pod
+        envoy -->|"routes to"| server-svc
+
+        %% Launcher flow
+        launcher -->|"reads catalog"| catalog-api
+        launcher -->|"creates"| mcpserver-cr
+
+        %% Gateway registration
+        mcp-gw-pod -.->|"watches"| server-reg
+
+        %% Auth
+        envoy -.->|"validates JWT"| req-auth
+        mini-oidc -.->|"issues tokens"| envoy
+    end
+
+    %% External access
+    client["Client / Browser"]
+    client -->|":8001"| nodeport-gw
+    client -->|":8003"| nodeport-oidc
+    client -->|":8004"| nodeport-launcher
+
+    classDef ns fill:none,stroke:#666,stroke-width:2px,stroke-dasharray:5 5
+    classDef pod fill:#e8f4fd,stroke:#2196F3,stroke-width:1px
+    classDef svc fill:#fff3e0,stroke:#FF9800,stroke-width:1px
+    classDef cr fill:#e8f5e9,stroke:#4CAF50,stroke-width:1px
+    classDef storage fill:#fce4ec,stroke:#E91E63,stroke-width:1px
+    classDef external fill:#f3e5f5,stroke:#9C27B0,stroke-width:2px
+
+    class catalog-system,gateway-system,istio-system,mcp-system,mcp-test,operator-system,metallb-system ns
+    class envoy,catalog-api,mcp-gw-pod,launcher,server-pod,mini-oidc,operator,istiod,metallb pod
+    class nodeport-gw,nodeport-oidc,nodeport-launcher,server-svc svc
+    class mcpserver-cr,server-httproute,server-reg,gateway-res,ref-grant,req-auth,authz-policy,ef-extproc,ef-lua,mcp-gw-ext,httproute-gw,config-secret,launcher-rbac cr
+    class postgres,catalog-cm storage
+    class client external

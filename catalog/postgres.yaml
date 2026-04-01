@@ -1,0 +1,87 @@
+apiVersion: v1
+kind: Secret
+metadata:
+  name: mcp-catalog-postgres
+  namespace: catalog-system
+type: Opaque
+stringData:
+  POSTGRES_DB: mcp_catalog
+  POSTGRES_PASSWORD: catalog
+  POSTGRES_USER: catalog
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: mcp-catalog-postgres
+  namespace: catalog-system
+spec:
+  accessModes:
+    - ReadWriteOnce
+  resources:
+    requests:
+      storage: 1Gi
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: mcp-catalog-postgres
+  namespace: catalog-system
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: mcp-catalog-postgres
+  serviceName: mcp-catalog-postgres
+  template:
+    metadata:
+      annotations:
+        sidecar.istio.io/inject: "false"
+      labels:
+        app: mcp-catalog-postgres
+    spec:
+      securityContext:
+        runAsUser: 70
+        runAsGroup: 70
+        fsGroup: 70
+      containers:
+        - name: postgres
+          image: postgres:17.6
+          ports:
+            - containerPort: 5432
+          env:
+            - name: PGDATA
+              value: /var/lib/postgresql/data/pgdata
+            - name: POSTGRES_USER
+              valueFrom:
+                secretKeyRef:
+                  name: mcp-catalog-postgres
+                  key: POSTGRES_USER
+            - name: POSTGRES_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: mcp-catalog-postgres
+                  key: POSTGRES_PASSWORD
+            - name: POSTGRES_DB
+              valueFrom:
+                secretKeyRef:
+                  name: mcp-catalog-postgres
+                  key: POSTGRES_DB
+          volumeMounts:
+            - name: data
+              mountPath: /var/lib/postgresql/data
+      volumes:
+        - name: data
+          persistentVolumeClaim:
+            claimName: mcp-catalog-postgres
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: mcp-catalog-postgres
+  namespace: catalog-system
+spec:
+  selector:
+    app: mcp-catalog-postgres
+  ports:
+    - port: 5432
+      targetPort: 5432
