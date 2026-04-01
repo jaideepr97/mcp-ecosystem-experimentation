@@ -5,14 +5,15 @@ sequenceDiagram
     participant O as mini-oidc<br/>(OIDC Provider)
     participant E as Envoy Proxy<br/>(gateway-system)
     participant R as Router<br/>(mcp-system)
+    participant B as Broker<br/>(mcp-system)
     participant S as MCP Server<br/>(mcp-test)
 
     Note over C,S: 1. Token Acquisition
     C->>O: GET /token
     O-->>C: {"access_token": "eyJ..."}
 
-    Note over C,S: 2. Authenticated MCP Request
-    C->>E: POST /mcp<br/>Authorization: Bearer eyJ...<br/>{"jsonrpc":"2.0","method":"tools/call",<br/>"params":{"name":"op_greet"}}
+    Note over C,S: 2. Authentication (common to all requests)
+    C->>E: POST /mcp<br/>Authorization: Bearer eyJ...
 
     Note over E: Istio RequestAuthentication<br/>validates JWT signature + issuer
 
@@ -24,12 +25,35 @@ sequenceDiagram
 
     E->>R: gRPC ext_proc request<br/>(headers + body)
 
-    Note over R: 1. Parse JSON-RPC body<br/>2. Extract tool name "op_greet"<br/>3. Strip prefix → "greet"<br/>4. Look up MCPServerRegistration<br/>5. Set :authority = test-server1.mcp.local
+    alt initialize / tools/list (aggregation path)
+        Note over C,S: 3a. Initialize or tools/list → Broker aggregates
 
-    R-->>E: Modified headers<br/>:authority = test-server1.mcp.local<br/>tool = "greet" (prefix stripped)
+        Note over R: 1. Parse JSON-RPC body<br/>2. Method is "initialize" or "tools/list"<br/>3. Leave :authority unchanged<br/>(mcp.127-0-0-1.sslip.io)
 
-    Note over E: Route matches on :authority<br/>via HTTPRoute → test-server1 Service
+        R-->>E: Headers unchanged<br/>:authority = mcp.127-0-0-1.sslip.io
 
-    E->>S: POST /mcp<br/>{"jsonrpc":"2.0","method":"tools/call",<br/>"params":{"name":"greet"}}
-    S-->>E: {"jsonrpc":"2.0","result":{...}}
-    E-->>C: {"jsonrpc":"2.0","result":{...}}
+        Note over E: Route matches default<br/>HTTPRoute → mcp-gateway-route
+
+        E->>B: POST /mcp<br/>{"jsonrpc":"2.0","method":"tools/list"}
+
+        Note over B: 1. Fan out to all registered<br/>upstream MCP servers<br/>2. Prefix each tool with server name<br/>(e.g. "greet" → "op_greet")<br/>3. Aggregate responses
+
+        B->>S: POST /mcp<br/>{"jsonrpc":"2.0","method":"tools/list"}
+        S-->>B: {"tools": [{"name":"greet"}, ...]}
+
+        B-->>E: {"tools": [{"name":"op_greet"}, ...]}
+        E-->>C: Aggregated tools/list response<br/>(all servers, prefixed tool names)
+
+    else tools/call (direct routing path)
+        Note over C,S: 3b. tools/call → Router sends direct to server
+
+        Note over R: 1. Parse JSON-RPC body<br/>2. Extract tool name "op_greet"<br/>3. Strip prefix → "greet"<br/>4. Look up MCPServerRegistration<br/>5. Set :authority = test-server1.mcp.local
+
+        R-->>E: Modified headers<br/>:authority = test-server1.mcp.local<br/>tool = "greet" (prefix stripped)
+
+        Note over E: Route matches on :authority<br/>via HTTPRoute → test-server1 Service
+
+        E->>S: POST /mcp<br/>{"jsonrpc":"2.0","method":"tools/call",<br/>"params":{"name":"greet"}}
+        S-->>E: {"jsonrpc":"2.0","result":{...}}
+        E-->>C: {"jsonrpc":"2.0","result":{...}}
+    end
