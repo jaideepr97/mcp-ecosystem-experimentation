@@ -1,6 +1,6 @@
 # MCP Ecosystem Experimentation
 
-A chronological record of an incremental, AI-assisted experiment exploring the MCP Gateway and MCP Lifecycle Operator projects — from initial analysis through deployment, request tracing, authentication, and OAuth integration with MCP Inspector.
+A chronological record of an incremental, AI-assisted experiment that starts from a completely empty Kind cluster and builds up a production-adjacent MCP ecosystem — from initial project analysis through deployment, request tracing, authentication, OAuth integration, catalog-driven discovery, automated gateway registration, and production-grade per-tool authorization with Kuadrant.
 
 This document captures both the technical outcomes and the learning process: what the user asked at each step, how they scoped and directed the exploration, where they pushed back or changed direction, and how AI-assisted iteration allowed them to build deep understanding of complex distributed systems without prior expertise in every component.
 
@@ -433,7 +433,9 @@ This was a forward-looking question — having understood the basic auth flow, t
 
 ---
 
-## Architecture Summary
+## Architecture Summary (as of Phase 7)
+
+This snapshot captures the cluster state after Phase 7 — basic gateway routing with mini-oidc authentication and the Lua EnvoyFilter workaround for 401 responses. Catalog, Keycloak, and Kuadrant were not yet introduced.
 
 ### Components on the cluster
 
@@ -772,92 +774,6 @@ The list endpoint returns `toolCount` but not the tools themselves. Tools requir
 | Stale leader lease after operator restart | Manually deleted lease: `kubectl delete lease bed7462b.x-k8s.io` |
 | N+1 API calls for tools | Launcher makes per-server `/tools` call in a loop during `List()` |
 | Gateway code in launcher | Removed entirely — launcher only bridges catalog → operator; gateway registration handled by operator's gateway controller via annotation |
-
----
-
-## Updated Architecture Summary
-
-### Components on the cluster (after Phase 13)
-
-```
-Kind Node (mcp-gateway)
-|
-+-- catalog-system namespace
-|   +-- PostgreSQL StatefulSet + PVC + Secret + Service (catalog metadata backend)
-|   +-- Catalog ConfigMap (mcp-catalog-sources: sources.yaml + mcp-servers.yaml)
-|   +-- Catalog Deployment + ClusterIP Service (REST API on :8080)
-|
-+-- gateway-system namespace
-|   +-- Envoy pod (mcp-gateway-istio) — L7 proxy, data path
-|   +-- NodePort Service (30080 -> 8080, 30082 -> 8002) — external ingress
-|   +-- Gateway resource — declarative listener config
-|   +-- ReferenceGrant — cross-namespace permissions
-|   +-- EnvoyFilter (ext_proc) — injects Router into Envoy
-|   +-- EnvoyFilter (kuadrant-auth) — created by Kuadrant (ext_authz cluster)
-|   +-- WasmPlugin (kuadrant-mcp-gateway) — created by Kuadrant (auth enforcement)
-|   +-- AuthPolicy (mcp-auth-policy) — gateway-level JWT auth + 401 response
-|
-+-- kuadrant-system namespace
-|   +-- Authorino (auth engine, ext_authz gRPC server)
-|   +-- Authorino operator
-|   +-- Kuadrant operator (translates AuthPolicy → Authorino config + WasmPlugin)
-|   +-- Limitador + operator (rate limiting, not yet used)
-|   +-- DNS operator (not yet used)
-|
-+-- keycloak namespace
-|   +-- Keycloak 26.3 (OIDC provider, dev mode)
-|   +-- ConfigMap (realm-import) — mcp realm with clients, users, groups
-|   +-- Service + HTTPRoute (OAuth discovery path rewrite)
-|
-+-- istio-system namespace
-|   +-- istiod — programs Envoy via xDS
-|
-+-- mcp-system namespace
-|   +-- mcp-gateway pod (broker + router + controller)
-|   +-- MCPGatewayExtension — attaches to Gateway
-|   +-- HTTPRoute (mcp-gateway-route) — routes to broker
-|   +-- Secret (config) — upstream server list
-|
-+-- mcp-test namespace
-|   +-- mcp-launcher pod (catalog UI + deployer)
-|   +-- mcp-launcher Service + NodePort (30472 -> host port 8004)
-|   +-- mcp-launcher RBAC (ServiceAccount, ClusterRole, ClusterRoleBinding)
-|   +-- test-server1 pod + Service + HTTPRoute + MCPServerRegistration
-|   +-- test-server2 pod + Service + HTTPRoute + MCPServerRegistration
-|   +-- AuthPolicy (server1-auth-policy) — developers group + tool ACLs
-|   +-- AuthPolicy (server2-auth-policy) — ops group + tool ACLs
-|   +-- MCPServer CRs (with gateway-ref annotations)
-|
-+-- mcp-lifecycle-operator-system namespace
-|   +-- lifecycle operator pod (main reconciler + gateway reconciler)
-|
-+-- metallb-system namespace
-    +-- MetalLB (LoadBalancer IP assignment)
-```
-
-### External access
-
-| Port | Maps to | Service |
-|------|---------|---------|
-| localhost:8001 | nodePort 30080 → Envoy :8080 | MCP Gateway |
-| localhost:8002 | nodePort 30082 → Envoy :8002 → Keycloak | OIDC Provider |
-| localhost:8004 | nodePort 30472 → mcp-launcher :8080 | MCP Launcher UI |
-
-### The catalog → deploy → authorize → route pipeline (complete)
-
-```
-Catalog API (catalog-system)          — "what's available"
-  ↓ REST API
-MCP Launcher (mcp-test)               — "browse, configure, deploy"
-  ↓ creates MCPServer CR (with gateway-ref annotation)
-Lifecycle Operator (operator-system)  — "make it run AND make it routable"
-  ↓ creates Deployment + Service + HTTPRoute + MCPServerRegistration
-Kuadrant AuthPolicy (per-HTTPRoute)   — "who can call which tools"
-  ↓ CEL predicates: group membership + tool name
-Gateway (gateway-system)              — "route authorized requests to the server"
-```
-
-The end-to-end pipeline is now fully automated with per-tool authorization. A user browses the catalog, deploys a server, and the operator handles deployment + gateway registration. AuthPolicies on the auto-created HTTPRoutes enforce per-group, per-tool access control.
 
 ---
 
@@ -1250,6 +1166,94 @@ This means Alice sees all 10 tools in `tools/list` even though she can only call
 
 - **Istio**: Gateway API controller (istiod programs Envoy via xDS), traffic routing (HTTPRoutes → Envoy virtual hosts), ext_proc injection (Router filter)
 - **Kuadrant**: Authentication (JWT validation via Authorino), authorization (per-group per-tool ACLs), custom 401/403 responses, `.well-known` path exclusions
+
+---
+
+## Architecture Summary (as of Phase 13)
+
+This snapshot captures the cluster state after Phase 13 — the full pipeline from catalog discovery through deployment, gateway registration, and per-tool authorization with Kuadrant.
+
+### Components on the cluster
+
+```
+Kind Node (mcp-gateway)
+|
++-- catalog-system namespace
+|   +-- PostgreSQL StatefulSet + PVC + Secret + Service (catalog metadata backend)
+|   +-- Catalog ConfigMap (mcp-catalog-sources: sources.yaml + mcp-servers.yaml)
+|   +-- Catalog Deployment + ClusterIP Service (REST API on :8080)
+|
++-- gateway-system namespace
+|   +-- Envoy pod (mcp-gateway-istio) — L7 proxy, data path
+|   +-- NodePort Service (30080 -> 8080, 30082 -> 8002) — external ingress
+|   +-- Gateway resource — declarative listener config
+|   +-- ReferenceGrant — cross-namespace permissions
+|   +-- EnvoyFilter (ext_proc) — injects Router into Envoy
+|   +-- EnvoyFilter (kuadrant-auth) — created by Kuadrant (ext_authz cluster)
+|   +-- WasmPlugin (kuadrant-mcp-gateway) — created by Kuadrant (auth enforcement)
+|   +-- AuthPolicy (mcp-auth-policy) — gateway-level JWT auth + 401 response
+|
++-- kuadrant-system namespace
+|   +-- Authorino (auth engine, ext_authz gRPC server)
+|   +-- Authorino operator
+|   +-- Kuadrant operator (translates AuthPolicy → Authorino config + WasmPlugin)
+|   +-- Limitador + operator (rate limiting, not yet used)
+|   +-- DNS operator (not yet used)
+|
++-- keycloak namespace
+|   +-- Keycloak 26.3 (OIDC provider, dev mode)
+|   +-- ConfigMap (realm-import) — mcp realm with clients, users, groups
+|   +-- Service + HTTPRoute (OAuth discovery path rewrite)
+|
++-- istio-system namespace
+|   +-- istiod — programs Envoy via xDS
+|
++-- mcp-system namespace
+|   +-- mcp-gateway pod (broker + router + controller)
+|   +-- MCPGatewayExtension — attaches to Gateway
+|   +-- HTTPRoute (mcp-gateway-route) — routes to broker
+|   +-- Secret (config) — upstream server list
+|
++-- mcp-test namespace
+|   +-- mcp-launcher pod (catalog UI + deployer)
+|   +-- mcp-launcher Service + NodePort (30472 -> host port 8004)
+|   +-- mcp-launcher RBAC (ServiceAccount, ClusterRole, ClusterRoleBinding)
+|   +-- test-server1 pod + Service + HTTPRoute + MCPServerRegistration
+|   +-- test-server2 pod + Service + HTTPRoute + MCPServerRegistration
+|   +-- AuthPolicy (server1-auth-policy) — developers group + tool ACLs
+|   +-- AuthPolicy (server2-auth-policy) — ops group + tool ACLs
+|   +-- MCPServer CRs (with gateway-ref annotations)
+|
++-- mcp-lifecycle-operator-system namespace
+|   +-- lifecycle operator pod (main reconciler + gateway reconciler)
+|
++-- metallb-system namespace
+    +-- MetalLB (LoadBalancer IP assignment)
+```
+
+### External access
+
+| Port | Maps to | Service |
+|------|---------|---------|
+| localhost:8001 | nodePort 30080 → Envoy :8080 | MCP Gateway |
+| localhost:8002 | nodePort 30082 → Envoy :8002 → Keycloak | OIDC Provider |
+| localhost:8004 | nodePort 30472 → mcp-launcher :8080 | MCP Launcher UI |
+
+### The catalog → deploy → authorize → route pipeline (complete)
+
+```
+Catalog API (catalog-system)          — "what's available"
+  ↓ REST API
+MCP Launcher (mcp-test)               — "browse, configure, deploy"
+  ↓ creates MCPServer CR (with gateway-ref annotation)
+Lifecycle Operator (operator-system)  — "make it run AND make it routable"
+  ↓ creates Deployment + Service + HTTPRoute + MCPServerRegistration
+Kuadrant AuthPolicy (per-HTTPRoute)   — "who can call which tools"
+  ↓ CEL predicates: group membership + tool name
+Gateway (gateway-system)              — "route authorized requests to the server"
+```
+
+The end-to-end pipeline is now fully automated with per-tool authorization. A user browses the catalog, deploys a server, and the operator handles deployment + gateway registration. AuthPolicies on the auto-created HTTPRoutes enforce per-group, per-tool access control.
 
 ---
 
