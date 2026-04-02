@@ -777,7 +777,7 @@ The list endpoint returns `toolCount` but not the tools themselves. Tools requir
 
 ## Updated Architecture Summary
 
-### Components on the cluster (after Phase 11)
+### Components on the cluster (after Phase 13)
 
 ```
 Kind Node (mcp-gateway)
@@ -789,12 +789,25 @@ Kind Node (mcp-gateway)
 |
 +-- gateway-system namespace
 |   +-- Envoy pod (mcp-gateway-istio) — L7 proxy, data path
-|   +-- NodePort Service (30080 -> 8080) — external ingress
+|   +-- NodePort Service (30080 -> 8080, 30082 -> 8002) — external ingress
 |   +-- Gateway resource — declarative listener config
 |   +-- ReferenceGrant — cross-namespace permissions
-|   +-- RequestAuthentication — JWT validation rules
 |   +-- EnvoyFilter (ext_proc) — injects Router into Envoy
-|   +-- EnvoyFilter (Lua) — 401 auth challenge for unauthenticated requests
+|   +-- EnvoyFilter (kuadrant-auth) — created by Kuadrant (ext_authz cluster)
+|   +-- WasmPlugin (kuadrant-mcp-gateway) — created by Kuadrant (auth enforcement)
+|   +-- AuthPolicy (mcp-auth-policy) — gateway-level JWT auth + 401 response
+|
++-- kuadrant-system namespace
+|   +-- Authorino (auth engine, ext_authz gRPC server)
+|   +-- Authorino operator
+|   +-- Kuadrant operator (translates AuthPolicy → Authorino config + WasmPlugin)
+|   +-- Limitador + operator (rate limiting, not yet used)
+|   +-- DNS operator (not yet used)
+|
++-- keycloak namespace
+|   +-- Keycloak 26.3 (OIDC provider, dev mode)
+|   +-- ConfigMap (realm-import) — mcp realm with clients, users, groups
+|   +-- Service + HTTPRoute (OAuth discovery path rewrite)
 |
 +-- istio-system namespace
 |   +-- istiod — programs Envoy via xDS
@@ -809,13 +822,11 @@ Kind Node (mcp-gateway)
 |   +-- mcp-launcher pod (catalog UI + deployer)
 |   +-- mcp-launcher Service + NodePort (30472 -> host port 8004)
 |   +-- mcp-launcher RBAC (ServiceAccount, ClusterRole, ClusterRoleBinding)
-|   +-- test-server1 pod (test MCP server, created by lifecycle operator)
-|   +-- test-server1 Service (created by lifecycle operator)
-|   +-- test-server1 HTTPRoute (created by gateway controller, routes to gateway)
-|   +-- test-server1 MCPServerRegistration (created by gateway controller)
-|   +-- MCPServer CR (lifecycle operator input, with gateway-ref annotation)
-|   +-- mini-oidc pod (custom OIDC provider)
-|   +-- mini-oidc Services (ClusterIP + NodePort 30471)
+|   +-- test-server1 pod + Service + HTTPRoute + MCPServerRegistration
+|   +-- test-server2 pod + Service + HTTPRoute + MCPServerRegistration
+|   +-- AuthPolicy (server1-auth-policy) — developers group + tool ACLs
+|   +-- AuthPolicy (server2-auth-policy) — ops group + tool ACLs
+|   +-- MCPServer CRs (with gateway-ref annotations)
 |
 +-- mcp-lifecycle-operator-system namespace
 |   +-- lifecycle operator pod (main reconciler + gateway reconciler)
@@ -829,10 +840,10 @@ Kind Node (mcp-gateway)
 | Port | Maps to | Service |
 |------|---------|---------|
 | localhost:8001 | nodePort 30080 → Envoy :8080 | MCP Gateway |
-| localhost:8003 | nodePort 30471 → mini-oidc :9090 | OIDC Provider |
+| localhost:8002 | nodePort 30082 → Envoy :8002 → Keycloak | OIDC Provider |
 | localhost:8004 | nodePort 30472 → mcp-launcher :8080 | MCP Launcher UI |
 
-### The catalog → deploy → route pipeline (complete)
+### The catalog → deploy → authorize → route pipeline (complete)
 
 ```
 Catalog API (catalog-system)          — "what's available"
@@ -841,10 +852,12 @@ MCP Launcher (mcp-test)               — "browse, configure, deploy"
   ↓ creates MCPServer CR (with gateway-ref annotation)
 Lifecycle Operator (operator-system)  — "make it run AND make it routable"
   ↓ creates Deployment + Service + HTTPRoute + MCPServerRegistration
-Gateway (gateway-system)              — "route requests to the server"
+Kuadrant AuthPolicy (per-HTTPRoute)   — "who can call which tools"
+  ↓ CEL predicates: group membership + tool name
+Gateway (gateway-system)              — "route authorized requests to the server"
 ```
 
-The end-to-end pipeline is now fully automated. A user browses the catalog, deploys a server, and the operator handles both deployment and gateway registration.
+The end-to-end pipeline is now fully automated with per-tool authorization. A user browses the catalog, deploys a server, and the operator handles deployment + gateway registration. AuthPolicies on the auto-created HTTPRoutes enforce per-group, per-tool access control.
 
 ---
 
@@ -1089,6 +1102,157 @@ This validates the complete production-grade auth flow: device authorization gra
 
 ---
 
+## Phase 13: Kuadrant AuthPolicy — From Binary Auth to Per-Tool Authorization
+
+> **Goal**: Replace the three Istio auth workarounds (RequestAuthentication + AuthorizationPolicy + Lua EnvoyFilter) with Kuadrant's AuthPolicy, then push authorization granularity as far as possible.
+
+### Installing Kuadrant
+
+> **User instruction**: *"Stick to the minimum as always!"*
+
+Installed via Helm into `kuadrant-system` namespace, then created the Kuadrant CR from mcp-gateway's config. This brought up Authorino (auth engine), its operator, Limitador (rate limiting — not yet used), and a DNS operator.
+
+### AuthPolicy replaces three Istio workarounds
+
+A single AuthPolicy replaced RequestAuthentication + AuthorizationPolicy + Lua EnvoyFilter:
+
+```yaml
+apiVersion: kuadrant.io/v1
+kind: AuthPolicy
+metadata:
+  name: mcp-auth-policy
+  namespace: gateway-system
+spec:
+  targetRef:
+    group: gateway.networking.k8s.io
+    kind: Gateway
+    name: mcp-gateway
+    sectionName: mcp
+  defaults:
+    when:
+      - predicate: "!request.path.contains('/.well-known')"
+    rules:
+      authentication:
+        "keycloak":
+          jwt:
+            issuerUrl: http://keycloak.127-0-0-1.sslip.io:8002/realms/mcp
+    response:
+      unauthenticated:
+        headers:
+          "WWW-Authenticate":
+            value: >-
+              Bearer resource_metadata="http://mcp.127-0-0-1.sslip.io:8001/.well-known/oauth-protected-resource"
+        body:
+          value: |
+            {"error":"Unauthorized","message":"Authentication required."}
+```
+
+Key points:
+- `sectionName: mcp` targets only the MCP listener, leaving Keycloak's port 8002 unaffected
+- `defaults.when` excludes `.well-known` paths from auth entirely (must be at `defaults` level, not inside `rules`)
+- Custom `unauthenticated` response returns proper 401 + `WWW-Authenticate` — no more Lua hacks
+
+### CoreDNS fix for in-cluster Keycloak resolution
+
+Authorino couldn't reach Keycloak because `keycloak.127-0-0-1.sslip.io` resolved to `127.0.0.1` inside pods. Fixed by patching CoreDNS with a hosts plugin mapping to the gateway's LoadBalancer IP (`10.89.0.0`). This is cleaner than mcp-gateway's `/etc/hosts` node patching approach — works cluster-wide for all pods.
+
+### Discovering the filter chain order
+
+The initial assumption was that Authorino's auth check ran before the Router's body parsing, which would make per-server and per-tool authorization impossible at the gateway layer (all requests would look identical to Authorino). This turned out to be wrong.
+
+> **User (from a separate session)**: *"ext_proc is set to run BEFORE ext_authz, so the request body parsing will already be done by the router/broker and a header set before it gets to authorino"*
+
+The Envoy config dump confirmed this:
+
+```
+1. envoy.filters.http.ext_proc                               ← Router runs FIRST
+2. extensions.istio.io/wasmplugin/kuadrant-mcp-gateway        ← Kuadrant Wasm auth runs SECOND
+3. ... other filters ...
+9. envoy.filters.http.router                                  ← routing decision
+```
+
+By the time the auth check happens, the Router has already parsed the JSON-RPC body and set headers visible to Authorino:
+
+| Header | Value | Example |
+|--------|-------|---------|
+| `:authority` | Server hostname (rewritten) | `test-server1.mcp.local` |
+| `x-mcp-toolname` | Tool name (prefix stripped) | `greet` |
+| `x-mcp-servername` | Server namespace/name | `mcp-test/test-server1` |
+| `x-mcp-method` | JSON-RPC method | `tools/call` |
+
+**Note**: Kuadrant implements auth via a Wasm plugin, not a raw ext_authz HTTP filter. This is why the Kuadrant EnvoyFilter only adds a cluster definition — the Wasm plugin was not visible in EnvoyFilter resources, only in the Envoy config dump.
+
+### Server-level authorization
+
+With the filter chain order confirmed, per-HTTPRoute AuthPolicies work. A second test server was deployed (same image, different name), and per-server AuthPolicies were created:
+
+```yaml
+# server1-auth-policy targets HTTPRoute test-server1
+authorization:
+  "require-developers":
+    patternMatching:
+      patterns:
+        - predicate: "auth.identity.groups.exists(g, g == 'developers')"
+```
+
+Results: Alice (developers) could call server1 tools, Bob (ops) could call server2 tools, Carol (both groups) could call both. Denied requests returned 403 from Authorino.
+
+### Tool-level authorization
+
+The `x-mcp-toolname` header enables per-tool restrictions. Adding a tool check to the authorization rules:
+
+```yaml
+authorization:
+  "allowed-tools":
+    patternMatching:
+      patterns:
+        - predicate: "request.headers['x-mcp-toolname'] in ['greet', 'time', 'add_tool']"
+```
+
+**Note**: The header name is `x-mcp-toolname` (no hyphens between words), not `x-mcp-tool-name`. This was discovered via Authorino debug logs — the initial assumption about the header name caused "no such key" errors.
+
+### Cross-server per-group per-tool authorization
+
+> **User instruction**: *"Can you also cover the case where Alice has access to tool-a, tool-b from server1 and tool-c from server2 and Bob has access to tool-b from server1 and tool-d from server2?"*
+
+This required combining group and tool checks in a single CEL predicate using OR logic:
+
+```yaml
+authorization:
+  "group-tool-access":
+    patternMatching:
+      patterns:
+        - predicate: >-
+            (auth.identity.groups.exists(g, g == 'developers') && request.headers['x-mcp-toolname'] in ['greet', 'time'])
+            || (auth.identity.groups.exists(g, g == 'ops') && request.headers['x-mcp-toolname'] in ['time', 'headers'])
+```
+
+Full test matrix — 30 test cases, all passing:
+
+| User | Group | Server1 allowed | Server1 denied | Server2 allowed | Server2 denied |
+|------|-------|----------------|----------------|-----------------|----------------|
+| Alice | developers | greet, time | headers, slow, add_tool | slow | greet, headers, add_tool |
+| Bob | ops | time, headers | greet, slow, add_tool | headers, add_tool | greet, time, slow |
+| Carol | both | greet, time, headers | slow, add_tool | slow, headers, add_tool | greet, time |
+
+This is production-grade per-user authorization at the gateway level with:
+- **No code changes to mcp-gateway** — purely declarative AuthPolicy CRs
+- **No duplicated JSON-RPC parsing** — the Router sets headers, Authorino reads them
+- **CEL predicates** combining group membership with tool identity
+
+### Remaining gap: `tools/list` filtering
+
+For `tools/call`, authorization is fully enforced at the gateway. But `tools/list` returns all tools to all users regardless of permissions. The broker aggregates tools from all servers and returns the full list — the gateway cannot selectively filter items within a JSON-RPC response body.
+
+This means Alice sees all 10 tools in `tools/list` even though she can only call 3 of them. Unauthorized calls are denied with 403, so it's not a security issue, but it's a confusing UX. Fixing this requires application-level changes to the broker to filter the tool list based on JWT claims.
+
+### What Istio still handles vs what Kuadrant now handles
+
+- **Istio**: Gateway API controller (istiod programs Envoy via xDS), traffic routing (HTTPRoutes → Envoy virtual hosts), ext_proc injection (Router filter)
+- **Kuadrant**: Authentication (JWT validation via Authorino), authorization (per-group per-tool ACLs), custom 401/403 responses, `.well-known` path exclusions
+
+---
+
 ## Key Learnings
 
 1. **Istio is not a service mesh here** — only istiod is used, purely as a Gateway API controller that programs Envoy. No sidecars, no ambient mode.
@@ -1136,6 +1300,18 @@ This validates the complete production-grade auth flow: device authorization gra
 22. **Keycloak 26 requires firstName/lastName even when optional** — user profile fields marked as optional in Keycloak's profile configuration are still required for the password grant flow. Without them, the token endpoint returns "Account is not fully set up." This is a Keycloak-specific behavior, not an OIDC standard requirement.
 
 23. **Device authorization grant is the right pattern for CLI MCP clients** — unlike password grant (client handles credentials directly) or authorization code + PKCE (requires browser redirect URI handling), the device flow lets a CLI tool authenticate users through the browser without embedding credentials or handling callbacks. Keycloak supports it out of the box with a single client attribute (`oauth2.device.authorization.grant.enabled`). The flow is identical to `gh auth login` and `gcloud auth login`.
+
+24. **Envoy filter chain order enables gateway-level tool authorization** — ext_proc (Router) runs before the Kuadrant Wasm plugin (auth) in Envoy's HTTP filter chain. By the time auth runs, the Router has already parsed the JSON-RPC body and set headers (`x-mcp-toolname`, `x-mcp-servername`, `:authority`). This means Authorino can authorize based on tool name and server identity without duplicating body parsing. The initial assumption that auth ran before routing was wrong — verified via `curl localhost:15000/config_dump` on the Envoy pod.
+
+25. **Kuadrant uses a Wasm plugin, not raw ext_authz** — the Kuadrant operator's EnvoyFilter only adds a cluster definition for Authorino. The actual HTTP filter is a Wasm plugin (`extensions.istio.io/wasmplugin/kuadrant-mcp-gateway`) that the operator manages via a WasmPlugin resource. This is not visible in EnvoyFilter resources — only in the Envoy config dump or `kubectl get wasmplugin`. Understanding this is critical for debugging auth issues.
+
+26. **CEL predicates in AuthPolicy combine group and tool checks** — a single `patternMatching` predicate can express "developers can call tools A and B, ops can call tools B and C" using OR logic. Multiple authorization rules are AND'd, but within a predicate you can use `||`. This gives production-grade per-group per-tool authorization with no code changes to the gateway.
+
+27. **Header names from the Router don't match intuition** — the Router sets `x-mcp-toolname` (no hyphens between words), not `x-mcp-tool-name`. This caused "no such key" errors in Authorino that were only visible in Authorino's debug logs. Always verify actual header names from the Envoy config dump or Authorino logs rather than assuming.
+
+28. **`tools/list` is the authorization blind spot** — gateway-level AuthPolicy can enforce `tools/call` authorization because the Router identifies the tool and sets headers. But `tools/list` goes to the broker (no `:authority` rewrite, no tool-specific headers), and the broker returns all tools to all users. Filtering `tools/list` by user identity requires broker code changes — the gateway cannot selectively filter items within a JSON-RPC response body.
+
+29. **Denied server access returns 500, denied tool access returns 403** — when a user is blocked from an entire server, the broker can't establish a session and wraps the 403 as a generic "failed to create session" 500 error. When a user can reach the server but is denied a specific tool, the 403 from Authorino passes through cleanly. The 500 is a presentation issue in the broker — it doesn't distinguish "server is down" from "you're not authorized."
 
 ---
 

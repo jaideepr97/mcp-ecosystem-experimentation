@@ -104,12 +104,12 @@ Without at least one of these, every new MCP server added to the catalog is a po
 - **Observation:** Keycloak 26 requires `firstName`/`lastName` on user profiles for password grant even when these fields are marked optional in the user profile configuration. Without them, the token endpoint returns "Account is not fully set up."
 - **Observation:** istiod caches JWKS as inline `local_jwks` in Envoy config. When Keycloak's dev mode regenerates signing keys on pod restart, istiod does not re-fetch. Both istiod and gateway pods must be restarted. Production Keycloak with persistent storage would not have this issue.
 
-### Istio auth resources (modified for Keycloak)
-- **AuthorizationPolicy** initially changed from ALLOW to DENY semantics, scoped to port 8080. Then **deleted from cluster entirely** because RBAC filter runs before the Lua EnvoyFilter in Envoy's filter chain — unauthenticated requests got 403 from RBAC before the Lua filter could return 401 with `WWW-Authenticate`. File kept in repo for reference but not applied. Auth enforcement currently relies on Lua filter + RequestAuthentication only. This will be properly handled by Kuadrant AuthPolicy in Phase 13.
-- **RequestAuthentication** updated to point to Keycloak's issuer (`http://keycloak.127-0-0-1.sslip.io:8002/realms/mcp`) and JWKS endpoint (in-cluster: `http://keycloak.keycloak.svc.cluster.local/realms/mcp/protocol/openid-connect/certs`). Mini-oidc issuer removed.
-- **EnvoyFilter** (Lua 401 challenge) — no changes needed, already scoped to port 8080 and not referencing any specific OIDC provider.
-- **Observation:** ALLOW-based auth policies don't compose well when adding new gateway listeners. Each new listener needs explicit exemption. DENY-based policies scoped to specific ports are more extensible.
-- **Observation:** Envoy filter chain ordering (RBAC before Lua) prevents combining AuthorizationPolicy enforcement with custom 401 responses from EnvoyFilter. This is a fundamental constraint of the Istio auth model.
+### Istio auth resources (removed in Phase 13)
+- **All three Istio auth resources** (RequestAuthentication, AuthorizationPolicy, Lua EnvoyFilter) have been **deleted from the cluster and removed from the repo**. They were replaced by Kuadrant AuthPolicy which handles authentication, authorization, and custom response formatting in a single CR.
+- **Historical observations** (from Phases 6-12, now resolved by Kuadrant):
+  - ALLOW-based auth policies don't compose well with multiple gateway listeners
+  - Envoy filter chain ordering (RBAC before Lua) prevented combining AuthorizationPolicy enforcement with custom 401 responses
+  - These constraints are specific to Istio's auth model and do not apply to Kuadrant's Wasm-based approach
 
 ### mcp-gateway (runtime configuration)
 - **`OAUTH_AUTHORIZATION_SERVERS` env var** set on `mcp-gateway` deployment in `mcp-system` — populates `authorization_servers` in `/.well-known/oauth-protected-resource`. Value must be the Keycloak issuer identifier (`http://keycloak.127-0-0-1.sslip.io:8002/realms/mcp`), not the `.well-known` URL, per RFC 9728.
@@ -123,6 +123,55 @@ Without at least one of these, every new MCP server added to the catalog is a po
 - Accepts both JSON (`{"name": "value"}`) and key=value (`name=value`) input formats for tool arguments.
 - **Why:** MCP Inspector's browser-based OAuth discovery fails with Keycloak's path-based issuer. Rather than debugging an Inspector-specific issue, the device flow provides a production-grade alternative that also serves as a reusable test client.
 
+### Kuadrant operator (Phase 13)
+- **Installed via Helm** into `kuadrant-system` namespace. Kuadrant CR created from mcp-gateway's config.
+- Components running: Authorino (auth engine), Authorino operator, Kuadrant operator, Limitador + operator (rate limiting, not yet used), DNS operator (not yet used).
+- **AuthPolicy** (`auth/authpolicy.yaml`) replaces three Istio auth workarounds (RequestAuthentication, AuthorizationPolicy, Lua EnvoyFilter) with a single CR. Uses Authorino as `ext_authz` in Envoy's filter chain, giving full control over denial responses (proper 401 + `WWW-Authenticate`).
+- **CoreDNS patch** applied to `kube-system` — maps `keycloak.127-0-0-1.sslip.io → 10.89.0.0` (gateway LB IP) so Authorino can reach Keycloak from inside the cluster. Cleaner than mcp-gateway's `/etc/hosts` node patching approach.
+- Old Istio auth resources (`RequestAuthentication`, `EnvoyFilter/mcp-auth-401`) deleted from cluster. `AuthorizationPolicy` was already deleted in Phase 12.
+
+### 6. Per-user tool-level authorization at the gateway — working (Phase 13)
+
+Per-group, per-tool, cross-server authorization is fully working at the gateway level using Kuadrant AuthPolicy. No code changes to mcp-gateway were required.
+
+#### How it works
+
+The Envoy filter chain order is key: ext_proc (Router) runs **before** the Kuadrant Wasm auth plugin. By the time auth runs, the Router has already parsed the JSON-RPC body and set headers:
+- `x-mcp-toolname` — the tool name (prefix stripped)
+- `x-mcp-servername` — the server namespace/name
+- `:authority` — rewritten to the server's HTTPRoute hostname
+
+Per-HTTPRoute AuthPolicies target individual server HTTPRoutes (created automatically by the operator's gateway controller). CEL predicates combine group membership with tool name:
+
+```yaml
+authorization:
+  "group-tool-access":
+    patternMatching:
+      patterns:
+        - predicate: >-
+            (auth.identity.groups.exists(g, g == 'developers') && request.headers['x-mcp-toolname'] in ['greet', 'time'])
+            || (auth.identity.groups.exists(g, g == 'ops') && request.headers['x-mcp-toolname'] in ['time', 'headers'])
+```
+
+#### Test results (30/30 passing)
+
+| User | Group | Server1 allowed | Server2 allowed |
+|------|-------|----------------|-----------------|
+| Alice | developers | greet, time | slow |
+| Bob | ops | time, headers | headers, add_tool |
+| Carol | both | greet, time, headers | slow, headers, add_tool |
+
+#### Remaining gap: `tools/list` filtering
+
+`tools/call` authorization is fully enforced. But `tools/list` returns all tools to all users because the broker aggregates without filtering. A user denied access to a tool via AuthPolicy would still see it in the tool list but get 403 when calling it. Fixing this requires broker-side changes to filter tools based on JWT claims — the gateway cannot selectively filter items within a JSON-RPC response.
+
+#### Response code inconsistency
+
+- Tool denied on an accessible server → clean **403** from Authorino
+- Entire server denied (no allowed tools) → **500** from broker ("failed to create session") because it wraps the 403 as a transport error
+
+The 500 is a presentation issue in the broker — it doesn't distinguish "server is down" from "you're not authorized."
+
 ### mini-oidc (removed)
 - **Removed from cluster and experiment repo.** Replaced entirely by Keycloak.
 - mini-oidc served its purpose as an educational tool for understanding OIDC flows (Phase 4). For multi-tenancy and role-based access control, Keycloak provides the necessary user/group/role management.
@@ -135,6 +184,7 @@ Without at least one of these, every new MCP server added to the catalog is a po
 - Launcher Deployment + Service + NodePort in `mcp-test`
 - Keycloak namespace + ConfigMap (realm-import) + Deployment + Service in `keycloak`
 - Gateway patch (HTTP listener on port 8002) + HTTPRoute for Keycloak
-- EnvoyFilter `mcp-auth-401` in `gateway-system`
-- RequestAuthentication `mcp-jwt-auth` in `gateway-system`
-- AuthorizationPolicy `mcp-require-jwt` in `gateway-system` (file in repo but deleted from cluster — RBAC/Lua filter ordering conflict)
+- AuthPolicy `mcp-auth-policy` in `gateway-system` (gateway-level JWT auth + 401 response)
+- AuthPolicy `server1-auth-policy` in `mcp-test` (per-HTTPRoute, developers group + tool ACLs)
+- AuthPolicy `server2-auth-policy` in `mcp-test` (per-HTTPRoute, ops group + tool ACLs)
+- MCPServer `test-server2` in `mcp-test` (second test server for multi-server auth testing)

@@ -1,0 +1,35 @@
+apiVersion: kuadrant.io/v1
+kind: AuthPolicy
+metadata:
+  name: server2-auth-policy
+  namespace: mcp-test
+spec:
+  targetRef:
+    group: gateway.networking.k8s.io
+    kind: HTTPRoute
+    name: test-server2
+  rules:
+    authentication:
+      "keycloak":
+        jwt:
+          issuerUrl: http://keycloak.127-0-0-1.sslip.io:8002/realms/mcp
+    authorization:
+      "group-tool-access":
+        patternMatching:
+          patterns:
+            - predicate: >-
+                (auth.identity.groups.exists(g, g == 'developers') && request.headers['x-mcp-toolname'] in ['slow'])
+                || (auth.identity.groups.exists(g, g == 'ops') && request.headers['x-mcp-toolname'] in ['headers', 'add_tool'])
+    response:
+      unauthenticated:
+        headers:
+          "WWW-Authenticate":
+            value: >-
+              Bearer resource_metadata="http://mcp.127-0-0-1.sslip.io:8001/.well-known/oauth-protected-resource"
+        body:
+          value: |
+            {"error":"Unauthorized","message":"Authentication required."}
+      unauthorized:
+        body:
+          value: |
+            {"error":"Forbidden","message":"You do not have access to this tool."}

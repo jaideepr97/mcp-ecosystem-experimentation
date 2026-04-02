@@ -1,6 +1,6 @@
 # MCP Ecosystem Experimentation
 
-A reproducible experiment exploring how four MCP ecosystem projects work together end-to-end: **discovery** (model-registry catalog), **deployment** (lifecycle operator), **routing** (mcp-gateway), and **authentication** (Keycloak + Istio).
+A reproducible experiment exploring how five MCP ecosystem projects work together end-to-end: **discovery** (model-registry catalog), **deployment** (lifecycle operator), **routing** (mcp-gateway), **authentication** (Keycloak + Kuadrant/Authorino), and **per-tool authorization** (AuthPolicy with CEL predicates).
 
 ## Acknowledgements
 
@@ -18,12 +18,14 @@ MCP Launcher         — "browse, configure, deploy"
   ↓ creates MCPServer CR (with gateway-ref annotation)
 Lifecycle Operator   — "make it run AND make it routable"
   ↓ creates Deployment + Service + HTTPRoute + MCPServerRegistration
+Kuadrant AuthPolicy  — "who can call which tools on which servers"
+  ↓ per-HTTPRoute policies with CEL predicates
 MCP Gateway          — "route requests securely to the server"
 ```
 
 ## Documentation
 
-- [docs/experimentation.md](docs/experimentation.md) — Full chronological narrative of the experiment, from initial project analysis through deployment, request tracing, authentication, catalog integration, and gateway automation
+- [docs/experimentation.md](docs/experimentation.md) — Full chronological narrative of the experiment, from initial project analysis through deployment, request tracing, authentication, catalog integration, gateway automation, and per-tool authorization
 - [docs/changes-tracker.md](docs/changes-tracker.md) — Structured changelog of every code modification and integration friction point discovered
 - [docs/diagrams/](docs/diagrams/) — Mermaid diagrams of the architecture, request flow, pipeline, and operator reconciliation logic
 
@@ -131,30 +133,67 @@ kubectl apply -f keycloak/httproute.yaml
 kubectl wait --for=condition=Ready pod -l app=keycloak -n keycloak --timeout=120s
 ```
 
-Then apply the Istio auth resources:
+### Step 5: Kuadrant operator (auth enforcement)
 
 ```bash
-kubectl apply -f auth/request-authentication.yaml
-kubectl apply -f auth/authorization-policy.yaml
-kubectl apply -f auth/envoyfilter-401.yaml
+helm repo add kuadrant https://kuadrant.io/helm-charts/
+helm install kuadrant-operator kuadrant/kuadrant-operator -n kuadrant-system --create-namespace
+
+# Create the Kuadrant CR (from mcp-gateway's config)
+kubectl apply -f /path/to/mcp-gateway/config/kuadrant/kuadrant.yaml
+
+# Wait for Authorino to be ready
+kubectl wait --for=condition=Ready pod -l app=authorino -n kuadrant-system --timeout=120s
+
+# Patch CoreDNS so Authorino can reach Keycloak via the gateway
+# (sslip.io resolves to 127.0.0.1 inside pods — need to map to gateway LB IP)
+GATEWAY_IP=$(kubectl get svc -n gateway-system -l gateway.networking.k8s.io/gateway-name=mcp-gateway -o jsonpath='{.items[0].status.loadBalancer.ingress[0].ip}')
+kubectl get configmap coredns -n kube-system -o yaml | \
+  sed "s/ready/hosts {\n          $GATEWAY_IP keycloak.127-0-0-1.sslip.io\n          fallthrough\n        }\n        ready/" | \
+  kubectl apply -f -
+kubectl rollout restart deployment coredns -n kube-system
 ```
 
-### Step 5: MCP Launcher
+Apply the gateway-level AuthPolicy (JWT auth + 401 response):
+
+```bash
+kubectl apply -f auth/authpolicy.yaml
+```
+
+### Step 6: MCP Launcher
 
 ```bash
 kubectl apply -f launcher/rbac.yaml
 kubectl apply -f launcher/deployment.yaml
 ```
 
-### Step 6: Deploy a server from the catalog
+### Step 7: Deploy servers and apply per-server AuthPolicies
 
-Open the launcher UI at http://localhost:8004, browse the catalog, click "Edit YAML" on the configure page, and paste the example YAML:
+Deploy MCP servers (via launcher UI at http://localhost:8004 or directly):
 
 ```bash
 kubectl apply -f examples/test-server1.yaml
+kubectl apply -f examples/test-server2.yaml
+
+# Wait for the operator to create Deployments, Services, HTTPRoutes, and MCPServerRegistrations
+kubectl wait --for=condition=Ready mcpserver/test-server1 -n mcp-test --timeout=120s
+kubectl wait --for=condition=Ready mcpserver/test-server2 -n mcp-test --timeout=120s
+
+# Restart mcp-gateway to pick up new registrations (if needed)
+kubectl rollout restart deployment mcp-gateway -n mcp-system
 ```
 
-Or use the launcher's YAML editor to deploy interactively.
+Apply per-server AuthPolicies for tool-level authorization:
+
+```bash
+kubectl apply -f auth/authpolicy-server1.yaml
+kubectl apply -f auth/authpolicy-server2.yaml
+```
+
+These policies enforce per-group, per-tool access control:
+- **server1**: `developers` can call greet+time, `ops` can call time+headers
+- **server2**: `developers` can call slow, `ops` can call headers+add_tool
+- Users in both groups (carol) get the union of permissions
 
 ## Accessing services
 
@@ -216,10 +255,10 @@ curl -s -H "Authorization: Bearer $TOKEN" \
 │   ├── deployment.yaml                # Keycloak 26.3 dev mode + Service
 │   ├── gateway-patch.json             # HTTP listener on port 8002
 │   └── httproute.yaml                 # Routes with OAuth discovery path rewrite
-├── auth/                          # gateway-system namespace
-│   ├── request-authentication.yaml    # JWT validation (Keycloak issuer)
-│   ├── authorization-policy.yaml      # DENY unauthenticated on port 8080
-│   └── envoyfilter-401.yaml           # Lua 401 + WWW-Authenticate response
+├── auth/                          # Kuadrant AuthPolicies
+│   ├── authpolicy.yaml                # Gateway-level JWT auth + 401 response
+│   ├── authpolicy-server1.yaml        # Per-server: developers + tool ACLs
+│   └── authpolicy-server2.yaml        # Per-server: ops + tool ACLs
 ├── launcher/                      # mcp-test namespace
 │   ├── rbac.yaml
 │   └── deployment.yaml
@@ -229,7 +268,8 @@ curl -s -H "Authorization: Bearer $TOKEN" \
 ├── scripts/
 │   └── mcp-client.sh              # Interactive MCP client (device auth flow)
 └── examples/
-    └── test-server1.yaml          # MCPServer CR with gateway annotation
+    ├── test-server1.yaml          # MCPServer CR with gateway annotation
+    └── test-server2.yaml          # Second test server (same image, different name)
 ```
 
 ## Custom images
@@ -246,10 +286,14 @@ Pre-built images are available on quay.io:
 
 The experiment surfaced several integration friction points documented in detail in [docs/changes-tracker.md](docs/changes-tracker.md). The most significant:
 
-1. **Catalog metadata is insufficient for deployment** — `runtimeMetadata` covers port and path but not container command, arguments, or security context. Each MCP server image is potentially a snowflake.
+1. **Per-tool authorization works at the gateway with no code changes** — Kuadrant AuthPolicy + CEL predicates enable per-group, per-tool, cross-server authorization. The Router sets `x-mcp-toolname` and `:authority` headers before the auth check runs, giving Authorino full visibility into tool and server identity.
 
-2. **OCI images are opaque to orchestrators** — without a standardized contract for MCP server images, every new server added to the catalog is a potential deployment failure requiring human debugging.
+2. **Envoy filter chain order is critical** — ext_proc (Router) runs before the Kuadrant Wasm plugin (auth). This was initially assumed to be the opposite, which would have made per-tool authorization impossible at the gateway. Always verify filter chain order via the Envoy config dump.
 
-3. **The annotation-based gateway integration pattern works well** — using `mcp.x-k8s.io/gateway-ref` annotations on MCPServer CRs avoids upstream spec changes while enabling automatic gateway registration.
+3. **`tools/list` is the authorization blind spot** — `tools/call` is fully enforced at the gateway, but `tools/list` returns all tools to all users. The broker aggregates without identity-based filtering, requiring application-level changes for consistent UX.
 
-See [docs/experimentation.md](docs/experimentation.md) for the full narrative including the auth layer investigation (Istio 403 vs OAuth 401), the OIDC/PKCE flow, the Keycloak migration, and the architectural evolution.
+4. **Catalog metadata is insufficient for deployment** — `runtimeMetadata` covers port and path but not container command, arguments, or security context. Each MCP server image is potentially a snowflake.
+
+5. **The annotation-based gateway integration pattern works well** — using `mcp.x-k8s.io/gateway-ref` annotations on MCPServer CRs avoids upstream spec changes while enabling automatic gateway registration.
+
+See [docs/experimentation.md](docs/experimentation.md) for the full narrative including the auth layer investigation (Istio 403 vs OAuth 401), the OIDC/PKCE flow, the Keycloak migration, and the per-tool authorization evolution.

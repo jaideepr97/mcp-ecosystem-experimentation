@@ -15,11 +15,16 @@ graph TB
             envoy["Envoy Proxy<br/>(mcp-gateway-istio :8080/:8002)"]
             gateway-res["Gateway Resource"]
             ref-grant["ReferenceGrant"]
-            req-auth["RequestAuthentication<br/>(JWT validation → Keycloak JWKS)"]
             ef-extproc["EnvoyFilter<br/>(ext_proc → Router)"]
-            ef-lua["EnvoyFilter<br/>(Lua 401 + WWW-Authenticate)"]
+            gw-authpolicy["AuthPolicy<br/>(mcp-auth-policy)<br/>JWT auth + 401 response"]
             nodeport-gw["NodePort Service<br/>30080 → 8080 (MCP)<br/>30082 → 8002 (Keycloak)"]
             nodeport-gw --> envoy
+        end
+
+        subgraph kuadrant-system["kuadrant-system namespace"]
+            authorino["Authorino<br/>(auth engine)"]
+            kuadrant-op["Kuadrant Operator"]
+            limitador["Limitador<br/>(rate limiting)"]
         end
 
         subgraph keycloak-ns["keycloak namespace"]
@@ -46,14 +51,22 @@ graph TB
         subgraph mcp-test["mcp-test namespace"]
             launcher["MCP Launcher<br/>(catalog UI + deployer :8080)"]
             launcher-rbac["RBAC<br/>(SA + ClusterRole + CRB)"]
-            mcpserver-cr["MCPServer CR<br/>(with gateway-ref annotation)"]
-            server-pod["test-server1 pod<br/>(MCP server :9090)"]
-            server-svc["test-server1 Service"]
-            server-httproute["HTTPRoute<br/>(test-server1)"]
-            server-reg["MCPServerRegistration<br/>(test-server1)"]
+            mcpserver-cr1["MCPServer CR<br/>test-server1<br/>(gateway-ref annotation)"]
+            mcpserver-cr2["MCPServer CR<br/>test-server2<br/>(gateway-ref annotation)"]
+            server1-pod["test-server1 pod<br/>(MCP server :9090)"]
+            server1-svc["test-server1 Service"]
+            server1-httproute["HTTPRoute<br/>(test-server1)"]
+            server1-reg["MCPServerRegistration<br/>(test-server1)"]
+            server1-authpolicy["AuthPolicy<br/>(server1-auth-policy)<br/>developers + tool ACLs"]
+            server2-pod["test-server2 pod<br/>(MCP server :9090)"]
+            server2-svc["test-server2 Service"]
+            server2-httproute["HTTPRoute<br/>(test-server2)"]
+            server2-reg["MCPServerRegistration<br/>(test-server2)"]
+            server2-authpolicy["AuthPolicy<br/>(server2-auth-policy)<br/>ops + tool ACLs"]
             nodeport-launcher["NodePort Service<br/>30472"]
             nodeport-launcher --> launcher
-            server-svc --> server-pod
+            server1-svc --> server1-pod
+            server2-svc --> server2-pod
         end
 
         subgraph operator-system["mcp-lifecycle-operator-system namespace"]
@@ -66,27 +79,38 @@ graph TB
 
         %% Control plane relationships
         istiod -.->|"programs via xDS"| envoy
-        operator -->|"creates"| server-pod
-        operator -->|"creates"| server-svc
-        operator -->|"creates"| server-httproute
-        operator -->|"creates"| server-reg
-        operator -.->|"watches"| mcpserver-cr
+        operator -->|"creates"| server1-pod
+        operator -->|"creates"| server1-svc
+        operator -->|"creates"| server1-httproute
+        operator -->|"creates"| server1-reg
+        operator -->|"creates"| server2-pod
+        operator -->|"creates"| server2-svc
+        operator -->|"creates"| server2-httproute
+        operator -->|"creates"| server2-reg
+        operator -.->|"watches"| mcpserver-cr1
+        operator -.->|"watches"| mcpserver-cr2
+
+        %% Kuadrant relationships
+        kuadrant-op -.->|"configures"| authorino
+        kuadrant-op -.->|"creates WasmPlugin"| envoy
 
         %% Data path
         envoy -->|"ext_proc"| mcp-gw-pod
-        envoy -->|"routes to"| server-svc
+        envoy -->|"routes to"| server1-svc
+        envoy -->|"routes to"| server2-svc
         envoy -->|"routes to (:8002)"| kc-svc
+
+        %% Auth flow
+        envoy -.->|"Wasm plugin calls"| authorino
+        authorino -.->|"JWKS (in-cluster)"| keycloak
 
         %% Launcher flow
         launcher -->|"reads catalog"| catalog-api
-        launcher -->|"creates"| mcpserver-cr
+        launcher -->|"creates"| mcpserver-cr1
 
         %% Gateway registration
-        mcp-ctrl -.->|"watches"| server-reg
-
-        %% Auth
-        envoy -.->|"validates JWT"| req-auth
-        req-auth -.->|"JWKS (in-cluster)"| keycloak
+        mcp-ctrl -.->|"watches"| server1-reg
+        mcp-ctrl -.->|"watches"| server2-reg
     end
 
     %% External access
@@ -116,10 +140,10 @@ graph TB
     classDef external fill:#f3e5f5,stroke:#9C27B0,stroke-width:2px
     classDef auth fill:#fff9c4,stroke:#FBC02D,stroke-width:1px
 
-    class catalog-system,gateway-system,istio-system,mcp-system,mcp-test,operator-system,metallb-system,keycloak-ns ns
-    class envoy,catalog-api,mcp-gw-pod,mcp-ctrl,launcher,server-pod,keycloak,operator,istiod,metallb pod
-    class nodeport-gw,nodeport-launcher,server-svc,kc-svc svc
-    class mcpserver-cr,server-httproute,server-reg,gateway-res,ref-grant,req-auth,ef-extproc,ef-lua,mcp-gw-ext,httproute-gw,config-secret,launcher-rbac,kc-httproute cr
+    class catalog-system,gateway-system,istio-system,mcp-system,mcp-test,operator-system,metallb-system,keycloak-ns,kuadrant-system ns
+    class envoy,catalog-api,mcp-gw-pod,mcp-ctrl,launcher,server1-pod,server2-pod,keycloak,operator,istiod,metallb,authorino,kuadrant-op,limitador pod
+    class nodeport-gw,nodeport-launcher,server1-svc,server2-svc,kc-svc svc
+    class mcpserver-cr1,mcpserver-cr2,server1-httproute,server1-reg,server2-httproute,server2-reg,gateway-res,ref-grant,ef-extproc,mcp-gw-ext,httproute-gw,config-secret,launcher-rbac,kc-httproute cr
     class postgres,catalog-cm,realm-cm storage
     class client external
-    class kc-gw-client,kc-cli-client,kc-inspector-client,alice,bob,carol,kc-clients,kc-users auth
+    class kc-gw-client,kc-cli-client,kc-inspector-client,alice,bob,carol,kc-clients,kc-users,gw-authpolicy,server1-authpolicy,server2-authpolicy auth

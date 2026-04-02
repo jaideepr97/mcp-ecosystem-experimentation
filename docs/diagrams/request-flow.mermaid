@@ -4,7 +4,8 @@ sequenceDiagram
     participant C as Client<br/>(mcp-client.sh)
     participant KC as Keycloak<br/>(OIDC Provider)
     participant E as Envoy Proxy<br/>(gateway-system)
-    participant R as Router<br/>(mcp-system)
+    participant R as Router<br/>(ext_proc, mcp-system)
+    participant A as Authorino<br/>(Wasm plugin → kuadrant-system)
     participant B as Broker<br/>(mcp-system)
     participant S as MCP Server<br/>(mcp-test)
 
@@ -16,53 +17,59 @@ sequenceDiagram
     KC-->>C: {"access_token": "eyJ...",<br/>"id_token": "...", "refresh_token": "..."}
     Note over C: Token contains: sub, groups, iss
 
-    Note over C,S: 2. Authentication (common to all requests)
+    Note over C,S: 2. Authenticated Request
     C->>E: POST /mcp<br/>Authorization: Bearer eyJ...
 
-    Note over E: Istio RequestAuthentication<br/>validates JWT signature via<br/>Keycloak JWKS (cached inline by istiod)
+    Note over E: Filter chain order:<br/>1. ext_proc (Router)<br/>2. Wasm plugin (Authorino)<br/>3. envoy.filters.http.router
 
-    alt Invalid token
-        E-->>C: 401 Unauthorized<br/>"Jwks doesn't have key to match kid"
-    end
-
-    Note over E: Lua EnvoyFilter checks for Bearer token
-    alt Missing token
-        E-->>C: 401 Unauthorized<br/>WWW-Authenticate: Bearer<br/>resource_metadata=".../.well-known/oauth-protected-resource"
-    end
-
-    Note over E: ext_proc filter invoked
-
-    E->>R: gRPC ext_proc request<br/>(headers + body)
+    E->>R: ext_proc: headers + body
 
     alt initialize / tools/list (aggregation path)
         Note over C,S: 3a. Initialize or tools/list → Broker aggregates
 
-        Note over R: 1. Parse JSON-RPC body<br/>2. Method is "initialize" or "tools/list"<br/>3. Leave :authority unchanged<br/>(mcp.127-0-0-1.sslip.io)
+        Note over R: 1. Parse JSON-RPC body<br/>2. Method is "initialize" or "tools/list"<br/>3. Leave :authority unchanged<br/>4. Set x-mcp-method header
 
-        R-->>E: Headers unchanged<br/>:authority = mcp.127-0-0-1.sslip.io
+        R-->>E: :authority = mcp.127-0-0-1.sslip.io<br/>(unchanged)
 
-        Note over E: Route matches default<br/>HTTPRoute → mcp-gateway-route
+        Note over E: Wasm plugin calls Authorino
+        E->>A: CheckRequest (host, path, JWT)
+        Note over A: Gateway AuthPolicy (defaults):<br/>• Validate JWT via Keycloak JWKS<br/>• Skip if path contains /.well-known
+        A-->>E: OK (authorized)
+
+        alt Missing/invalid token
+            A-->>E: DENIED
+            E-->>C: 401 Unauthorized<br/>WWW-Authenticate: Bearer<br/>resource_metadata=".../.well-known/oauth-protected-resource"
+        end
 
         E->>B: POST /mcp<br/>{"jsonrpc":"2.0","method":"tools/list"}
 
-        Note over B: 1. Fan out to all registered<br/>upstream MCP servers<br/>2. Prefix each tool with server name<br/>(e.g. "greet" → "test_server1_greet")<br/>3. Aggregate responses
+        Note over B: Fan out to all registered<br/>upstream MCP servers.<br/>Returns ALL tools to ALL users<br/>(no identity-based filtering).
 
-        B->>S: POST /mcp<br/>{"jsonrpc":"2.0","method":"tools/list"}
+        B->>S: POST /mcp → tools/list
         S-->>B: {"tools": [{"name":"greet"}, ...]}
 
         B-->>E: {"tools": [{"name":"test_server1_greet"}, ...]}
-        E-->>C: Aggregated tools/list response<br/>(all servers, prefixed tool names)
+        E-->>C: Aggregated tools/list response
 
     else tools/call (direct routing path)
-        Note over C,S: 3b. tools/call → Router sends direct to server
+        Note over C,S: 3b. tools/call → Router + AuthPolicy + direct to server
 
-        Note over R: 1. Parse JSON-RPC body<br/>2. Extract tool name "test_server1_greet"<br/>3. Strip prefix → "greet"<br/>4. Look up MCPServerRegistration<br/>5. Set :authority = test-server1.mcp.local
+        Note over R: 1. Parse JSON-RPC body<br/>2. Extract tool "test_server1_greet"<br/>3. Strip prefix → "greet"<br/>4. Set headers:<br/>   :authority = test-server1.mcp.local<br/>   x-mcp-toolname = greet<br/>   x-mcp-servername = mcp-test/test-server1
 
-        R-->>E: Modified headers<br/>:authority = test-server1.mcp.local<br/>tool = "greet" (prefix stripped)
+        R-->>E: Modified headers + body
 
-        Note over E: Route matches on :authority<br/>via HTTPRoute → test-server1 Service
+        Note over E: Wasm plugin calls Authorino
+        E->>A: CheckRequest<br/>(host=test-server1.mcp.local,<br/>x-mcp-toolname=greet, JWT)
 
-        E->>S: POST /mcp<br/>{"jsonrpc":"2.0","method":"tools/call",<br/>"params":{"name":"greet"}}
-        S-->>E: {"jsonrpc":"2.0","result":{...}}
-        E-->>C: {"jsonrpc":"2.0","result":{...}}
+        Note over A: Per-HTTPRoute AuthPolicy:<br/>• Validate JWT<br/>• Check group membership<br/>• Check tool name against ACL<br/>e.g. developers && toolname in [greet, time]
+
+        alt Authorized
+            A-->>E: OK
+            E->>S: POST /mcp<br/>{"method":"tools/call","params":{"name":"greet"}}
+            S-->>E: {"result":{"content":[{"text":"Hi alice"}]}}
+            E-->>C: 200 OK + tool result
+        else Unauthorized (wrong group or tool)
+            A-->>E: DENIED
+            E-->>C: 403 Forbidden<br/>{"error":"Forbidden","message":"You do not have access to this tool."}
+        end
     end
