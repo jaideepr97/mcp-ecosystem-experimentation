@@ -91,15 +91,29 @@ Without at least one of these, every new MCP server added to the catalog is a po
 
 ### Keycloak (replacing mini-oidc)
 - **No changes to upstream Keycloak image.** Deployed `quay.io/keycloak/keycloak:26.3` as-is in dev mode.
-- Created a stripped-down realm (`mcp`) with only the `mcp-gateway` confidential client and `groups`/`roles` client scopes. No users, no server-specific clients, no roles.
+- Created a stripped-down realm (`mcp`) with:
+  - `mcp-gateway` confidential client (`serviceAccountsEnabled`, `directAccessGrantsEnabled`) for server-to-server and password grant flows
+  - `mcp-inspector` public client (`standardFlowEnabled`, PKCE S256) for browser-based OAuth flows
+  - `basic` client scope with `sub` mapper (required for Istio to construct request principals from `iss/sub`)
+  - `groups` client scope with group membership mapper
+  - `roles` client scope with realm/client role mappers
+  - Users: alice (developers), bob (ops), carol (developers + ops)
+  - Groups: `developers`, `ops`
 - Exposed via HTTP through the gateway on port 8002 (no TLS — avoids cert-manager/Kuadrant dependency).
 - **Observation:** Keycloak's multi-realm URL structure (`/realms/mcp/.well-known/...`) predates RFC 8414, requiring an HTTPRoute path rewrite. This is a Keycloak-specific quirk, not a general OIDC issue.
+- **Observation:** Keycloak 26 requires `firstName`/`lastName` on user profiles for password grant even when these fields are marked optional in the user profile configuration. Without them, the token endpoint returns "Account is not fully set up."
+- **Observation:** istiod caches JWKS as inline `local_jwks` in Envoy config. When Keycloak's dev mode regenerates signing keys on pod restart, istiod does not re-fetch. Both istiod and gateway pods must be restarted. Production Keycloak with persistent storage would not have this issue.
 
 ### Istio auth resources (modified for Keycloak)
-- **AuthorizationPolicy** changed from ALLOW to DENY semantics, scoped to port 8080 only. The original ALLOW rule blocked all non-JWT traffic across the entire gateway, including the Keycloak listener on port 8002. DENY + port scoping allows Keycloak traffic through while still requiring JWT for MCP requests.
+- **AuthorizationPolicy** initially changed from ALLOW to DENY semantics, scoped to port 8080. Then **deleted from cluster entirely** because RBAC filter runs before the Lua EnvoyFilter in Envoy's filter chain — unauthenticated requests got 403 from RBAC before the Lua filter could return 401 with `WWW-Authenticate`. File kept in repo for reference but not applied. Auth enforcement currently relies on Lua filter + RequestAuthentication only. This will be properly handled by Kuadrant AuthPolicy in Phase 13.
 - **RequestAuthentication** updated to point to Keycloak's issuer (`http://keycloak.127-0-0-1.sslip.io:8002/realms/mcp`) and JWKS endpoint (in-cluster: `http://keycloak.keycloak.svc.cluster.local/realms/mcp/protocol/openid-connect/certs`). Mini-oidc issuer removed.
 - **EnvoyFilter** (Lua 401 challenge) — no changes needed, already scoped to port 8080 and not referencing any specific OIDC provider.
 - **Observation:** ALLOW-based auth policies don't compose well when adding new gateway listeners. Each new listener needs explicit exemption. DENY-based policies scoped to specific ports are more extensible.
+- **Observation:** Envoy filter chain ordering (RBAC before Lua) prevents combining AuthorizationPolicy enforcement with custom 401 responses from EnvoyFilter. This is a fundamental constraint of the Istio auth model.
+
+### mcp-gateway (runtime configuration)
+- **`OAUTH_AUTHORIZATION_SERVERS` env var** set on `mcp-gateway` deployment in `mcp-system` — populates `authorization_servers` in `/.well-known/oauth-protected-resource`. Value must be the Keycloak issuer identifier (`http://keycloak.127-0-0-1.sslip.io:8002/realms/mcp`), not the `.well-known` URL, per RFC 9728.
+- **Observation:** MCP Inspector's browser-based OAuth discovery fails with Keycloak's path-based issuer (`/realms/mcp`). The Inspector fetches authorization server metadata from the browser, which fails silently due to CORS/header issues, and falls back to constructing `/authorize` on the MCP gateway host (404). This is Inspector-specific — curl-based verification works correctly for all grant types.
 
 ### mini-oidc (removed)
 - **Removed from cluster and experiment repo.** Replaced entirely by Keycloak.
@@ -115,4 +129,4 @@ Without at least one of these, every new MCP server added to the catalog is a po
 - Gateway patch (HTTP listener on port 8002) + HTTPRoute for Keycloak
 - EnvoyFilter `mcp-auth-401` in `gateway-system`
 - RequestAuthentication `mcp-jwt-auth` in `gateway-system`
-- AuthorizationPolicy `mcp-require-jwt` in `gateway-system`
+- AuthorizationPolicy `mcp-require-jwt` in `gateway-system` (file in repo but deleted from cluster — RBAC/Lua filter ordering conflict)

@@ -967,7 +967,7 @@ Keycloak tokens use issuer `http://keycloak.127-0-0-1.sslip.io:8002/realms/mcp`.
 | `RequestAuthentication` | Removed mini-oidc issuer, added Keycloak issuer + JWKS |
 | `AuthorizationPolicy` | Changed from ALLOW to DENY, scoped to port 8080 only |
 
-### Verification
+### Verification (client_credentials)
 
 ```bash
 # Get token from Keycloak
@@ -986,6 +986,63 @@ curl -H "Authorization: Bearer $KC_TOKEN" -H "Mcp-Session-Id: $SESSION" ... tool
 curl http://mcp.127-0-0-1.sslip.io:8001/mcp
 # → RBAC: access denied
 ```
+
+### Adding users, groups, and identity-based access
+
+> **User instruction**: *"Let's add a couple users and groups now. I want to get to a place where I have tested everything I can with just Keycloak."*
+
+The realm was updated with:
+
+- **Users**: alice (developers), bob (ops), carol (developers + ops). Each with password = username, `emailVerified: true`, `firstName`/`lastName` set (Keycloak 26 requires these even when profile says optional — without them, the password grant returns "Account is not fully set up").
+- **Groups**: `developers` and `ops` — these map to the group claims in access tokens when the `groups` scope is requested.
+- **`basic` client scope** with `sub` mapper — this was missing from the stripped realm and turned out to be critical. Without the `sub` claim, Istio cannot construct a request principal (`iss/sub`), and the DENY AuthorizationPolicy fires because `notRequestPrincipals: ["*"]` matches when there's no principal.
+- **`mcp-inspector` public client** — a separate OAuth client for browser-based tools, configured with `standardFlowEnabled: true`, PKCE (S256), and redirect URIs for localhost:6274. Deliberately kept separate from the `mcp-gateway` confidential client to maintain proper OAuth client separation (public clients for browser flows, confidential clients for server-to-server).
+
+> **User instruction**: *"One thing we need to be cognizant of is what changes are we making just to get stuff working right now vs which ones are taking us closer to our goal of getting a robust system in place."*
+
+This prompted an explicit assessment of each change's durability. The Keycloak configuration (realm, clients, users, groups, scopes) is all durable — Kuadrant consumes Keycloak as an OIDC provider and doesn't replace it. The Istio auth resources (RequestAuthentication, EnvoyFilter, AuthorizationPolicy) are temporary workarounds that will be replaced by Kuadrant AuthPolicy.
+
+#### AuthorizationPolicy removal
+
+The DENY AuthorizationPolicy was deleted from the cluster. Istio's RBAC filter runs *before* the Lua EnvoyFilter in the filter chain, so unauthenticated requests got a bare `403` from RBAC before the Lua filter could return a proper `401 + WWW-Authenticate` header. Since the `401` response is needed for OAuth-compliant clients to discover the authorization flow, the AuthorizationPolicy was removed, leaving enforcement to the Lua filter + RequestAuthentication. The file remains in the repo for reference but is not applied.
+
+This is acknowledged as a temporary workaround — in production, Kuadrant's AuthPolicy handles both enforcement and proper 401 responses.
+
+#### JWKS caching issue (istiod)
+
+After restarting the Keycloak pod (to pick up realm changes), all authenticated requests failed with "Jwks doesn't have key to match kid or alg from Jwt." Investigation revealed that **istiod converts JWKS URIs to inline `local_jwks`** — it fetches the JWKS once, embeds the keys directly in the Envoy config, and does not refresh when the upstream keys change. The gateway pod had the old kid baked into its config even after a pod restart, because istiod was still serving the cached keys.
+
+**Fix**: Restart istiod, then restart the gateway pod. The new istiod fetches fresh JWKS from Keycloak, embeds the updated keys, and pushes them to the gateway's Envoy.
+
+**Learning**: In production, OIDC providers persist signing keys across restarts (Keycloak does this with a persistent database). In dev mode with ephemeral storage, every pod restart generates new keys. This is a dev-mode-only issue, but it's worth knowing that istiod's JWKS caching is aggressive and doesn't honor the `jwksUri` for periodic refresh — it's a one-shot fetch that becomes `local_jwks`.
+
+#### Protected resource metadata (`OAUTH_AUTHORIZATION_SERVERS`)
+
+The `mcp-gateway` broker serves `/.well-known/oauth-protected-resource` with the `authorization_servers` field populated from the `OAUTH_AUTHORIZATION_SERVERS` env var. This was set on the `mcp-gateway` deployment in `mcp-system` namespace. Initially the value was set to the `.well-known` URL (`http://keycloak.127-0-0-1.sslip.io:8002/.well-known/oauth-authorization-server/realms/mcp`) but per RFC 9728, it should be the **issuer identifier** (`http://keycloak.127-0-0-1.sslip.io:8002/realms/mcp`). OAuth clients construct the metadata URL from the issuer themselves.
+
+### Verification (user tokens with group claims)
+
+```bash
+# Alice authenticates — token carries groups: ["developers"]
+TOKEN=$(curl -s -X POST http://keycloak.127-0-0-1.sslip.io:8002/realms/mcp/protocol/openid-connect/token \
+  -d 'grant_type=password&client_id=mcp-gateway&client_secret=secret&username=alice&password=alice&scope=openid groups' \
+  | python3 -c "import sys,json; print(json.load(sys.stdin)['access_token'])")
+
+# Full MCP flow: initialize → tools/list
+curl -H "Authorization: Bearer $TOKEN" ... initialize ...  # → 200, Mcp-Session-Id returned
+curl -H "Authorization: Bearer $TOKEN" -H "Mcp-Session-Id: $SESSION" ... tools/list
+# → all 5 test_server1 tools returned
+```
+
+### MCP Inspector (browser-based OAuth)
+
+> **User question**: *"Can I verify what we have now through the MCP Inspector?"*
+
+MCP Inspector runs a browser-based OAuth 2.1 authorization code + PKCE flow. The setup was correct (protected resource metadata pointing to Keycloak, `mcp-inspector` public client with PKCE, redirect URIs configured), but Inspector's browser-side OAuth discovery failed: it fetched the `authorization_servers` issuer from the protected resource metadata, then tried to discover Keycloak's OAuth AS metadata, but the metadata fetch failed silently. Inspector fell back to constructing `/authorize` on the MCP gateway host, which returned 404.
+
+> **User question**: *"Is this an issue that is worth spending time on? Or is it something very specific to the inspector that wouldn't really matter when the client is something else?"*
+
+This is Inspector-specific. The auth setup is fully functional — verified end-to-end with both client_credentials and user password grants via curl. Production MCP clients do OAuth discovery server-side where browser CORS restrictions don't apply. The Inspector's browser-based implementation has limitations with complex auth setups involving path-based OAuth issuers (Keycloak's `/realms/mcp` structure).
 
 ---
 
@@ -1024,6 +1081,16 @@ curl http://mcp.127-0-0-1.sslip.io:8001/mcp
 16. **Keycloak's realm import is a one-shot operation** — the `--import-realm` flag loads the realm JSON on first startup. Changes to the ConfigMap require a pod restart. This is fine for development but means realm evolution (adding users, clients, roles) should be done via the Keycloak admin API or UI once the instance is running, not by editing the ConfigMap.
 
 17. **Istio auth resources are all Envoy filters under the hood** — RequestAuthentication becomes a JWT authn filter, AuthorizationPolicy becomes an RBAC filter, EnvoyFilter injects Lua directly. They all end up as configuration in the same Envoy proxy, executed in order. Understanding this makes debugging auth issues much clearer — you're always debugging Envoy filter chain behavior, not three separate systems.
+
+18. **Envoy filter chain ordering constrains auth architecture** — RBAC filters (from AuthorizationPolicy) run before Lua filters (from EnvoyFilter). This means you can't use AuthorizationPolicy to deny unauthenticated requests AND use a Lua filter to return proper 401 + WWW-Authenticate — the RBAC 403 fires first. In production, Kuadrant's ext_authz-based AuthPolicy runs at a different point in the filter chain and has full response control.
+
+19. **istiod caches JWKS inline, not by reference** — istiod fetches JWKS from the configured URI once, converts it to `local_jwks` (inline keys in Envoy config), and pushes it to proxies. If the OIDC provider's keys rotate (e.g., Keycloak pod restart in dev mode), istiod does not re-fetch. Both istiod and the gateway pod must be restarted to pick up new keys. Production OIDC providers persist keys across restarts, making this a dev-mode-specific issue.
+
+20. **RFC 9728 `authorization_servers` must contain issuer identifiers, not `.well-known` URLs** — OAuth clients construct the metadata discovery URL from the issuer. Setting the full `.well-known` URL in protected resource metadata breaks client discovery. This is a subtle but important distinction in the OAuth protected resource metadata spec.
+
+21. **Separate OAuth clients for different grant flows** — browser-based tools (Inspector, SPAs) need public clients with authorization code + PKCE. Server-to-server integrations need confidential clients with client_credentials. Mixing these in a single client weakens the security model. Keycloak makes this easy with multiple clients per realm.
+
+22. **Keycloak 26 requires firstName/lastName even when optional** — user profile fields marked as optional in Keycloak's profile configuration are still required for the password grant flow. Without them, the token endpoint returns "Account is not fully set up." This is a Keycloak-specific behavior, not an OIDC standard requirement.
 
 ---
 
