@@ -1,24 +1,33 @@
 %%{ init: { 'theme': 'base', 'sequence': { 'mirrorActors': false } } }%%
 
 sequenceDiagram
-    participant C as Client
-    participant O as mini-oidc<br/>(OIDC Provider)
+    participant C as Client<br/>(mcp-client.sh)
+    participant KC as Keycloak<br/>(OIDC Provider)
     participant E as Envoy Proxy<br/>(gateway-system)
     participant R as Router<br/>(mcp-system)
     participant B as Broker<br/>(mcp-system)
     participant S as MCP Server<br/>(mcp-test)
 
-    Note over C,S: 1. Token Acquisition
-    C->>O: GET /token
-    O-->>C: {"access_token": "eyJ..."}
+    Note over C,S: 1. Token Acquisition (Device Authorization Grant)
+    C->>KC: POST /auth/device<br/>client_id=mcp-cli&scope=openid groups
+    KC-->>C: {"device_code": "...", "user_code": "ABCD-EFGH",<br/>"verification_uri": "http://keycloak.../device"}
+    Note over C: Opens browser → user logs in
+    C->>KC: POST /token<br/>grant_type=device_code&device_code=...
+    KC-->>C: {"access_token": "eyJ...",<br/>"id_token": "...", "refresh_token": "..."}
+    Note over C: Token contains: sub, groups, iss
 
     Note over C,S: 2. Authentication (common to all requests)
     C->>E: POST /mcp<br/>Authorization: Bearer eyJ...
 
-    Note over E: Istio RequestAuthentication<br/>validates JWT signature + issuer
+    Note over E: Istio RequestAuthentication<br/>validates JWT signature via<br/>Keycloak JWKS (cached inline by istiod)
 
-    alt Invalid/missing token
-        E-->>C: 401 Unauthorized<br/>WWW-Authenticate: Bearer<br/>(via Lua EnvoyFilter)
+    alt Invalid token
+        E-->>C: 401 Unauthorized<br/>"Jwks doesn't have key to match kid"
+    end
+
+    Note over E: Lua EnvoyFilter checks for Bearer token
+    alt Missing token
+        E-->>C: 401 Unauthorized<br/>WWW-Authenticate: Bearer<br/>resource_metadata=".../.well-known/oauth-protected-resource"
     end
 
     Note over E: ext_proc filter invoked
@@ -36,18 +45,18 @@ sequenceDiagram
 
         E->>B: POST /mcp<br/>{"jsonrpc":"2.0","method":"tools/list"}
 
-        Note over B: 1. Fan out to all registered<br/>upstream MCP servers<br/>2. Prefix each tool with server name<br/>(e.g. "greet" → "op_greet")<br/>3. Aggregate responses
+        Note over B: 1. Fan out to all registered<br/>upstream MCP servers<br/>2. Prefix each tool with server name<br/>(e.g. "greet" → "test_server1_greet")<br/>3. Aggregate responses
 
         B->>S: POST /mcp<br/>{"jsonrpc":"2.0","method":"tools/list"}
         S-->>B: {"tools": [{"name":"greet"}, ...]}
 
-        B-->>E: {"tools": [{"name":"op_greet"}, ...]}
+        B-->>E: {"tools": [{"name":"test_server1_greet"}, ...]}
         E-->>C: Aggregated tools/list response<br/>(all servers, prefixed tool names)
 
     else tools/call (direct routing path)
         Note over C,S: 3b. tools/call → Router sends direct to server
 
-        Note over R: 1. Parse JSON-RPC body<br/>2. Extract tool name "op_greet"<br/>3. Strip prefix → "greet"<br/>4. Look up MCPServerRegistration<br/>5. Set :authority = test-server1.mcp.local
+        Note over R: 1. Parse JSON-RPC body<br/>2. Extract tool name "test_server1_greet"<br/>3. Strip prefix → "greet"<br/>4. Look up MCPServerRegistration<br/>5. Set :authority = test-server1.mcp.local
 
         R-->>E: Modified headers<br/>:authority = test-server1.mcp.local<br/>tool = "greet" (prefix stripped)
 
