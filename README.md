@@ -165,7 +165,16 @@ Or use the launcher's YAML editor to deploy interactively.
 | Keycloak | http://keycloak.127-0-0-1.sslip.io:8002 | OIDC provider (admin: admin/admin) |
 | Keycloak OIDC Discovery | http://keycloak.127-0-0-1.sslip.io:8002/realms/mcp/.well-known/openid-configuration | Realm endpoints |
 
-### Quick test
+### Interactive client (recommended)
+
+```bash
+# Authenticates via browser-based device flow, then drops into a tool-calling REPL
+./scripts/mcp-client.sh
+```
+
+Log in as any user (alice/alice, bob/bob, carol/carol). Use `/login` to switch users, `/tools` to list tools, `/whoami` to check identity.
+
+### Quick test (curl)
 
 ```bash
 # Get a token from Keycloak
@@ -217,6 +226,8 @@ curl -s -H "Authorization: Bearer $TOKEN" \
 ├── operator-gateway/              # Operator RBAC additions
 │   ├── gateway-role.yaml
 │   └── gateway-role-binding.yaml
+├── scripts/
+│   └── mcp-client.sh              # Interactive MCP client (device auth flow)
 └── examples/
     └── test-server1.yaml          # MCPServer CR with gateway annotation
 ```

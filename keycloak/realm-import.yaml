@@ -51,6 +51,23 @@ data:
           "optionalClientScopes": [
             "groups"
           ]
+        },
+        {
+          "clientId": "mcp-cli",
+          "publicClient": true,
+          "standardFlowEnabled": false,
+          "directAccessGrantsEnabled": false,
+          "serviceAccountsEnabled": false,
+          "attributes": {
+            "oauth2.device.authorization.grant.enabled": "true"
+          },
+          "defaultClientScopes": [
+            "basic",
+            "roles"
+          ],
+          "optionalClientScopes": [
+            "groups"
+          ]
         }
       ],
       "groups": [

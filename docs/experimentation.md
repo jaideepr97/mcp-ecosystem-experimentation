@@ -1044,6 +1044,49 @@ MCP Inspector runs a browser-based OAuth 2.1 authorization code + PKCE flow. The
 
 This is Inspector-specific. The auth setup is fully functional — verified end-to-end with both client_credentials and user password grants via curl. Production MCP clients do OAuth discovery server-side where browser CORS restrictions don't apply. The Inspector's browser-based implementation has limitations with complex auth setups involving path-based OAuth issuers (Keycloak's `/realms/mcp` structure).
 
+### Interactive MCP client with device authorization grant
+
+> **User instruction**: *"I am open to switching to a better MCP client. But I do want to retain the ability to test things out myself one way or another."*
+
+Rather than debugging the Inspector's browser OAuth, we built an interactive shell script (`scripts/mcp-client.sh`) using the OAuth 2.0 Device Authorization Grant (RFC 8628) — the same flow used by `gh auth login`, `gcloud auth login`, and `az login`. This is the production-standard pattern for CLI tools that need user authentication.
+
+> **User instruction**: *"If there are cheap opportunities to make something closer to production without much extra effort let's take it."*
+
+A new `mcp-cli` public Keycloak client was added with `oauth2.device.authorization.grant.enabled: true`. The script:
+
+1. Requests a device code from Keycloak
+2. Opens the verification URL in the browser — user logs in as alice/bob/carol
+3. Polls the token endpoint until login completes
+4. Shows the authenticated identity and group memberships
+5. Initializes an MCP session through the gateway
+6. Drops into a REPL for tool calls
+
+```
+$ ./scripts/mcp-client.sh
+==========================================
+  Open this URL in your browser:
+  http://keycloak.../realms/mcp/device?user_code=ABCD-EFGH
+==========================================
+Waiting for you to log in...
+Authenticated as: alice (groups: developers)
+Session established.
+
+Available tools:
+----------------
+  test_server1_greet(name) — say hi
+  test_server1_time() — get current time
+  ...
+
+mcp> test_server1_greet name=luffy
+mcp> /login          # switch to a different user
+mcp> /whoami         # show current identity
+mcp> /tools          # list available tools
+```
+
+The `/login` command performs a proper Keycloak logout (back-channel token revocation + front-channel browser cookie clearing via `id_token_hint`) before starting a fresh device flow, allowing mid-session user switching.
+
+This validates the complete production-grade auth flow: device authorization grant → Keycloak login → JWT with group claims → authenticated MCP tool calls through the gateway. The only non-production element is HTTP instead of TLS.
+
 ---
 
 ## Key Learnings
@@ -1091,6 +1134,8 @@ This is Inspector-specific. The auth setup is fully functional — verified end-
 21. **Separate OAuth clients for different grant flows** — browser-based tools (Inspector, SPAs) need public clients with authorization code + PKCE. Server-to-server integrations need confidential clients with client_credentials. Mixing these in a single client weakens the security model. Keycloak makes this easy with multiple clients per realm.
 
 22. **Keycloak 26 requires firstName/lastName even when optional** — user profile fields marked as optional in Keycloak's profile configuration are still required for the password grant flow. Without them, the token endpoint returns "Account is not fully set up." This is a Keycloak-specific behavior, not an OIDC standard requirement.
+
+23. **Device authorization grant is the right pattern for CLI MCP clients** — unlike password grant (client handles credentials directly) or authorization code + PKCE (requires browser redirect URI handling), the device flow lets a CLI tool authenticate users through the browser without embedding credentials or handling callbacks. Keycloak supports it out of the box with a single client attribute (`oauth2.device.authorization.grant.enabled`). The flow is identical to `gh auth login` and `gcloud auth login`.
 
 ---
 

@@ -115,6 +115,14 @@ Without at least one of these, every new MCP server added to the catalog is a po
 - **`OAUTH_AUTHORIZATION_SERVERS` env var** set on `mcp-gateway` deployment in `mcp-system` — populates `authorization_servers` in `/.well-known/oauth-protected-resource`. Value must be the Keycloak issuer identifier (`http://keycloak.127-0-0-1.sslip.io:8002/realms/mcp`), not the `.well-known` URL, per RFC 9728.
 - **Observation:** MCP Inspector's browser-based OAuth discovery fails with Keycloak's path-based issuer (`/realms/mcp`). The Inspector fetches authorization server metadata from the browser, which fails silently due to CORS/header issues, and falls back to constructing `/authorize` on the MCP gateway host (404). This is Inspector-specific — curl-based verification works correctly for all grant types.
 
+### mcp-client script (new)
+- **`scripts/mcp-client.sh`** — interactive MCP client using OAuth 2.0 Device Authorization Grant (RFC 8628).
+- Uses the `mcp-cli` public Keycloak client with `oauth2.device.authorization.grant.enabled`.
+- Authenticates via browser-based device flow (same pattern as `gh auth login`), initializes an MCP session, and provides a REPL for tool calls.
+- Supports `/login` command for mid-session user switching with proper Keycloak logout (back-channel token revocation + front-channel `id_token_hint` logout).
+- Accepts both JSON (`{"name": "value"}`) and key=value (`name=value`) input formats for tool arguments.
+- **Why:** MCP Inspector's browser-based OAuth discovery fails with Keycloak's path-based issuer. Rather than debugging an Inspector-specific issue, the device flow provides a production-grade alternative that also serves as a reusable test client.
+
 ### mini-oidc (removed)
 - **Removed from cluster and experiment repo.** Replaced entirely by Keycloak.
 - mini-oidc served its purpose as an educational tool for understanding OIDC flows (Phase 4). For multi-tenancy and role-based access control, Keycloak provides the necessary user/group/role management.
