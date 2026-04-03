@@ -215,7 +215,17 @@ your browser and curl.
 
 if confirm_phase 1; then
   if kind get clusters 2>/dev/null | grep -q "^${KIND_CLUSTER_NAME}$"; then
-    gum style --foreground 214 "Cluster '${KIND_CLUSTER_NAME}' already exists — reusing it."
+    # Cluster exists — check if it's actually healthy
+    kubectl config use-context "kind-${KIND_CLUSTER_NAME}" >/dev/null 2>&1
+    if kubectl get nodes --request-timeout=5s &>/dev/null; then
+      gum style --foreground 214 "Cluster '${KIND_CLUSTER_NAME}' already exists and is healthy — reusing it."
+    else
+      gum style --foreground 214 "Cluster '${KIND_CLUSTER_NAME}' exists but is not responding — recreating it."
+      run_cmd "Deleting stale cluster..." \
+        kind delete cluster --name "${KIND_CLUSTER_NAME}"
+      run_cmd "Creating Kind cluster..." \
+        kind create cluster --name "${KIND_CLUSTER_NAME}" --config "${REPO_DIR}/infrastructure/kind/cluster.yaml"
+    fi
   else
     run_cmd "Creating Kind cluster..." \
       kind create cluster --name "${KIND_CLUSTER_NAME}" --config "${REPO_DIR}/infrastructure/kind/cluster.yaml"
