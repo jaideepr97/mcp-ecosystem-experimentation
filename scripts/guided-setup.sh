@@ -758,11 +758,18 @@ if [ "$BATCH_MODE" = false ]; then
 # Get a token
 TOKEN=$(curl -s -X POST http://localhost:8003/token | python3 -c "import sys,json; print(json.load(sys.stdin)['access_token'])")
 
+# Initialize an MCP session
+SESSION=$(curl -si -H "Authorization: Bearer $TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-03-26","capabilities":{},"clientInfo":{"name":"test","version":"1.0"}}}' \
+  http://mcp.127-0-0-1.sslip.io:8001/mcp | grep -i mcp-session-id | awk '{print $2}' | tr -d '\r')
+
 # List tools through the gateway
 curl -s http://mcp.127-0-0-1.sslip.io:8001/mcp \
   -H "Authorization: Bearer $TOKEN" \
+  -H "Mcp-Session-Id: $SESSION" \
   -H 'Content-Type: application/json' \
-  -d '{"jsonrpc":"2.0","method":"tools/list","id":1}'
+  -d '{"jsonrpc":"2.0","id":2,"method":"tools/list"}'
 
 # Run the test pipeline
 ./scripts/test-pipeline.sh
