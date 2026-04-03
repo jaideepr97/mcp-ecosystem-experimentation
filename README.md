@@ -37,16 +37,35 @@ MCP Gateway          — "route requests securely to the server"
 - [Podman](https://podman.io/) or Docker
 - kubectl
 - [Helm](https://helm.sh/)
+- [gum](https://github.com/charmbracelet/gum) (for guided setup — `brew install gum`)
 
 ## Quick Start
 
-The setup script creates a Kind cluster and deploys all components:
+### Guided setup (recommended)
+
+Walk through each phase interactively with explanations of what each component does and why:
+
+```bash
+./scripts/guided-setup.sh
+```
+
+Features:
+- Rich TUI powered by [gum](https://github.com/charmbracelet/gum)
+- Each phase explains what it deploys and why before prompting you to continue
+- Shows all resources created after each phase completes
+- Resume from where you left off with `--resume`
+- Jump to a specific phase with `--phase N`
+- Run non-interactively with `--batch`
+
+### One-shot setup
+
+For a non-interactive setup that runs all phases without prompts:
 
 ```bash
 ./scripts/setup.sh
 ```
 
-This takes approximately 5 minutes and sets up: Kind cluster, Istio (as Gateway API controller), MetalLB, cert-manager, Envoy gateway, mcp-gateway (broker/router/controller), lifecycle operator, catalog system, Keycloak, Kuadrant (Authorino), two test MCP servers, per-tool AuthPolicies, and TLS termination.
+This takes approximately 10 minutes and sets up: Kind cluster, Istio (as Gateway API controller), MetalLB, cert-manager, Envoy gateway, mcp-gateway (broker/router/controller), lifecycle operator, catalog system, Keycloak, Kuadrant (Authorino), two test MCP servers, per-tool AuthPolicies, TLS termination, Vault, and optionally a GitHub MCP server.
 
 To reuse an existing Kind cluster:
 
@@ -54,7 +73,7 @@ To reuse an existing Kind cluster:
 ./scripts/setup.sh --skip-cluster
 ```
 
-To tear down:
+### Tear down
 
 ```bash
 kind delete cluster --name mcp-gateway
@@ -174,7 +193,8 @@ All passwords match the username.
 │   ├── auth/                                   # Kuadrant AuthPolicies (gateway + per-server + Vault exchange)
 │   └── test-servers/                           # MCPServer CRs for test-server1, test-server2, and GitHub
 ├── scripts/
-│   ├── setup.sh                                # Full cluster setup from scratch (16 phases)
+│   ├── guided-setup.sh                         # Interactive guided setup with gum TUI
+│   ├── setup.sh                                # Non-interactive full cluster setup (16 phases)
 │   ├── test-pipeline.sh                        # Full pipeline + auth matrix + TLS + Vault (63 checks)
 │   ├── test-auth-matrix.sh                     # Auth matrix only (subset of test-pipeline)
 │   ├── mcp-client.sh                           # Interactive MCP client (device auth flow)
