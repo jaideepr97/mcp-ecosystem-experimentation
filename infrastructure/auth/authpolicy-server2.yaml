@@ -18,8 +18,8 @@ spec:
         patternMatching:
           patterns:
             - predicate: >-
-                (auth.identity.groups.exists(g, g == 'developers') && request.headers['x-mcp-toolname'] in ['slow'])
-                || (auth.identity.groups.exists(g, g == 'ops') && request.headers['x-mcp-toolname'] in ['headers', 'add_tool'])
+                (auth.identity.groups.exists(g, g == 'developers') && request.headers['x-mcp-toolname'] in ['set_time'])
+                || (auth.identity.groups.exists(g, g == 'ops') && request.headers['x-mcp-toolname'] in ['auth1234', 'set_time'])
     response:
       unauthenticated:
         headers:

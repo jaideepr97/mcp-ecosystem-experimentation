@@ -57,12 +57,12 @@ graph TB
             server1-svc["test-server1 Service"]
             server1-httproute["HTTPRoute<br/>(test-server1)"]
             server1-reg["MCPServerRegistration<br/>(test-server1)"]
-            server1-authpolicy["AuthPolicy<br/>(server1-auth-policy)<br/>developers + tool ACLs"]
+            server1-authpolicy["AuthPolicy<br/>(server1-auth-policy)<br/>developers→greet, ops→add_tool"]
             server2-pod["test-server2 pod<br/>(MCP server :9090)"]
             server2-svc["test-server2 Service"]
             server2-httproute["HTTPRoute<br/>(test-server2)"]
             server2-reg["MCPServerRegistration<br/>(test-server2)"]
-            server2-authpolicy["AuthPolicy<br/>(server2-auth-policy)<br/>ops + tool ACLs"]
+            server2-authpolicy["AuthPolicy<br/>(server2-auth-policy)<br/>developers→set_time, ops→auth1234+set_time"]
             nodeport-launcher["NodePort Service<br/>30472"]
             nodeport-launcher --> launcher
             server1-svc --> server1-pod
@@ -122,7 +122,7 @@ graph TB
     %% Keycloak clients
     subgraph kc-clients["Keycloak Clients"]
         kc-gw-client["mcp-gateway<br/>(confidential, client_credentials)"]
-        kc-cli-client["mcp-cli<br/>(public, device auth grant)"]
+        kc-cli-client["mcp-cli<br/>(public, device auth +<br/>direct access grant)"]
         kc-inspector-client["mcp-inspector<br/>(public, auth code + PKCE)"]
     end
 

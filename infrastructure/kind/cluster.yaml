@@ -1,0 +1,24 @@
+kind: Cluster
+apiVersion: kind.x-k8s.io/v1alpha4
+nodes:
+- role: control-plane
+  kubeadmConfigPatches:
+  - |
+    kind: InitConfiguration
+    nodeRegistration:
+      kubeletExtraArgs:
+        node-labels: "ingress-ready=true"
+  - |
+    apiVersion: kubelet.config.k8s.io/v1beta1
+    kind: KubeletConfiguration
+    syncFrequency: "10s"
+  extraPortMappings:
+  - containerPort: 30080 # mcp-gateway
+    hostPort: 8001
+    protocol: TCP
+  - containerPort: 30089 # keycloak
+    hostPort: 8002
+    protocol: TCP
+  - containerPort: 30472 # launcher
+    hostPort: 8004
+    protocol: TCP

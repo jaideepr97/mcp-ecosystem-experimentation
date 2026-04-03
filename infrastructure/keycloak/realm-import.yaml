@@ -56,7 +56,7 @@ data:
           "clientId": "mcp-cli",
           "publicClient": true,
           "standardFlowEnabled": false,
-          "directAccessGrantsEnabled": false,
+          "directAccessGrantsEnabled": true,
           "serviceAccountsEnabled": false,
           "attributes": {
             "oauth2.device.authorization.grant.enabled": "true"

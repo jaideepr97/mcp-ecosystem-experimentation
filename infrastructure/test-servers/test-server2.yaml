@@ -9,14 +9,15 @@ spec:
   source:
     type: ContainerImage
     containerImage:
-      ref: ghcr.io/kuadrant/mcp-gateway/test-server1:latest
+      ref: ghcr.io/kuadrant/mcp-gateway/test-server2:latest
   config:
     port: 9090
     path: /mcp
-    arguments:
-      - /mcp-test-server
-      - --http
-      - 0.0.0.0:9090
+    env:
+      - name: MCP_TRANSPORT
+        value: http
+      - name: PORT
+        value: "9090"
   runtime:
     security:
       securityContext:

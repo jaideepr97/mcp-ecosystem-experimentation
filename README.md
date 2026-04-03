@@ -13,19 +13,19 @@ The result is a fully automated pipeline:
 
 ```
 Catalog API          — "what's available"
-  ↓ REST API
+  | REST API
 MCP Launcher         — "browse, configure, deploy"
-  ↓ creates MCPServer CR (with gateway-ref annotation)
+  | creates MCPServer CR (with gateway-ref annotation)
 Lifecycle Operator   — "make it run AND make it routable"
-  ↓ creates Deployment + Service + HTTPRoute + MCPServerRegistration
+  | creates Deployment + Service + HTTPRoute + MCPServerRegistration
 Kuadrant AuthPolicy  — "who can call which tools on which servers"
-  ↓ per-HTTPRoute policies with CEL predicates
+  | per-HTTPRoute policies with CEL predicates
 MCP Gateway          — "route requests securely to the server"
 ```
 
 ## Documentation
 
-- [docs/experimentation.md](docs/experimentation.md) — Full chronological narrative of the experiment, from initial project analysis through deployment, request tracing, authentication, catalog integration, gateway automation, and per-tool authorization
+- [docs/experimentation.md](docs/experimentation.md) — Full chronological narrative of the experiment (Phases 1-13), from initial project analysis through deployment, request tracing, authentication, catalog integration, gateway automation, and per-tool authorization
 - [docs/changes-tracker.md](docs/changes-tracker.md) — Structured changelog of every code modification and integration friction point discovered
 - [docs/diagrams/](docs/diagrams/) — Mermaid diagrams of the architecture, request flow, pipeline, and operator reconciliation logic
 
@@ -34,191 +34,69 @@ MCP Gateway          — "route requests securely to the server"
 - [Kind](https://kind.sigs.k8s.io/) (tested with v0.27+)
 - [Podman](https://podman.io/) or Docker
 - kubectl
-- Go 1.25+ (only if building from source)
-- The following project repos cloned locally:
-  - [mcp-gateway](https://github.com/kuadrant/mcp-gateway)
-  - [mcp-lifecycle-operator](https://github.com/kubernetes-sigs/mcp-lifecycle-operator) (upstream)
+- [Helm](https://helm.sh/)
 
-## Setup
+## Quick Start
 
-### Step 1: Kind cluster + Gateway infrastructure
-
-From the **mcp-gateway** repo:
+The setup script creates a Kind cluster and deploys all components:
 
 ```bash
-cd /path/to/mcp-gateway
-export CONTAINER_ENGINE=podman
-
-make tools
-make kind-create-cluster    # Creates "mcp-gateway" Kind cluster with port mappings
-make gateway-api-install
-make istio-install
-make metallb-install
-make build-and-load-image
-make deploy-gateway
-make deploy                 # CRDs + controller
+./scripts/setup.sh
 ```
 
-This sets up: Kind cluster, Istio (as Gateway API controller), MetalLB, Envoy gateway, and the mcp-gateway broker/router/controller.
+This takes approximately 5 minutes and sets up: Kind cluster, Istio (as Gateway API controller), MetalLB, Envoy gateway, mcp-gateway (broker/router/controller), lifecycle operator, catalog system, Keycloak, Kuadrant (Authorino), two test MCP servers, and per-tool AuthPolicies.
 
-### Step 2: Lifecycle operator
-
-From the **mcp-lifecycle-operator** repo (upstream):
+To reuse an existing Kind cluster:
 
 ```bash
-cd /path/to/mcp-lifecycle-operator
-make install    # Apply MCPServer CRD
-make deploy     # Deploy operator
+./scripts/setup.sh --skip-cluster
 ```
 
-Then apply the gateway integration RBAC so the operator can manage HTTPRoutes and MCPServerRegistrations:
+To tear down:
 
 ```bash
-kubectl apply -f operator-gateway/gateway-role.yaml
-kubectl apply -f operator-gateway/gateway-role-binding.yaml
+kind delete cluster --name mcp-gateway
 ```
 
-To use the pre-built operator image with gateway integration (recommended):
+## Verifying the Setup
+
+Run the automated authorization test matrix:
 
 ```bash
-# Load the image with gateway controller support
-podman pull quay.io/jrao/mcp-lifecycle-operator:gateway-integration
-podman save quay.io/jrao/mcp-lifecycle-operator:gateway-integration -o /tmp/operator.tar
-kind load image-archive /tmp/operator.tar --name mcp-gateway
-
-# Update the operator deployment to use it
-kubectl set image deployment/mcp-lifecycle-operator-controller-manager \
-  -n mcp-lifecycle-operator-system \
-  manager=quay.io/jrao/mcp-lifecycle-operator:gateway-integration
-
-kubectl rollout restart deployment/mcp-lifecycle-operator-controller-manager \
-  -n mcp-lifecycle-operator-system
+./scripts/test-auth-matrix.sh
 ```
 
-> **Note**: If the operator pod hangs on "Attempting to acquire leader lease", delete the stale lease:
-> ```bash
-> kubectl delete lease bed7462b.x-k8s.io -n mcp-lifecycle-operator-system
-> ```
+This authenticates as all three test users via Keycloak's direct access grant, calls every tool on both servers, and verifies the correct allow/deny outcome for each combination (15 test cases).
 
-### Step 3: Catalog service
+### Authorization Matrix
 
-```bash
-kubectl create namespace catalog-system
-kubectl apply -f catalog/postgres.yaml
-kubectl apply -f catalog/catalog-sources.yaml
-kubectl apply -f catalog/catalog.yaml
+Two test servers with distinct tools, five access control patterns:
 
-# Wait for pods to be ready
-kubectl wait --for=condition=Ready pod -l app=mcp-catalog-postgres -n catalog-system --timeout=120s
-kubectl wait --for=condition=Ready pod -l app=mcp-catalog -n catalog-system --timeout=120s
-```
+| | greet | add_tool | hello_world | auth1234 | set_time |
+|---|---|---|---|---|---|
+| **Policy** | dev-only | ops-only | *no group* | ops-only | shared |
+| Alice (developers) | allow | deny | deny | deny | allow |
+| Bob (ops) | deny | allow | deny | allow | allow |
+| Carol (both) | allow | allow | deny | allow | allow |
 
-Verify the catalog API:
-```bash
-kubectl port-forward svc/mcp-catalog -n catalog-system 8080:8080 &
-curl -s http://localhost:8080/api/mcp_catalog/v1alpha1/mcp_servers | python3 -m json.tool
-kill %1
-```
+- **server1** (greet, time, slow, headers, add_tool): `developers` can call greet, `ops` can call add_tool
+- **server2** (hello_world, time, headers, auth1234, slow, set_time): `developers` can call set_time, `ops` can call auth1234 + set_time
+- **hello_world** is not in any policy — tests that tool existence does not imply access
 
-### Step 4: Keycloak (OIDC provider)
+### Interactive Client
 
 ```bash
-kubectl create namespace keycloak
-kubectl apply -f keycloak/realm-import.yaml
-kubectl apply -f keycloak/deployment.yaml
-kubectl patch gateway mcp-gateway -n gateway-system --type json -p "$(cat keycloak/gateway-patch.json)"
-kubectl apply -f keycloak/httproute.yaml
-
-# Wait for Keycloak to be ready (can take 30-60s)
-kubectl wait --for=condition=Ready pod -l app=keycloak -n keycloak --timeout=120s
-```
-
-### Step 5: Kuadrant operator (auth enforcement)
-
-```bash
-helm repo add kuadrant https://kuadrant.io/helm-charts/
-helm install kuadrant-operator kuadrant/kuadrant-operator -n kuadrant-system --create-namespace
-
-# Create the Kuadrant CR (from mcp-gateway's config)
-kubectl apply -f /path/to/mcp-gateway/config/kuadrant/kuadrant.yaml
-
-# Wait for Authorino to be ready
-kubectl wait --for=condition=Ready pod -l app=authorino -n kuadrant-system --timeout=120s
-
-# Patch CoreDNS so Authorino can reach Keycloak via the gateway
-# (sslip.io resolves to 127.0.0.1 inside pods — need to map to gateway LB IP)
-GATEWAY_IP=$(kubectl get svc -n gateway-system -l gateway.networking.k8s.io/gateway-name=mcp-gateway -o jsonpath='{.items[0].status.loadBalancer.ingress[0].ip}')
-kubectl get configmap coredns -n kube-system -o yaml | \
-  sed "s/ready/hosts {\n          $GATEWAY_IP keycloak.127-0-0-1.sslip.io\n          fallthrough\n        }\n        ready/" | \
-  kubectl apply -f -
-kubectl rollout restart deployment coredns -n kube-system
-```
-
-Apply the gateway-level AuthPolicy (JWT auth + 401 response):
-
-```bash
-kubectl apply -f auth/authpolicy.yaml
-```
-
-### Step 6: MCP Launcher
-
-```bash
-kubectl apply -f launcher/rbac.yaml
-kubectl apply -f launcher/deployment.yaml
-```
-
-### Step 7: Deploy servers and apply per-server AuthPolicies
-
-Deploy MCP servers (via launcher UI at http://localhost:8004 or directly):
-
-```bash
-kubectl apply -f examples/test-server1.yaml
-kubectl apply -f examples/test-server2.yaml
-
-# Wait for the operator to create Deployments, Services, HTTPRoutes, and MCPServerRegistrations
-kubectl wait --for=condition=Ready mcpserver/test-server1 -n mcp-test --timeout=120s
-kubectl wait --for=condition=Ready mcpserver/test-server2 -n mcp-test --timeout=120s
-
-# Restart mcp-gateway to pick up new registrations (if needed)
-kubectl rollout restart deployment mcp-gateway -n mcp-system
-```
-
-Apply per-server AuthPolicies for tool-level authorization:
-
-```bash
-kubectl apply -f auth/authpolicy-server1.yaml
-kubectl apply -f auth/authpolicy-server2.yaml
-```
-
-These policies enforce per-group, per-tool access control:
-- **server1**: `developers` can call greet+time, `ops` can call time+headers
-- **server2**: `developers` can call slow, `ops` can call headers+add_tool
-- Users in both groups (carol) get the union of permissions
-
-## Accessing services
-
-| Service | URL | Description |
-|---------|-----|-------------|
-| MCP Gateway | http://mcp.127-0-0-1.sslip.io:8001/mcp | Envoy gateway (authenticated) |
-| MCP Launcher | http://localhost:8004 | Catalog UI + deployment |
-| Keycloak | http://keycloak.127-0-0-1.sslip.io:8002 | OIDC provider (admin: admin/admin) |
-| Keycloak OIDC Discovery | http://keycloak.127-0-0-1.sslip.io:8002/realms/mcp/.well-known/openid-configuration | Realm endpoints |
-
-### Interactive client (recommended)
-
-```bash
-# Authenticates via browser-based device flow, then drops into a tool-calling REPL
 ./scripts/mcp-client.sh
 ```
 
-Log in as any user (alice/alice, bob/bob, carol/carol). Use `/login` to switch users, `/tools` to list tools, `/whoami` to check identity.
+Authenticates via browser-based device flow, then drops into a tool-calling REPL. Log in as any user (alice/alice, bob/bob, carol/carol). Use `/login` to switch users, `/tools` to list tools, `/whoami` to check identity.
 
-### Quick test (curl)
+### Quick Test (curl)
 
 ```bash
-# Get a token from Keycloak
+# Get a token (direct access grant)
 TOKEN=$(curl -s -X POST http://keycloak.127-0-0-1.sslip.io:8002/realms/mcp/protocol/openid-connect/token \
-  -d 'grant_type=client_credentials&client_id=mcp-gateway&client_secret=secret' \
+  -d 'grant_type=password&client_id=mcp-cli&username=alice&password=alice&scope=openid groups' \
   | python3 -c "import sys,json; print(json.load(sys.stdin)['access_token'])")
 
 # Initialize an MCP session
@@ -235,44 +113,59 @@ curl -s -H "Authorization: Bearer $TOKEN" \
   http://mcp.127-0-0-1.sslip.io:8001/mcp
 ```
 
-## Repository structure
+## Accessing Services
+
+| Service | URL | Description |
+|---------|-----|-------------|
+| MCP Gateway | http://mcp.127-0-0-1.sslip.io:8001/mcp | Envoy gateway (authenticated) |
+| MCP Launcher | http://localhost:8004 | Catalog UI + deployment |
+| Keycloak | http://keycloak.127-0-0-1.sslip.io:8002 | OIDC provider (admin: admin/admin) |
+| Keycloak OIDC Discovery | http://keycloak.127-0-0-1.sslip.io:8002/realms/mcp/.well-known/openid-configuration | Realm endpoints |
+
+## Test Users
+
+All passwords match the username.
+
+| User | Password | Groups | Server1 access | Server2 access |
+|------|----------|--------|----------------|----------------|
+| alice | alice | developers | greet | set_time |
+| bob | bob | ops | add_tool | auth1234, set_time |
+| carol | carol | developers, ops | greet, add_tool | auth1234, set_time |
+
+## Repository Structure
 
 ```
 ├── docs/
-│   ├── experimentation.md         # Full experiment narrative (Phases 1-12)
-│   ├── changes-tracker.md         # Code changes + friction points
+│   ├── experimentation.md                      # Full experiment narrative (Phases 1-13)
+│   ├── changes-tracker.md                      # Code changes + friction points
 │   └── diagrams/
-│       ├── component-architecture.mermaid  # Cluster component map
-│       ├── request-flow.mermaid            # Authenticated MCP request sequence
-│       ├── catalog-to-gateway-pipeline.mermaid  # End-to-end pipeline flow
-│       └── operator-reconciliation.mermaid      # Operator reconciler logic
-├── catalog/                       # catalog-system namespace
-│   ├── postgres.yaml              # PostgreSQL backend
-│   ├── catalog-sources.yaml       # MCP server definitions
-│   └── catalog.yaml               # Catalog API deployment
-├── keycloak/                      # keycloak namespace
-│   ├── realm-import.yaml              # Minimal realm (mcp-gateway client + scopes)
-│   ├── deployment.yaml                # Keycloak 26.3 dev mode + Service
-│   ├── gateway-patch.json             # HTTP listener on port 8002
-│   └── httproute.yaml                 # Routes with OAuth discovery path rewrite
-├── auth/                          # Kuadrant AuthPolicies
-│   ├── authpolicy.yaml                # Gateway-level JWT auth + 401 response
-│   ├── authpolicy-server1.yaml        # Per-server: developers + tool ACLs
-│   └── authpolicy-server2.yaml        # Per-server: ops + tool ACLs
-├── launcher/                      # mcp-test namespace
-│   ├── rbac.yaml
-│   └── deployment.yaml
-├── operator-gateway/              # Operator RBAC additions
-│   ├── gateway-role.yaml
-│   └── gateway-role-binding.yaml
+│       ├── component-architecture.mermaid      # Cluster component map
+│       ├── request-flow.mermaid                # Authenticated MCP request sequence
+│       ├── catalog-to-gateway-pipeline.mermaid # End-to-end pipeline flow
+│       └── operator-reconciliation.mermaid     # Operator reconciler logic
+├── infrastructure/
+│   ├── kind/                                   # Kind cluster config
+│   ├── istio/                                  # Istio (Sail operator) config
+│   ├── gateway/                                # Gateway namespace, resource, nodeport
+│   ├── metallb/                                # MetalLB IP pool script
+│   ├── mcp-gateway/                            # CRDs + controller/broker deployment
+│   ├── lifecycle-operator/                     # Operator deployment manifest
+│   ├── kuadrant/                               # Kuadrant CR
+│   ├── catalog/                                # Catalog API + PostgreSQL
+│   ├── keycloak/                               # Keycloak deployment + realm import
+│   ├── launcher/                               # MCP Launcher deployment + RBAC
+│   ├── operator-gateway/                       # Operator gateway RBAC additions
+│   ├── auth/                                   # Kuadrant AuthPolicies (gateway + per-server)
+│   └── test-servers/                           # MCPServer CRs for test-server1 and test-server2
 ├── scripts/
-│   └── mcp-client.sh              # Interactive MCP client (device auth flow)
-└── examples/
-    ├── test-server1.yaml          # MCPServer CR with gateway annotation
-    └── test-server2.yaml          # Second test server (same image, different name)
+│   ├── setup.sh                                # Full cluster setup from scratch
+│   ├── test-auth-matrix.sh                     # Automated 15-case auth verification
+│   └── mcp-client.sh                           # Interactive MCP client (device auth flow)
+├── progress.md                                 # Session handoff / current state
+└── README.md
 ```
 
-## Custom images
+## Custom Images
 
 Pre-built images are available on quay.io:
 
@@ -282,7 +175,7 @@ Pre-built images are available on quay.io:
 | `quay.io/jrao/mcp-lifecycle-operator:gateway-integration` | [mcp-lifecycle-operator](https://github.com/kubernetes-sigs/mcp-lifecycle-operator) fork, branch `gateway-integration` — adds gateway controller for automatic HTTPRoute/MCPServerRegistration creation |
 | `quay.io/keycloak/keycloak:26.3` | Upstream Keycloak OIDC provider (no custom build) |
 
-## Key findings
+## Key Findings
 
 The experiment surfaced several integration friction points documented in detail in [docs/changes-tracker.md](docs/changes-tracker.md). The most significant:
 

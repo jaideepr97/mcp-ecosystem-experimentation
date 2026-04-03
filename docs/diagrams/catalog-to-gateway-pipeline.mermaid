@@ -21,9 +21,9 @@ flowchart LR
         gateway["MCP Gateway<br/>(Envoy + Router)"]
     end
 
-    subgraph auth["Authentication"]
-        oidc["OIDC Provider"]
-        istio["Istio<br/>(JWT validation)"]
+    subgraph auth["Authentication & Authorization"]
+        oidc["Keycloak<br/>(OIDC Provider)"]
+        authorino["Authorino<br/>(JWT validation +<br/>per-tool authorization)"]
     end
 
     %% Pipeline flow
@@ -39,8 +39,8 @@ flowchart LR
     httproute -->|"configures route"| gateway
     registration -->|"registers server"| gateway
 
-    oidc -.->|"issues tokens"| istio
-    istio -.->|"validates JWT"| gateway
+    oidc -.->|"issues tokens"| authorino
+    authorino -.->|"validates JWT +<br/>enforces AuthPolicy"| gateway
 
     %% Styling
     classDef discoveryStyle fill:#e3f2fd,stroke:#1565C0,stroke-width:2px
@@ -53,4 +53,4 @@ flowchart LR
     class launcher,operator deployStyle
     class mcpserver,deploy crStyle
     class gw-controller,httproute,registration,gateway routeStyle
-    class oidc,istio authStyle
+    class oidc,authorino authStyle
