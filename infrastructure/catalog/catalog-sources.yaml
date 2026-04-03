@@ -40,6 +40,51 @@ data:
           readOnlyTools: true
         createTimeSinceEpoch: "1743400000000"
         lastUpdateTimeSinceEpoch: "1743400000000"
+      - name: test-server2
+        provider: MCP Gateway Project
+        license: apache-2.0
+        description: >-
+          Second Go-based test MCP server. Provides additional tools for testing
+          multi-server gateway federation: hello_world, time, headers, auth1234, set_time.
+        version: "latest"
+        transports:
+          - http
+        deploymentMode: local
+        artifacts:
+          - uri: oci://ghcr.io/kuadrant/mcp-gateway/test-server2:latest
+        tools:
+          - name: hello_world
+            description: Returns a hello world greeting
+            accessType: read_only
+            parameters: []
+          - name: time
+            description: Returns the current server time
+            accessType: read_only
+            parameters: []
+          - name: headers
+            description: Returns the HTTP headers received by the server
+            accessType: read_only
+            parameters: []
+          - name: auth1234
+            description: Returns authentication info
+            accessType: read_only
+            parameters: []
+          - name: set_time
+            description: Sets the server time
+            accessType: read_write
+            parameters:
+              - name: time
+                type: string
+                description: Time to set
+                required: true
+        runtimeMetadata:
+          defaultPort: 9090
+          mcpPath: /mcp
+        securityIndicators:
+          verifiedSource: true
+          readOnlyTools: false
+        createTimeSinceEpoch: "1743400000000"
+        lastUpdateTimeSinceEpoch: "1743400000000"
       - name: github-mcp-server
         provider: GitHub
         license: mit
