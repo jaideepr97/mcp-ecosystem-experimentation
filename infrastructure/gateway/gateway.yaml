@@ -10,6 +10,7 @@ metadata:
 spec:
   gatewayClassName: istio
   listeners:
+    # HTTP listeners (existing)
     - name: mcp
       hostname: 'mcp.127-0-0-1.sslip.io'
       port: 8080
@@ -21,6 +22,18 @@ spec:
       port: 8080
       protocol: HTTP
       hostname: '*.mcp.local'
+      allowedRoutes:
+        namespaces:
+          from: All
+    # HTTPS listeners (Phase 14: TLS)
+    - name: mcp-https
+      hostname: 'mcp.127-0-0-1.sslip.io'
+      port: 8443
+      protocol: HTTPS
+      tls:
+        mode: Terminate
+        certificateRefs:
+          - name: mcp-gateway-mcp-https-tls
       allowedRoutes:
         namespaces:
           from: All

@@ -1,6 +1,6 @@
 # MCP Ecosystem Experimentation
 
-A reproducible experiment exploring how five MCP ecosystem projects work together end-to-end: **discovery** (model-registry catalog), **deployment** (lifecycle operator), **routing** (mcp-gateway), **authentication** (Keycloak + Kuadrant/Authorino), and **per-tool authorization** (AuthPolicy with CEL predicates).
+A reproducible experiment exploring how MCP ecosystem projects work together end-to-end: **discovery** (model-registry catalog), **deployment** (lifecycle operator), **routing** (mcp-gateway), **authentication** (Keycloak + Kuadrant/Authorino), **per-tool authorization** (AuthPolicy with CEL predicates), and **TLS** (cert-manager + Kuadrant TLSPolicy).
 
 ## Acknowledgements
 
@@ -25,7 +25,7 @@ MCP Gateway          — "route requests securely to the server"
 
 ## Documentation
 
-- [docs/experimentation.md](docs/experimentation.md) — Full chronological narrative of the experiment (Phases 1-13), from initial project analysis through deployment, request tracing, authentication, catalog integration, gateway automation, and per-tool authorization
+- [docs/experimentation.md](docs/experimentation.md) — Full chronological narrative of the experiment (Phases 1-14), from initial project analysis through deployment, request tracing, authentication, catalog integration, gateway automation, per-tool authorization, and TLS
 - [docs/changes-tracker.md](docs/changes-tracker.md) — Structured changelog of every code modification and integration friction point discovered
 - [docs/diagrams/](docs/diagrams/) — Mermaid diagrams of the architecture, request flow, pipeline, and operator reconciliation logic
 
@@ -44,7 +44,7 @@ The setup script creates a Kind cluster and deploys all components:
 ./scripts/setup.sh
 ```
 
-This takes approximately 5 minutes and sets up: Kind cluster, Istio (as Gateway API controller), MetalLB, Envoy gateway, mcp-gateway (broker/router/controller), lifecycle operator, catalog system, Keycloak, Kuadrant (Authorino), two test MCP servers, and per-tool AuthPolicies.
+This takes approximately 5 minutes and sets up: Kind cluster, Istio (as Gateway API controller), MetalLB, cert-manager, Envoy gateway, mcp-gateway (broker/router/controller), lifecycle operator, catalog system, Keycloak, Kuadrant (Authorino), two test MCP servers, per-tool AuthPolicies, and TLS termination.
 
 To reuse an existing Kind cluster:
 
@@ -66,13 +66,14 @@ Run the automated pipeline test:
 ./scripts/test-pipeline.sh
 ```
 
-This verifies the full pipeline end-to-end across 6 phases:
+This verifies the full pipeline end-to-end across 7 phases (55 checks):
 1. **Catalog API** — lists available servers with OCI artifact URIs
 2. **Operator resources** — MCPServer CRs triggered Deployment + Service creation for both servers
 3. **Gateway integration** — operator created HTTPRoute + MCPServerRegistration + AuthPolicies
 4. **Authentication** — Keycloak issues tokens for all users, unauthenticated requests are rejected with 401
 5. **Gateway tool access** — MCP sessions initialize, tools from both servers are federated, tool calls return results
 6. **Authorization matrix** — 15 allow/deny cases across 3 users × 5 tools (see matrix below)
+7. **TLS** — cert-manager, TLSPolicy, HTTPS endpoints for MCP gateway and Keycloak
 
 ### Authorization Matrix
 
@@ -123,9 +124,11 @@ curl -s -H "Authorization: Bearer $TOKEN" \
 
 | Service | URL | Description |
 |---------|-----|-------------|
-| MCP Gateway | http://mcp.127-0-0-1.sslip.io:8001/mcp | Envoy gateway (authenticated) |
+| MCP Gateway (HTTP) | http://mcp.127-0-0-1.sslip.io:8001/mcp | Envoy gateway (authenticated) |
+| MCP Gateway (HTTPS) | https://mcp.127-0-0-1.sslip.io:8443/mcp | TLS-terminated (use `--cacert /tmp/mcp-ca.crt`) |
+| Keycloak (HTTP) | http://keycloak.127-0-0-1.sslip.io:8002 | OIDC provider (admin: admin/admin) |
+| Keycloak (HTTPS) | https://keycloak.127-0-0-1.sslip.io:8445 | TLS-terminated (use `--cacert /tmp/mcp-ca.crt`) |
 | MCP Launcher | http://localhost:8004 | Catalog UI + deployment |
-| Keycloak | http://keycloak.127-0-0-1.sslip.io:8002 | OIDC provider (admin: admin/admin) |
 | Keycloak OIDC Discovery | http://keycloak.127-0-0-1.sslip.io:8002/realms/mcp/.well-known/openid-configuration | Realm endpoints |
 
 ## Test Users
@@ -142,30 +145,32 @@ All passwords match the username.
 
 ```
 ├── docs/
-│   ├── experimentation.md                      # Full experiment narrative (Phases 1-13)
+│   ├── experimentation.md                      # Full experiment narrative (Phases 1-14)
 │   ├── changes-tracker.md                      # Code changes + friction points
 │   └── diagrams/
 │       ├── component-architecture.mermaid      # Cluster component map
-│       ├── request-flow.mermaid                # Authenticated MCP request sequence
+│       ├── request-flow.mermaid                # Authenticated MCP request sequence (HTTP + HTTPS)
+│       ├── tls-architecture.mermaid            # TLS certificate chain + termination flow
 │       ├── catalog-to-gateway-pipeline.mermaid # End-to-end pipeline flow
 │       └── operator-reconciliation.mermaid     # Operator reconciler logic
 ├── infrastructure/
-│   ├── kind/                                   # Kind cluster config
+│   ├── kind/                                   # Kind cluster config (HTTP + HTTPS ports)
 │   ├── istio/                                  # Istio (Sail operator) config
 │   ├── gateway/                                # Gateway namespace, resource, nodeport
 │   ├── metallb/                                # MetalLB IP pool script
+│   ├── cert-manager/                           # CA issuers + TLSPolicy
 │   ├── mcp-gateway/                            # CRDs + controller/broker deployment
 │   ├── lifecycle-operator/                     # Operator deployment manifest
 │   ├── kuadrant/                               # Kuadrant CR
 │   ├── catalog/                                # Catalog API + PostgreSQL
-│   ├── keycloak/                               # Keycloak deployment + realm import
+│   ├── keycloak/                               # Keycloak deployment + realm import + TLS
 │   ├── launcher/                               # MCP Launcher deployment + RBAC
 │   ├── operator-gateway/                       # Operator gateway RBAC additions
 │   ├── auth/                                   # Kuadrant AuthPolicies (gateway + per-server)
 │   └── test-servers/                           # MCPServer CRs for test-server1 and test-server2
 ├── scripts/
-│   ├── setup.sh                                # Full cluster setup from scratch
-│   ├── test-pipeline.sh                        # Full pipeline + auth matrix verification
+│   ├── setup.sh                                # Full cluster setup from scratch (14 phases)
+│   ├── test-pipeline.sh                        # Full pipeline + auth matrix + TLS (55 checks)
 │   ├── test-auth-matrix.sh                     # Auth matrix only (subset of test-pipeline)
 │   └── mcp-client.sh                           # Interactive MCP client (device auth flow)
 ├── progress.md                                 # Session handoff / current state
@@ -195,5 +200,7 @@ The experiment surfaced several integration friction points documented in detail
 4. **Catalog metadata is insufficient for deployment** — `runtimeMetadata` covers port and path but not container command, arguments, or security context. Each MCP server image is potentially a snowflake.
 
 5. **The annotation-based gateway integration pattern works well** — using `mcp.x-k8s.io/gateway-ref` annotations on MCPServer CRs avoids upstream spec changes while enabling automatic gateway registration.
+
+6. **TLS termination is transparent to the MCP protocol** — Kuadrant TLSPolicy + cert-manager adds HTTPS with zero application changes. TLS terminates at Envoy; backends stay plain HTTP. The only client-side change is URL scheme and CA certificate trust. cert-manager must be installed before Kuadrant — the TLSPolicy controller checks for it at startup and never re-checks.
 
 See [docs/experimentation.md](docs/experimentation.md) for the full narrative including the auth layer investigation (Istio 403 vs OAuth 401), the OIDC/PKCE flow, the Keycloak migration, and the per-tool authorization evolution.

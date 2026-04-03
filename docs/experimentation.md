@@ -1169,14 +1169,126 @@ This means Alice sees all 10 tools in `tools/list` even though she can only call
 
 ---
 
-## Architecture Summary (as of Phase 13)
+## Phase 14: TLS Termination at the Gateway
 
-This snapshot captures the cluster state after Phase 13 — the full pipeline from catalog discovery through deployment, gateway registration, and per-tool authorization with Kuadrant.
+> **User instruction**: *"i think we can do TLS in phase 14, token exchange in phase 15 and then probably cut another branch."*
+
+> **User instruction**: *"keep HTTP for now, and separate ports"*
+
+The goal was to add TLS termination at the Envoy gateway using cert-manager and Kuadrant's TLSPolicy, while keeping existing HTTP endpoints intact. HTTPS runs on separate ports (8443 for MCP, 8445 for Keycloak) so nothing breaks for existing workflows.
+
+### cert-manager installation order matters
+
+The first attempt installed Kuadrant before cert-manager. TLSPolicy was created but sat in `MissingDependency` status:
+
+```
+message: "[Cert Manager] is not installed"
+```
+
+Kuadrant's TLSPolicy controller checks for cert-manager at startup. If cert-manager isn't present, the controller never initializes — even if cert-manager is installed later. The fix was to install cert-manager as Phase 5 in setup.sh (before Kuadrant in Phase 11), and add a fallback that restarts the Kuadrant operator if TLSPolicy isn't enforced within 30 seconds.
+
+### Certificate chain
+
+Three resources create the CA chain:
+
+1. **ClusterIssuer `selfsigned-issuer`** — self-signed issuer (bootstrap)
+2. **Certificate `mcp-ca-cert`** — CA certificate (`isCA: true`), signed by the self-signed issuer, stored in `mcp-ca-secret`
+3. **ClusterIssuer `mcp-ca-issuer`** — references `mcp-ca-secret`, signs all downstream certificates
+
+This is a standard cert-manager pattern: bootstrap a self-signed CA, then use it to sign everything else.
+
+### TLSPolicy auto-creates certificates
+
+A single TLSPolicy targeting the Gateway:
+
+```yaml
+apiVersion: kuadrant.io/v1
+kind: TLSPolicy
+metadata:
+  name: mcp-gateway-tls
+  namespace: gateway-system
+spec:
+  targetRef:
+    group: gateway.networking.k8s.io
+    kind: Gateway
+    name: mcp-gateway
+  issuerRef:
+    group: cert-manager.io
+    kind: ClusterIssuer
+    name: mcp-ca-issuer
+```
+
+Kuadrant scans the Gateway for HTTPS listeners and auto-creates a Certificate CR for each one. The naming convention is deterministic: `{gateway-name}-{listener-name}` for the Certificate, `{gateway-name}-{listener-name}-tls` for the Secret. The Gateway's `certificateRefs` must match these auto-generated secret names.
+
+### Gateway HTTPS listeners
+
+Two HTTPS listeners were added to the Gateway:
+
+- `mcp-https` on port 8443 — TLS-terminated MCP gateway
+- `keycloak-https` on port 8445 — TLS-terminated Keycloak
+
+Both use `tls.mode: Terminate` — TLS is terminated at Envoy, and traffic continues as plain HTTP to backends. No backend changes needed.
+
+The Keycloak HTTPS listener was added via a JSON patch (`gateway-patch-tls.json`) applied by setup.sh, keeping the base gateway.yaml clean. A separate HTTPRoute (`httproute-tls.yaml`) routes HTTPS Keycloak traffic, including the OAuth discovery path rewrite.
+
+### Kind cluster and NodePort updates
+
+Kind cluster config gained two new port mappings:
+- `hostPort: 8443` → `containerPort: 30443` (MCP HTTPS)
+- `hostPort: 8445` → `containerPort: 30445` (Keycloak HTTPS)
+
+The NodePort service added corresponding entries routing 30443→8443 and 30445→8445.
+
+### CA certificate extraction
+
+Setup.sh extracts the CA certificate from the `mcp-ca-secret` for client use:
+
+```bash
+kubectl get secret mcp-ca-secret -n cert-manager -o jsonpath='{.data.ca\.crt}' | base64 -d > /tmp/mcp-ca.crt
+```
+
+Clients use this with `curl --cacert /tmp/mcp-ca.crt` to verify the self-signed certificate chain.
+
+### User experience
+
+> **User instruction**: *"so from a user experience perspective there is no difference other than the fact that you are hitting an https endpoint instead of http?"*
+
+Correct. From the client's perspective, the only change is:
+- Use `https://` URLs with port 8443/8445 instead of `http://` with port 8001/8002
+- Pass `--cacert /tmp/mcp-ca.crt` to curl (or equivalent CA trust in other clients)
+
+All JSON-RPC payloads, headers, session management, and authorization behavior are identical. TLS is transparent to the MCP protocol layer.
+
+### Test coverage
+
+The test pipeline was extended with Phase 7 (TLS), adding 8 checks:
+1. cert-manager is running
+2. CA certificate is Ready
+3. TLSPolicy exists
+4. Gateway has HTTPS listener
+5. CA cert extracted to `/tmp/mcp-ca.crt`
+6. Keycloak HTTPS token issuance
+7. MCP session via HTTPS
+8. Tools listed via HTTPS
+
+Total: 55/55 tests passing on a clean cluster (setup.sh → test-pipeline.sh).
+
+---
+
+## Architecture Summary (as of Phase 14)
+
+This snapshot captures the cluster state after Phase 14 — the full pipeline from catalog discovery through deployment, gateway registration, per-tool authorization with Kuadrant, and TLS termination at the gateway.
 
 ### Components on the cluster
 
 ```
 Kind Node (mcp-gateway)
+|
++-- cert-manager namespace
+|   +-- cert-manager (certificate lifecycle management)
+|   +-- ClusterIssuer selfsigned-issuer (bootstrap)
+|   +-- Certificate mcp-ca-cert (isCA: true) → Secret mcp-ca-secret
+|   +-- ClusterIssuer mcp-ca-issuer (signs downstream certs)
 |
 +-- catalog-system namespace
 |   +-- PostgreSQL StatefulSet + PVC + Secret + Service (catalog metadata backend)
@@ -1185,8 +1297,11 @@ Kind Node (mcp-gateway)
 |
 +-- gateway-system namespace
 |   +-- Envoy pod (mcp-gateway-istio) — L7 proxy, data path
-|   +-- NodePort Service (30080 -> 8080, 30082 -> 8002) — external ingress
-|   +-- Gateway resource — declarative listener config
+|   +-- NodePort Service (30080→8080, 30089→8002, 30443→8443, 30445→8445)
+|   +-- Gateway resource — 4 listeners (mcp, keycloak, mcp-https, keycloak-https)
+|   +-- TLSPolicy mcp-gateway-tls — targets Gateway, references mcp-ca-issuer
+|   +-- Certificate mcp-gateway-mcp-https → Secret mcp-gateway-mcp-https-tls
+|   +-- Certificate mcp-gateway-keycloak-https → Secret mcp-gateway-keycloak-https-tls
 |   +-- ReferenceGrant — cross-namespace permissions
 |   +-- EnvoyFilter (ext_proc) — injects Router into Envoy
 |   +-- EnvoyFilter (kuadrant-auth) — created by Kuadrant (ext_authz cluster)
@@ -1196,14 +1311,14 @@ Kind Node (mcp-gateway)
 +-- kuadrant-system namespace
 |   +-- Authorino (auth engine, ext_authz gRPC server)
 |   +-- Authorino operator
-|   +-- Kuadrant operator (translates AuthPolicy → Authorino config + WasmPlugin)
+|   +-- Kuadrant operator (translates AuthPolicy/TLSPolicy → Authorino config + certs)
 |   +-- Limitador + operator (rate limiting, not yet used)
 |   +-- DNS operator (not yet used)
 |
 +-- keycloak namespace
 |   +-- Keycloak 26.3 (OIDC provider, dev mode)
 |   +-- ConfigMap (realm-import) — mcp realm with clients, users, groups
-|   +-- Service + HTTPRoute (OAuth discovery path rewrite)
+|   +-- Service + HTTPRoutes (HTTP + HTTPS, OAuth discovery path rewrite)
 |
 +-- istio-system namespace
 |   +-- istiod — programs Envoy via xDS
@@ -1235,8 +1350,10 @@ Kind Node (mcp-gateway)
 
 | Port | Maps to | Service |
 |------|---------|---------|
-| localhost:8001 | nodePort 30080 → Envoy :8080 | MCP Gateway |
-| localhost:8002 | nodePort 30082 → Envoy :8002 → Keycloak | OIDC Provider |
+| localhost:8001 | nodePort 30080 → Envoy :8080 | MCP Gateway (HTTP) |
+| localhost:8002 | nodePort 30089 → Envoy :8002 → Keycloak | OIDC Provider (HTTP) |
+| localhost:8443 | nodePort 30443 → Envoy :8443 | MCP Gateway (HTTPS) |
+| localhost:8445 | nodePort 30445 → Envoy :8445 → Keycloak | OIDC Provider (HTTPS) |
 | localhost:8004 | nodePort 30472 → mcp-launcher :8080 | MCP Launcher UI |
 
 ### The catalog → deploy → authorize → route pipeline (complete)
@@ -1315,7 +1432,13 @@ The end-to-end pipeline is now fully automated with per-tool authorization. A us
 
 28. **`tools/list` is the authorization blind spot** — gateway-level AuthPolicy can enforce `tools/call` authorization because the Router identifies the tool and sets headers. But `tools/list` goes to the broker (no `:authority` rewrite, no tool-specific headers), and the broker returns all tools to all users. Filtering `tools/list` by user identity requires broker code changes — the gateway cannot selectively filter items within a JSON-RPC response body.
 
-29. **Denied server access returns 500, denied tool access returns 403** — when a user is blocked from an entire server, the broker can't establish a session and wraps the 403 as a generic "failed to create session" 500 error. When a user can reach the server but is denied a specific tool, the 403 from Authorino passes through cleanly. The 500 is a presentation issue in the broker — it doesn't distinguish "server is down" from "you're not authorized."
+29. **TLS termination at the gateway is transparent to the MCP protocol** — adding HTTPS listeners with `tls.mode: Terminate` means TLS is handled entirely at Envoy. Backends (broker, MCP servers, Keycloak) continue to receive plain HTTP. No application-level changes are needed. The only client-side change is the URL scheme and CA certificate trust.
+
+30. **cert-manager must be installed before Kuadrant** — Kuadrant's TLSPolicy controller checks for cert-manager at startup. If cert-manager isn't present, the controller reports `MissingDependency` and never initializes — even if cert-manager is installed later. The fix is installation order, plus a fallback that restarts the Kuadrant operator if TLSPolicy isn't enforced within a timeout window.
+
+31. **TLSPolicy auto-creates certificates with deterministic naming** — a single TLSPolicy targeting a Gateway scans for HTTPS listeners and creates Certificate CRs named `{gateway}-{listener}`, with secrets named `{gateway}-{listener}-tls`. The Gateway's `certificateRefs` must match these auto-generated names. This convention is undocumented but reliable — knowing it avoids trial-and-error.
+
+32. **Denied server access returns 500, denied tool access returns 403** — when a user is blocked from an entire server, the broker can't establish a session and wraps the 403 as a generic "failed to create session" 500 error. When a user can reach the server but is denied a specific tool, the 403 from Authorino passes through cleanly. The 500 is a presentation issue in the broker — it doesn't distinguish "server is down" from "you're not authorized."
 
 ---
 

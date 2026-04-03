@@ -1,0 +1,83 @@
+%%{ init: { 'theme': 'base' } }%%
+
+flowchart TB
+    subgraph External ["External (Host Machine)"]
+        Client["Client<br/>(curl / mcp-client.sh)"]
+    end
+
+    subgraph Kind ["Kind Cluster"]
+        subgraph CM ["cert-manager namespace"]
+            SI["ClusterIssuer<br/>selfsigned-issuer"]
+            CA["Certificate<br/>mcp-ca-cert<br/>(isCA: true)"]
+            CAI["ClusterIssuer<br/>mcp-ca-issuer"]
+            CAS["Secret<br/>mcp-ca-secret<br/>(CA key + cert)"]
+
+            SI -->|signs| CA
+            CA -->|stored in| CAS
+            CAS -->|referenced by| CAI
+        end
+
+        subgraph KS ["kuadrant-system namespace"]
+            TP["TLSPolicy<br/>mcp-gateway-tls<br/>(targets Gateway,<br/>references mcp-ca-issuer)"]
+        end
+
+        subgraph GS ["gateway-system namespace"]
+            GW["Gateway<br/>mcp-gateway"]
+
+            subgraph Listeners ["Listeners"]
+                L1["mcp<br/>:8080 HTTP"]
+                L2["keycloak<br/>:8002 HTTP"]
+                L3["mcp-https<br/>:8443 HTTPS"]
+                L4["keycloak-https<br/>:8445 HTTPS"]
+            end
+
+            CERT1["Certificate<br/>mcp-gateway-mcp-https"]
+            CERT2["Certificate<br/>mcp-gateway-keycloak-https"]
+            SEC1["Secret<br/>mcp-gateway-mcp-https-tls"]
+            SEC2["Secret<br/>mcp-gateway-keycloak-https-tls"]
+
+            GW --- Listeners
+            CERT1 -->|stored in| SEC1
+            CERT2 -->|stored in| SEC2
+            SEC1 -->|certificateRef| L3
+            SEC2 -->|certificateRef| L4
+        end
+
+        subgraph NP ["NodePort Service"]
+            P1["30080 → 8080<br/>(host :8001)"]
+            P2["30089 → 8002<br/>(host :8002)"]
+            P3["30443 → 8443<br/>(host :8443)"]
+            P4["30445 → 8445<br/>(host :8445)"]
+        end
+
+        subgraph Backend ["Backend (plain HTTP)"]
+            Broker["mcp-gateway<br/>broker/router"]
+            KC["Keycloak"]
+        end
+    end
+
+    TP -->|"creates Certificates<br/>for HTTPS listeners"| CERT1
+    TP -->|"creates Certificates<br/>for HTTPS listeners"| CERT2
+    CAI -->|signs| CERT1
+    CAI -->|signs| CERT2
+
+    Client -->|"https://:8443"| P3
+    Client -->|"https://:8445"| P4
+    Client -->|"http://:8001"| P1
+    Client -->|"http://:8002"| P2
+
+    P1 --> L1
+    P2 --> L2
+    P3 --> L3
+    P4 --> L4
+
+    L1 -->|HTTP| Broker
+    L2 -->|HTTP| KC
+    L3 -->|"TLS terminated<br/>→ HTTP"| Broker
+    L4 -->|"TLS terminated<br/>→ HTTP"| KC
+
+    style L3 fill:#2d6a4f,color:#fff
+    style L4 fill:#2d6a4f,color:#fff
+    style SEC1 fill:#1b4332,color:#fff
+    style SEC2 fill:#1b4332,color:#fff
+    style TP fill:#40916c,color:#fff

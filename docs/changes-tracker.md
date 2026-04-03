@@ -73,6 +73,24 @@ Without at least one of these, every new MCP server added to the catalog is a po
   - Added `/authorize` endpoint with authorization code + PKCE flow
   - These were needed because MCP Inspector expects a full OAuth 2.1 flow
 
+### cert-manager (Phase 14)
+- **No code changes to upstream.** Deployed via Helm chart `jetstack/cert-manager` (v1.17.2).
+- Created a CA issuer chain: ClusterIssuer `selfsigned-issuer` → Certificate `mcp-ca-cert` (isCA) → ClusterIssuer `mcp-ca-issuer`.
+- **Observation:** Must be installed before Kuadrant operator. Kuadrant's TLSPolicy controller checks for cert-manager at startup and reports `MissingDependency` if not found — it does not re-check later. Setup.sh installs cert-manager as Phase 5 (before Kuadrant in Phase 11) with a fallback that restarts the Kuadrant operator if TLSPolicy isn't enforced.
+
+### Kuadrant TLSPolicy (Phase 14)
+- **TLSPolicy `mcp-gateway-tls`** in `gateway-system` — targets the Gateway, references `mcp-ca-issuer`.
+- Auto-creates Certificate CRs for each HTTPS listener: `mcp-gateway-mcp-https` and `mcp-gateway-keycloak-https`.
+- Naming convention is deterministic: `{gateway}-{listener}` for Certificate, `{gateway}-{listener}-tls` for Secret.
+- **Observation:** TLSPolicy reconciliation can be flaky after initial creation. Setup.sh includes a retry loop and a fallback that restarts the Kuadrant operator and annotates the TLSPolicy to trigger re-reconciliation.
+
+### Gateway HTTPS listeners (Phase 14)
+- **Two HTTPS listeners added** to the Gateway: `mcp-https` (port 8443) and `keycloak-https` (port 8445).
+- Both use `tls.mode: Terminate` — TLS terminated at Envoy, backends receive plain HTTP.
+- Keycloak HTTPS listener added via JSON patch (`gateway-patch-tls.json`) + separate HTTPRoute (`httproute-tls.yaml`) with OAuth discovery path rewrite.
+- **NodePort service** updated with two new entries: 30443→8443, 30445→8445.
+- **Kind cluster config** updated with corresponding host port mappings: 8443→30443, 8445→30445.
+
 ### Istio/Envoy (auth layer)
 - **EnvoyFilter `mcp-auth-401` created** in `gateway-system` — Lua filter that returns proper 401 + `WWW-Authenticate: Bearer` header instead of Istio's default 403 from AuthorizationPolicy. This was needed because Istio's AuthorizationPolicy hardcodes 403 responses (istio/istio#26559), but OAuth clients (MCP Inspector) expect 401 to trigger the authorization flow. In production, Kuadrant AuthPolicy (Authorino) handles this properly.
 
@@ -99,7 +117,7 @@ Without at least one of these, every new MCP server added to the catalog is a po
   - `roles` client scope with realm/client role mappers
   - Users: alice (developers), bob (ops), carol (developers + ops)
   - Groups: `developers`, `ops`
-- Exposed via HTTP through the gateway on port 8002 (no TLS — avoids cert-manager/Kuadrant dependency).
+- Exposed via HTTP (port 8002) and HTTPS (port 8445) through the gateway. TLS terminated at Envoy — Keycloak receives plain HTTP.
 - **Observation:** Keycloak's multi-realm URL structure (`/realms/mcp/.well-known/...`) predates RFC 8414, requiring an HTTPRoute path rewrite. This is a Keycloak-specific quirk, not a general OIDC issue.
 - **Observation:** Keycloak 26 requires `firstName`/`lastName` on user profiles for password grant even when these fields are marked optional in the user profile configuration. Without them, the token endpoint returns "Account is not fully set up."
 - **Observation:** istiod caches JWKS as inline `local_jwks` in Envoy config. When Keycloak's dev mode regenerates signing keys on pod restart, istiod does not re-fetch. Both istiod and gateway pods must be restarted. Production Keycloak with persistent storage would not have this issue.
@@ -184,7 +202,12 @@ The 500 is a presentation issue in the broker — it doesn't distinguish "server
 - Launcher Deployment + Service + NodePort in `mcp-test`
 - Keycloak namespace + ConfigMap (realm-import) + Deployment + Service in `keycloak`
 - Gateway patch (HTTP listener on port 8002) + HTTPRoute for Keycloak
+- Gateway patch (HTTPS listener on port 8445) + HTTPRoute for Keycloak HTTPS
 - AuthPolicy `mcp-auth-policy` in `gateway-system` (gateway-level JWT auth + 401 response)
 - AuthPolicy `server1-auth-policy` in `mcp-test` (per-HTTPRoute, developers group + tool ACLs)
 - AuthPolicy `server2-auth-policy` in `mcp-test` (per-HTTPRoute, ops group + tool ACLs)
 - MCPServer `test-server2` in `mcp-test` (second test server for multi-server auth testing)
+- cert-manager CA issuer chain (ClusterIssuers + CA Certificate) in `cert-manager`
+- TLSPolicy `mcp-gateway-tls` in `gateway-system` (auto-creates HTTPS certificates)
+- Gateway HTTPS listener `mcp-https` on port 8443 (in base gateway.yaml)
+- NodePort entries for HTTPS (30443→8443, 30445→8445)

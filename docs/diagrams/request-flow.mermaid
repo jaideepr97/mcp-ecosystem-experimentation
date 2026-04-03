@@ -17,8 +17,15 @@ sequenceDiagram
     KC-->>C: {"access_token": "eyJ...",<br/>"id_token": "...", "refresh_token": "..."}
     Note over C: Token contains: sub, groups, iss
 
-    Note over C,S: 2. Authenticated Request
-    C->>E: POST /mcp<br/>Authorization: Bearer eyJ...
+    Note over C,S: 2. Authenticated Request (HTTP or HTTPS)
+
+    alt HTTPS (port 8443)
+        Note over C,E: TLS handshake using cert signed by mcp-ca-issuer<br/>Client verifies with --cacert /tmp/mcp-ca.crt
+        C->>E: POST https://.../mcp<br/>Authorization: Bearer eyJ...
+        Note over E: TLS terminated at Gateway.<br/>Request continues as plain HTTP internally.
+    else HTTP (port 8001)
+        C->>E: POST http://.../mcp<br/>Authorization: Bearer eyJ...
+    end
 
     Note over E: Filter chain order:<br/>1. ext_proc (Router)<br/>2. Wasm plugin (Authorino)<br/>3. envoy.filters.http.router
 

@@ -13,11 +13,17 @@ nodes:
     kind: KubeletConfiguration
     syncFrequency: "10s"
   extraPortMappings:
-  - containerPort: 30080 # mcp-gateway
+  - containerPort: 30080 # mcp-gateway (HTTP)
     hostPort: 8001
     protocol: TCP
-  - containerPort: 30089 # keycloak
+  - containerPort: 30089 # keycloak (HTTP)
     hostPort: 8002
+    protocol: TCP
+  - containerPort: 30443 # mcp-gateway (HTTPS)
+    hostPort: 8443
+    protocol: TCP
+  - containerPort: 30445 # keycloak (HTTPS)
+    hostPort: 8445
     protocol: TCP
   - containerPort: 30472 # launcher
     hostPort: 8004

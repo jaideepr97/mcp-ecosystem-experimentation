@@ -8,6 +8,7 @@
 #   Phase 4: Keycloak authentication (token issuance, unauthenticated rejection)
 #   Phase 5: Gateway tool access (session init, tool federation, tool calls)
 #   Phase 6: Authorization matrix (3 users × 5 tools = 15 allow/deny cases)
+#   Phase 7: TLS (cert-manager, TLSPolicy, HTTPS endpoints)
 #
 # Usage: ./scripts/test-pipeline.sh
 
@@ -15,6 +16,9 @@ set -uo pipefail
 
 KEYCLOAK_URL="${KEYCLOAK_URL:-http://keycloak.127-0-0-1.sslip.io:8002}"
 GATEWAY_URL="${GATEWAY_URL:-http://mcp.127-0-0-1.sslip.io:8001}"
+KEYCLOAK_TLS_URL="${KEYCLOAK_TLS_URL:-https://keycloak.127-0-0-1.sslip.io:8445}"
+GATEWAY_TLS_URL="${GATEWAY_TLS_URL:-https://mcp.127-0-0-1.sslip.io:8443}"
+CA_CERT="${CA_CERT:-/tmp/mcp-ca.crt}"
 CLIENT_ID="${CLIENT_ID:-mcp-cli}"
 REALM="${REALM:-mcp}"
 SCOPE="${SCOPE:-openid groups}"
@@ -337,6 +341,73 @@ assert_tool "carol" "test_server2_auth1234" "allow" "$CAROL_TOKEN" "$CAROL_SESSI
 assert_tool "alice" "test_server2_set_time" "allow" "$ALICE_TOKEN" "$ALICE_SESSION" '{"time":"12:00"}'
 assert_tool "bob"   "test_server2_set_time" "allow" "$BOB_TOKEN"   "$BOB_SESSION"   '{"time":"12:00"}'
 assert_tool "carol" "test_server2_set_time" "allow" "$CAROL_TOKEN" "$CAROL_SESSION" '{"time":"12:00"}'
+
+########################################
+# Phase 7: TLS
+########################################
+echo ""
+echo "--- Phase 7: TLS ---"
+
+# cert-manager running
+CM_READY=$(kubectl get deployment cert-manager -n cert-manager -o jsonpath='{.status.availableReplicas}' 2>/dev/null)
+check "cert-manager is running" "$([ "${CM_READY:-0}" -gt 0 ] && echo true || echo false)"
+
+# CA certificate issued
+CA_CERT_READY=$(kubectl get certificate mcp-ca-cert -n cert-manager -o jsonpath='{.status.conditions[?(@.type=="Ready")].status}' 2>/dev/null)
+check "CA certificate is Ready" "$([ "$CA_CERT_READY" = "True" ] && echo true || echo false)"
+
+# TLSPolicy exists
+TLS_POLICY=$(kubectl get tlspolicy mcp-gateway-tls -n gateway-system -o name 2>/dev/null)
+check "TLSPolicy exists" "$([ -n "$TLS_POLICY" ] && echo true || echo false)"
+
+# Gateway has HTTPS listeners
+HTTPS_LISTENER=$(kubectl get gateway mcp-gateway -n gateway-system -o jsonpath='{.spec.listeners[?(@.name=="mcp-https")].protocol}' 2>/dev/null)
+check "Gateway has HTTPS listener" "$([ "$HTTPS_LISTENER" = "HTTPS" ] && echo true || echo false)"
+
+# CA cert file exists
+check "CA cert extracted to ${CA_CERT}" "$([ -f "$CA_CERT" ] && echo true || echo false)"
+
+# HTTPS gateway endpoint responds
+if [ -f "$CA_CERT" ]; then
+  TLS_TOKEN=$(curl -s --cacert "$CA_CERT" -X POST \
+    "${KEYCLOAK_TLS_URL}/realms/${REALM}/protocol/openid-connect/token" \
+    -d "grant_type=password" -d "client_id=${CLIENT_ID}" \
+    -d "username=alice" -d "password=alice" -d "scope=${SCOPE}" 2>/dev/null | \
+    python3 -c "import sys,json; print(json.load(sys.stdin).get('access_token',''))" 2>/dev/null)
+  check "Keycloak HTTPS token issuance" "$([ -n "$TLS_TOKEN" ] && echo true || echo false)"
+
+  TLS_INIT=$(curl -si --cacert "$CA_CERT" \
+    -H "Authorization: Bearer $TLS_TOKEN" \
+    -H "Content-Type: application/json" \
+    -d '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-03-26","capabilities":{},"clientInfo":{"name":"tls-test","version":"1.0"}}}' \
+    "${GATEWAY_TLS_URL}/mcp" 2>&1)
+  TLS_SESSION=$(echo "$TLS_INIT" | grep -i mcp-session-id | awk '{print $2}' | tr -d '\r')
+  check "MCP session via HTTPS" "$([ -n "$TLS_SESSION" ] && echo true || echo false)"
+
+  if [ -n "$TLS_SESSION" ]; then
+    TLS_TOOLS=$(curl -s --cacert "$CA_CERT" \
+      -H "Authorization: Bearer $TLS_TOKEN" \
+      -H "Mcp-Session-Id: $TLS_SESSION" \
+      -H "Content-Type: application/json" \
+      -d '{"jsonrpc":"2.0","id":2,"method":"tools/list"}' \
+      "${GATEWAY_TLS_URL}/mcp" 2>/dev/null)
+    # Handle SSE or plain JSON
+    TLS_TOOLS_JSON=$(echo "$TLS_TOOLS" | grep "^data:" | sed 's/^data: //')
+    [ -z "$TLS_TOOLS_JSON" ] && TLS_TOOLS_JSON="$TLS_TOOLS"
+    TLS_TOOL_COUNT=$(echo "$TLS_TOOLS_JSON" | python3 -c "
+import sys,json
+data = json.load(sys.stdin)
+print(len(data.get('result',{}).get('tools',[])))
+" 2>/dev/null || echo "0")
+    check "Tools listed via HTTPS" "$([ "${TLS_TOOL_COUNT:-0}" -gt 0 ] 2>/dev/null && echo true || echo false)" "found ${TLS_TOOL_COUNT} tools"
+  else
+    check "Tools listed via HTTPS" "false" "skipped (no session)"
+  fi
+else
+  check "Keycloak HTTPS token issuance" "false" "skipped (no CA cert)"
+  check "MCP session via HTTPS" "false" "skipped (no CA cert)"
+  check "Tools listed via HTTPS" "false" "skipped (no CA cert)"
+fi
 
 ########################################
 # Summary

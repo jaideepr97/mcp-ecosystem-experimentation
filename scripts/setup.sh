@@ -32,6 +32,7 @@ fi
 GATEWAY_API_VERSION="v1.4.1"
 SAIL_VERSION="1.27.0"
 METALLB_VERSION="v0.15.2"
+CERT_MANAGER_VERSION="v1.17.2"
 
 # Colors for output
 RED='\033[0;31m'
@@ -103,7 +104,29 @@ info "Configuring MetalLB IP pool..."
 "${REPO_DIR}/infrastructure/metallb/ipaddresspool.sh" kind | kubectl apply -n metallb-system -f -
 
 ########################################
-# Phase 5: Gateway (namespace, gateway, nodeport, referencegrant)
+# Phase 5: cert-manager (must be before Kuadrant so it detects the dependency)
+########################################
+info "Installing cert-manager (${CERT_MANAGER_VERSION})..."
+helm repo add jetstack https://charts.jetstack.io 2>/dev/null || true
+helm repo update
+helm upgrade --install cert-manager jetstack/cert-manager \
+  --create-namespace \
+  --namespace cert-manager \
+  --set crds.enabled=true \
+  --wait \
+  --timeout=300s
+
+wait_for "cert-manager to be ready..."
+kubectl wait --for=condition=Available deployment/cert-manager -n cert-manager --timeout=120s
+kubectl wait --for=condition=Available deployment/cert-manager-webhook -n cert-manager --timeout=120s
+
+info "Creating CA issuer chain..."
+kubectl apply -f "${REPO_DIR}/infrastructure/cert-manager/issuers.yaml"
+wait_for "CA certificate to be ready..."
+kubectl wait --for=condition=Ready certificate/mcp-ca-cert -n cert-manager --timeout=60s
+
+########################################
+# Phase 6: Gateway (namespace, gateway, nodeport, referencegrant)
 ########################################
 info "Deploying Istio Gateway..."
 kubectl apply -f "${REPO_DIR}/infrastructure/gateway/namespace.yaml"
@@ -114,7 +137,7 @@ wait_for "Gateway to be programmed..."
 kubectl wait --for=condition=Programmed gateway/mcp-gateway -n gateway-system --timeout=300s
 
 ########################################
-# Phase 6: mcp-gateway (CRDs + controller)
+# Phase 7: mcp-gateway (CRDs + controller)
 ########################################
 info "Installing mcp-gateway CRDs..."
 kubectl apply -f "${REPO_DIR}/infrastructure/mcp-gateway/mcp.kuadrant.io_mcpserverregistrations.yaml"
@@ -131,7 +154,7 @@ wait_for "MCPGatewayExtension to be ready..."
 kubectl wait --for=condition=Ready mcpgatewayextension/mcp-gateway-extension -n mcp-system --timeout=120s
 
 ########################################
-# Phase 7: mcp-lifecycle-operator
+# Phase 8: mcp-lifecycle-operator
 ########################################
 # Pre-load the image into Kind so it doesn't need to pull from registry
 info "Loading lifecycle operator image into Kind..."
@@ -153,7 +176,7 @@ kubectl apply -f "${REPO_DIR}/infrastructure/operator-gateway/gateway-role.yaml"
 kubectl apply -f "${REPO_DIR}/infrastructure/operator-gateway/gateway-role-binding.yaml"
 
 ########################################
-# Phase 8: Catalog system
+# Phase 9: Catalog system
 ########################################
 info "Deploying catalog system..."
 kubectl create namespace catalog-system --dry-run=client -o yaml | kubectl apply -f -
@@ -165,7 +188,7 @@ kubectl wait --for=condition=Ready pod -l app=mcp-catalog-postgres -n catalog-sy
 kubectl wait --for=condition=Ready pod -l app=mcp-catalog -n catalog-system --timeout=120s
 
 ########################################
-# Phase 9: Keycloak
+# Phase 10: Keycloak
 ########################################
 info "Deploying Keycloak..."
 kubectl create namespace keycloak --dry-run=client -o yaml | kubectl apply -f -
@@ -178,7 +201,7 @@ wait_for "Keycloak to be ready..."
 kubectl wait --for=condition=Ready pod -l app=keycloak -n keycloak --timeout=180s
 
 ########################################
-# Phase 10: Kuadrant operator
+# Phase 11: Kuadrant operator
 ########################################
 info "Installing Kuadrant operator..."
 helm repo add kuadrant https://kuadrant.io/helm-charts 2>/dev/null || true
@@ -212,7 +235,7 @@ else
 fi
 
 ########################################
-# Phase 11: Test servers + Launcher
+# Phase 12: Test servers + Launcher
 ########################################
 info "Deploying test servers..."
 kubectl create namespace mcp-test --dry-run=client -o yaml | kubectl apply -f -
@@ -235,7 +258,7 @@ kubectl rollout restart deployment mcp-gateway -n mcp-system 2>/dev/null || true
 kubectl rollout status deployment mcp-gateway -n mcp-system --timeout=120s 2>/dev/null || true
 
 ########################################
-# Phase 12: AuthPolicies
+# Phase 13: AuthPolicies
 ########################################
 info "Applying gateway-level AuthPolicy..."
 kubectl apply -f "${REPO_DIR}/infrastructure/auth/authpolicy.yaml"
@@ -245,6 +268,52 @@ kubectl apply -f "${REPO_DIR}/infrastructure/auth/authpolicy-server1.yaml"
 kubectl apply -f "${REPO_DIR}/infrastructure/auth/authpolicy-server2.yaml"
 
 ########################################
+# Phase 14: TLS (TLSPolicy + HTTPS listeners)
+########################################
+info "Applying TLSPolicy..."
+kubectl apply -f "${REPO_DIR}/infrastructure/cert-manager/tls-policy.yaml"
+
+info "Adding Keycloak HTTPS listener..."
+kubectl patch gateway mcp-gateway -n gateway-system --type json \
+  -p "$(cat "${REPO_DIR}/infrastructure/keycloak/gateway-patch-tls.json")"
+kubectl apply -f "${REPO_DIR}/infrastructure/keycloak/httproute-tls.yaml"
+
+wait_for "TLSPolicy to be enforced..."
+# TLSPolicy may need a moment to reconcile after cert-manager + Kuadrant are both ready
+for i in $(seq 1 6); do
+  STATUS=$(kubectl get tlspolicy mcp-gateway-tls -n gateway-system -o jsonpath='{.status.conditions[?(@.type=="Enforced")].status}' 2>/dev/null)
+  [ "$STATUS" = "True" ] && break
+  sleep 5
+done
+if [ "$STATUS" != "True" ]; then
+  warn "TLSPolicy not enforced yet — restarting Kuadrant operator..."
+  kubectl rollout restart deployment kuadrant-operator-controller-manager -n kuadrant-system
+  kubectl rollout status deployment kuadrant-operator-controller-manager -n kuadrant-system --timeout=60s
+  kubectl annotate tlspolicy mcp-gateway-tls -n gateway-system reconcile-trigger="$(date +%s)" --overwrite
+  sleep 10
+fi
+
+wait_for "Gateway HTTPS certificates..."
+kubectl wait --for=condition=Ready certificate/mcp-gateway-mcp-https -n gateway-system --timeout=120s 2>/dev/null || \
+  warn "MCP HTTPS certificate not ready yet"
+kubectl wait --for=condition=Ready certificate/mcp-gateway-keycloak-https -n gateway-system --timeout=120s 2>/dev/null || \
+  warn "Keycloak HTTPS certificate not ready yet"
+
+wait_for "Gateway to be programmed with HTTPS listeners..."
+kubectl wait --for=condition=Programmed gateway/mcp-gateway -n gateway-system --timeout=120s
+
+# Extract CA cert for client use
+info "Extracting CA certificate for client verification..."
+kubectl get secret mcp-ca-secret -n cert-manager -o jsonpath='{.data.ca\.crt}' | \
+  base64 -d > /tmp/mcp-ca.crt 2>/dev/null || \
+  kubectl get secret mcp-ca-secret -n cert-manager -o jsonpath='{.data.tls\.crt}' | \
+  base64 -d > /tmp/mcp-ca.crt 2>/dev/null || \
+  warn "Could not extract CA cert"
+if [ -f /tmp/mcp-ca.crt ]; then
+  info "CA certificate saved to /tmp/mcp-ca.crt (use with curl --cacert)"
+fi
+
+########################################
 # Done
 ########################################
 echo ""
@@ -252,17 +321,30 @@ info "========================================="
 info "  MCP Ecosystem setup complete!"
 info "========================================="
 echo ""
-info "Endpoints:"
+info "Endpoints (HTTP):"
 info "  MCP Gateway:  http://mcp.127-0-0-1.sslip.io:8001/mcp"
 info "  Keycloak:     http://keycloak.127-0-0-1.sslip.io:8002 (admin/admin)"
+info ""
+info "Endpoints (HTTPS — self-signed CA):"
+info "  MCP Gateway:  https://mcp.127-0-0-1.sslip.io:8443/mcp"
+info "  Keycloak:     https://keycloak.127-0-0-1.sslip.io:8445 (admin/admin)"
+info "  CA cert:      /tmp/mcp-ca.crt"
+info ""
 info "  Launcher:     http://localhost:8004"
 echo ""
 info "Test users (password = username):"
 info "  alice (developers) | bob (ops) | carol (both)"
 echo ""
-info "Quick test:"
+info "Quick test (HTTP):"
 info "  TOKEN=\$(curl -s http://keycloak.127-0-0-1.sslip.io:8002/realms/mcp/protocol/openid-connect/token \\"
 info "    -d grant_type=password -d client_id=mcp-cli -d username=alice -d password=alice -d scope=openid \\"
 info "    | jq -r .access_token)"
 info "  curl http://mcp.127-0-0-1.sslip.io:8001/mcp -H \"Authorization: Bearer \$TOKEN\" \\"
+info "    -H 'Content-Type: application/json' -d '{\"jsonrpc\":\"2.0\",\"method\":\"tools/list\",\"id\":1}'"
+echo ""
+info "Quick test (HTTPS):"
+info "  TOKEN=\$(curl -s --cacert /tmp/mcp-ca.crt https://keycloak.127-0-0-1.sslip.io:8445/realms/mcp/protocol/openid-connect/token \\"
+info "    -d grant_type=password -d client_id=mcp-cli -d username=alice -d password=alice -d scope=openid \\"
+info "    | jq -r .access_token)"
+info "  curl --cacert /tmp/mcp-ca.crt https://mcp.127-0-0-1.sslip.io:8443/mcp -H \"Authorization: Bearer \$TOKEN\" \\"
 info "    -H 'Content-Type: application/json' -d '{\"jsonrpc\":\"2.0\",\"method\":\"tools/list\",\"id\":1}'"

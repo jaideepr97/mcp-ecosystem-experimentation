@@ -11,14 +11,29 @@ graph TB
             catalog-api --> catalog-cm
         end
 
+        subgraph cert-manager-ns["cert-manager namespace"]
+            selfsigned-issuer["ClusterIssuer<br/>selfsigned-issuer"]
+            ca-cert["Certificate<br/>mcp-ca-cert (isCA)"]
+            ca-secret["Secret<br/>mcp-ca-secret"]
+            ca-issuer["ClusterIssuer<br/>mcp-ca-issuer"]
+            selfsigned-issuer -->|signs| ca-cert
+            ca-cert -->|stored in| ca-secret
+            ca-secret -->|referenced by| ca-issuer
+        end
+
         subgraph gateway-system["gateway-system namespace"]
-            envoy["Envoy Proxy<br/>(mcp-gateway-istio :8080/:8002)"]
+            envoy["Envoy Proxy<br/>(mcp-gateway-istio<br/>:8080/:8002/:8443/:8445)"]
             gateway-res["Gateway Resource"]
             ref-grant["ReferenceGrant"]
             ef-extproc["EnvoyFilter<br/>(ext_proc → Router)"]
             gw-authpolicy["AuthPolicy<br/>(mcp-auth-policy)<br/>JWT auth + 401 response"]
-            nodeport-gw["NodePort Service<br/>30080 → 8080 (MCP)<br/>30082 → 8002 (Keycloak)"]
+            tls-policy["TLSPolicy<br/>(mcp-gateway-tls)"]
+            gw-cert-mcp["Certificate<br/>mcp-gateway-mcp-https"]
+            gw-cert-kc["Certificate<br/>mcp-gateway-keycloak-https"]
+            nodeport-gw["NodePort Service<br/>30080→8080 (MCP HTTP)<br/>30089→8002 (KC HTTP)<br/>30443→8443 (MCP HTTPS)<br/>30445→8445 (KC HTTPS)"]
             nodeport-gw --> envoy
+            tls-policy -->|creates| gw-cert-mcp
+            tls-policy -->|creates| gw-cert-kc
         end
 
         subgraph kuadrant-system["kuadrant-system namespace"]
@@ -90,6 +105,11 @@ graph TB
         operator -.->|"watches"| mcpserver-cr1
         operator -.->|"watches"| mcpserver-cr2
 
+        %% TLS relationships
+        ca-issuer -->|signs| gw-cert-mcp
+        ca-issuer -->|signs| gw-cert-kc
+        tls-policy -.->|"targets"| gateway-res
+
         %% Kuadrant relationships
         kuadrant-op -.->|"configures"| authorino
         kuadrant-op -.->|"creates WasmPlugin"| envoy
@@ -115,8 +135,10 @@ graph TB
 
     %% External access
     client["Client / mcp-client.sh"]
-    client -->|":8001 (MCP)"| nodeport-gw
-    client -->|":8002 (Keycloak)"| nodeport-gw
+    client -->|":8001 (MCP HTTP)"| nodeport-gw
+    client -->|":8443 (MCP HTTPS)"| nodeport-gw
+    client -->|":8002 (KC HTTP)"| nodeport-gw
+    client -->|":8445 (KC HTTPS)"| nodeport-gw
     client -->|":8004"| nodeport-launcher
 
     %% Keycloak clients
@@ -140,10 +162,11 @@ graph TB
     classDef external fill:#f3e5f5,stroke:#9C27B0,stroke-width:2px
     classDef auth fill:#fff9c4,stroke:#FBC02D,stroke-width:1px
 
-    class catalog-system,gateway-system,istio-system,mcp-system,mcp-test,operator-system,metallb-system,keycloak-ns,kuadrant-system ns
+    class catalog-system,gateway-system,istio-system,mcp-system,mcp-test,operator-system,metallb-system,keycloak-ns,kuadrant-system,cert-manager-ns ns
     class envoy,catalog-api,mcp-gw-pod,mcp-ctrl,launcher,server1-pod,server2-pod,keycloak,operator,istiod,metallb,authorino,kuadrant-op,limitador pod
     class nodeport-gw,nodeport-launcher,server1-svc,server2-svc,kc-svc svc
-    class mcpserver-cr1,mcpserver-cr2,server1-httproute,server1-reg,server2-httproute,server2-reg,gateway-res,ref-grant,ef-extproc,mcp-gw-ext,httproute-gw,config-secret,launcher-rbac,kc-httproute cr
+    class mcpserver-cr1,mcpserver-cr2,server1-httproute,server1-reg,server2-httproute,server2-reg,gateway-res,ref-grant,ef-extproc,mcp-gw-ext,httproute-gw,config-secret,launcher-rbac,kc-httproute,tls-policy,gw-cert-mcp,gw-cert-kc,selfsigned-issuer,ca-cert,ca-issuer cr
+    class ca-secret storage
     class postgres,catalog-cm,realm-cm storage
     class client external
     class kc-gw-client,kc-cli-client,kc-inspector-client,alice,bob,carol,kc-clients,kc-users,gw-authpolicy,server1-authpolicy,server2-authpolicy auth
