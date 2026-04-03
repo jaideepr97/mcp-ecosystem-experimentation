@@ -60,13 +60,19 @@ kind delete cluster --name mcp-gateway
 
 ## Verifying the Setup
 
-Run the automated authorization test matrix:
+Run the automated pipeline test:
 
 ```bash
-./scripts/test-auth-matrix.sh
+./scripts/test-pipeline.sh
 ```
 
-This authenticates as all three test users via Keycloak's direct access grant, calls every tool on both servers, and verifies the correct allow/deny outcome for each combination (15 test cases).
+This verifies the full pipeline end-to-end across 6 phases:
+1. **Catalog API** — lists available servers with OCI artifact URIs
+2. **Operator resources** — MCPServer CRs triggered Deployment + Service creation for both servers
+3. **Gateway integration** — operator created HTTPRoute + MCPServerRegistration + AuthPolicies
+4. **Authentication** — Keycloak issues tokens for all users, unauthenticated requests are rejected with 401
+5. **Gateway tool access** — MCP sessions initialize, tools from both servers are federated, tool calls return results
+6. **Authorization matrix** — 15 allow/deny cases across 3 users × 5 tools (see matrix below)
 
 ### Authorization Matrix
 
@@ -159,7 +165,8 @@ All passwords match the username.
 │   └── test-servers/                           # MCPServer CRs for test-server1 and test-server2
 ├── scripts/
 │   ├── setup.sh                                # Full cluster setup from scratch
-│   ├── test-auth-matrix.sh                     # Automated 15-case auth verification
+│   ├── test-pipeline.sh                        # Full pipeline + auth matrix verification
+│   ├── test-auth-matrix.sh                     # Auth matrix only (subset of test-pipeline)
 │   └── mcp-client.sh                           # Interactive MCP client (device auth flow)
 ├── progress.md                                 # Session handoff / current state
 └── README.md
