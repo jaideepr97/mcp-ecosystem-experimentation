@@ -137,13 +137,32 @@ phase_done() {
   fi
 }
 
-phase_inspect() {
-  local namespace="$1"
-  if [ "$BATCH_MODE" = true ]; then
+show_resources() {
+  # Show the actual resources created during a phase by running kubectl commands.
+  # Usage: show_resources "label: kubectl args" "label: kubectl args" ...
+  # Each argument is "LABEL: kubectl get args..." — the label is shown as a header.
+
+  local output=""
+  for entry in "$@"; do
+    local label="${entry%%:*}"
+    local cmd="${entry#*: }"
+    local items
+    items=$(eval "kubectl get $cmd --no-headers 2>/dev/null")
+    if [ -n "$items" ]; then
+      output="${output}${label}:\n${items}\n\n"
+    fi
+  done
+
+  if [ -z "$output" ]; then
     return
   fi
-  if gum confirm --default=no "Inspect resources in ${namespace}?"; then
-    kubectl get all -n "$namespace" 2>/dev/null | gum pager
+
+  echo ""
+  if [ "$BATCH_MODE" = true ]; then
+    echo "  Resources created:"
+    printf '%b' "$output" | sed 's/^/    /'
+  else
+    printf '%b' "$output" | gum style --border rounded --border-foreground 240 --padding "0 2" --margin "0 2"
   fi
 }
 
@@ -203,6 +222,7 @@ if confirm_phase 1; then
   fi
   kubectl config use-context "kind-${KIND_CLUSTER_NAME}" >/dev/null 2>&1
   phase_done 1
+  show_resources "Nodes: nodes"
 fi
 
 fi # phase 1
@@ -239,6 +259,7 @@ if confirm_phase 2; then
     kubectl apply -f "https://github.com/kubernetes-sigs/gateway-api/releases/download/${GATEWAY_API_VERSION}/standard-install.yaml"
   kubectl wait --for=condition=Established --timeout=60s crd/gateways.gateway.networking.k8s.io >/dev/null 2>&1
   phase_done 2
+  show_resources "Gateway API CRDs: crd gateways.gateway.networking.k8s.io httproutes.gateway.networking.k8s.io referencegrants.gateway.networking.k8s.io gatewayclasses.gateway.networking.k8s.io grpcroutes.gateway.networking.k8s.io"
 fi
 
 fi # phase 2
@@ -283,7 +304,10 @@ if confirm_phase 3; then
   run_cmd "Waiting for Istio to become ready..." \
     kubectl -n istio-system wait --for=condition=Ready istio/default --timeout=300s
   phase_done 3
-  phase_inspect "istio-system"
+  show_resources \
+    "Deployments: deployments -n istio-system" \
+    "Pods: pods -n istio-system" \
+    "Istio: istio -n istio-system"
 fi
 
 fi # phase 3
@@ -325,6 +349,11 @@ if confirm_phase 4; then
   run_cmd "Configuring IP pool..." \
     bash -c "'${REPO_DIR}/infrastructure/metallb/ipaddresspool.sh' kind | kubectl apply -n metallb-system -f -"
   phase_done 4
+  show_resources \
+    "Deployments: deployments -n metallb-system" \
+    "Pods: pods -n metallb-system" \
+    "IPAddressPools: ipaddresspool -n metallb-system" \
+    "L2Advertisements: l2advertisement -n metallb-system"
 fi
 
 fi # phase 4
@@ -370,7 +399,11 @@ if confirm_phase 5; then
   run_cmd "Waiting for Gateway to be programmed..." \
     kubectl wait --for=condition=Programmed gateway/mcp-gateway -n gateway-system --timeout=300s
   phase_done 5
-  phase_inspect "gateway-system"
+  show_resources \
+    "Gateways: gateway -n gateway-system" \
+    "Services: services -n gateway-system" \
+    "Pods: pods -n gateway-system" \
+    "ReferenceGrants: referencegrant -n gateway-system"
 fi
 
 fi # phase 5
@@ -429,7 +462,12 @@ if confirm_phase 6; then
   run_cmd "Waiting for MCPGatewayExtension..." \
     kubectl wait --for=condition=Ready mcpgatewayextension/mcp-gateway-extension -n mcp-system --timeout=120s
   phase_done 6
-  phase_inspect "mcp-system"
+  show_resources \
+    "MCP CRDs: crd mcpserverregistrations.mcp.kuadrant.io mcpvirtualservers.mcp.kuadrant.io mcpgatewayextensions.mcp.kuadrant.io" \
+    "Deployments: deployments -n mcp-system" \
+    "Services: services -n mcp-system" \
+    "Pods: pods -n mcp-system" \
+    "MCPGatewayExtensions: mcpgatewayextension -n mcp-system"
 fi
 
 fi # phase 6
@@ -485,7 +523,10 @@ if confirm_phase 7; then
     bash -c "kubectl apply -f '${REPO_DIR}/infrastructure/operator-gateway/gateway-role.yaml' && \
              kubectl apply -f '${REPO_DIR}/infrastructure/operator-gateway/gateway-role-binding.yaml'"
   phase_done 7
-  phase_inspect "mcp-lifecycle-operator-system"
+  show_resources \
+    "Deployments: deployments -n mcp-lifecycle-operator-system" \
+    "Pods: pods -n mcp-lifecycle-operator-system" \
+    "Operator CRDs: crd mcpservers.mcp.x-k8s.io"
 fi
 
 fi # phase 7
@@ -535,7 +576,12 @@ if confirm_phase 8; then
   run_cmd "Waiting for catalog API..." \
     kubectl wait --for=condition=Ready pod -l app=mcp-catalog -n catalog-system --timeout=120s
   phase_done 8
-  phase_inspect "catalog-system"
+  show_resources \
+    "Deployments: deployments -n catalog-system" \
+    "Pods: pods -n catalog-system" \
+    "Services: services -n catalog-system" \
+    "ConfigMaps: configmaps -n catalog-system" \
+    "PVCs: pvc -n catalog-system"
 fi
 
 fi # phase 8
@@ -592,6 +638,12 @@ if confirm_phase 9; then
              kubectl apply -f '${REPO_DIR}/infrastructure/auth/authorization-policy.yaml' && \
              kubectl apply -f '${REPO_DIR}/infrastructure/auth/envoyfilter-401.yaml'"
   phase_done 9
+  show_resources \
+    "Pods (mini-oidc): pods -n mcp-test -l app=mini-oidc" \
+    "Services: services -n mcp-test -l app=mini-oidc" \
+    "RequestAuthentication: requestauthentication -n gateway-system" \
+    "AuthorizationPolicy: authorizationpolicy -n gateway-system" \
+    "EnvoyFilters: envoyfilter -n gateway-system"
 fi
 
 fi # phase 9
@@ -653,7 +705,13 @@ if confirm_phase 10; then
     bash -c "kubectl rollout restart deployment mcp-gateway -n mcp-system 2>/dev/null && \
              kubectl rollout status deployment mcp-gateway -n mcp-system --timeout=120s 2>/dev/null || true"
   phase_done 10
-  phase_inspect "mcp-test"
+  show_resources \
+    "MCPServers: mcpserver -n mcp-test" \
+    "Deployments: deployments -n mcp-test" \
+    "Services: services -n mcp-test" \
+    "Pods: pods -n mcp-test" \
+    "HTTPRoutes: httproute -n mcp-test" \
+    "MCPServerRegistrations: mcpserverregistration -n mcp-test"
 fi
 
 fi # phase 10
