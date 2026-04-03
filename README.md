@@ -1,6 +1,6 @@
 # MCP Ecosystem Experimentation
 
-A reproducible experiment exploring how MCP ecosystem projects work together end-to-end: **discovery** (model-registry catalog), **deployment** (lifecycle operator), **routing** (mcp-gateway), **authentication** (Keycloak + Kuadrant/Authorino), **per-tool authorization** (AuthPolicy with CEL predicates), and **TLS** (cert-manager + Kuadrant TLSPolicy).
+A reproducible experiment exploring how MCP ecosystem projects work together end-to-end: **discovery** (model-registry catalog), **deployment** (lifecycle operator), **routing** (mcp-gateway), **authentication** (Keycloak + Kuadrant/Authorino), **per-tool authorization** (AuthPolicy with CEL predicates), **TLS** (cert-manager + Kuadrant TLSPolicy), and **per-user credential exchange** (Vault token exchange for upstream API tokens).
 
 ## Acknowledgements
 
@@ -20,12 +20,14 @@ Lifecycle Operator   — "make it run AND make it routable"
   | creates Deployment + Service + HTTPRoute + MCPServerRegistration
 Kuadrant AuthPolicy  — "who can call which tools on which servers"
   | per-HTTPRoute policies with CEL predicates
+Vault Token Exchange — "swap user JWT for upstream API credentials"
+  | Keycloak JWT → Vault JWT login → per-user secret read
 MCP Gateway          — "route requests securely to the server"
 ```
 
 ## Documentation
 
-- [docs/experimentation.md](docs/experimentation.md) — Full chronological narrative of the experiment (Phases 1-14), from initial project analysis through deployment, request tracing, authentication, catalog integration, gateway automation, per-tool authorization, and TLS
+- [docs/experimentation.md](docs/experimentation.md) — Full chronological narrative of the experiment (Phases 1-15), from initial project analysis through deployment, request tracing, authentication, catalog integration, gateway automation, per-tool authorization, TLS, and Vault credential exchange
 - [docs/changes-tracker.md](docs/changes-tracker.md) — Structured changelog of every code modification and integration friction point discovered
 - [docs/diagrams/](docs/diagrams/) — Mermaid diagrams of the architecture, request flow, pipeline, and operator reconciliation logic
 
@@ -66,7 +68,7 @@ Run the automated pipeline test:
 ./scripts/test-pipeline.sh
 ```
 
-This verifies the full pipeline end-to-end across 7 phases (55 checks):
+This verifies the full pipeline end-to-end across 8 phases (63 checks):
 1. **Catalog API** — lists available servers with OCI artifact URIs
 2. **Operator resources** — MCPServer CRs triggered Deployment + Service creation for both servers
 3. **Gateway integration** — operator created HTTPRoute + MCPServerRegistration + AuthPolicies
@@ -74,6 +76,7 @@ This verifies the full pipeline end-to-end across 7 phases (55 checks):
 5. **Gateway tool access** — MCP sessions initialize, tools from both servers are federated, tool calls return results
 6. **Authorization matrix** — 15 allow/deny cases across 3 users × 5 tools (see matrix below)
 7. **TLS** — cert-manager, TLSPolicy, HTTPS endpoints for MCP gateway and Keycloak
+8. **Vault credential exchange** — Vault JWT login with Keycloak token, per-user secret read via JWT-derived policy, GitHub MCPServerRegistration + AuthPolicy
 
 ### Authorization Matrix
 
@@ -130,6 +133,7 @@ curl -s -H "Authorization: Bearer $TOKEN" \
 | Keycloak (HTTPS) | https://keycloak.127-0-0-1.sslip.io:8445 | TLS-terminated (use `--cacert /tmp/mcp-ca.crt`) |
 | MCP Launcher | http://localhost:8004 | Catalog UI + deployment |
 | Keycloak OIDC Discovery | http://keycloak.127-0-0-1.sslip.io:8002/realms/mcp/.well-known/openid-configuration | Realm endpoints |
+| Vault | ClusterIP only (`vault.vault.svc:8200`) | Dev mode, root token: `root` |
 
 ## Test Users
 
@@ -166,13 +170,15 @@ All passwords match the username.
 │   ├── keycloak/                               # Keycloak deployment + realm import + TLS
 │   ├── launcher/                               # MCP Launcher deployment + RBAC
 │   ├── operator-gateway/                       # Operator gateway RBAC additions
-│   ├── auth/                                   # Kuadrant AuthPolicies (gateway + per-server)
-│   └── test-servers/                           # MCPServer CRs for test-server1 and test-server2
+│   ├── vault/                                  # Vault deployment + configuration script
+│   ├── auth/                                   # Kuadrant AuthPolicies (gateway + per-server + Vault exchange)
+│   └── test-servers/                           # MCPServer CRs for test-server1, test-server2, and GitHub
 ├── scripts/
-│   ├── setup.sh                                # Full cluster setup from scratch (14 phases)
-│   ├── test-pipeline.sh                        # Full pipeline + auth matrix + TLS (55 checks)
+│   ├── setup.sh                                # Full cluster setup from scratch (16 phases)
+│   ├── test-pipeline.sh                        # Full pipeline + auth matrix + TLS + Vault (63 checks)
 │   ├── test-auth-matrix.sh                     # Auth matrix only (subset of test-pipeline)
-│   └── mcp-client.sh                           # Interactive MCP client (device auth flow)
+│   ├── mcp-client.sh                           # Interactive MCP client (device auth flow)
+│   └── store-github-pat.sh                     # Store a GitHub PAT in Vault for a Keycloak user
 ├── progress.md                                 # Session handoff / current state
 └── README.md
 ```
@@ -185,6 +191,7 @@ Pre-built images are available on quay.io:
 |-------|--------|
 | `quay.io/jrao/mcp-launcher:catalog-api` | [mcp-launcher](https://github.com/matzew/mcp-launcher) fork, branch `catalog-api-integration` — adds catalog REST API backend |
 | `quay.io/jrao/mcp-lifecycle-operator:gateway-integration` | [mcp-lifecycle-operator](https://github.com/kubernetes-sigs/mcp-lifecycle-operator) fork, branch `gateway-integration` — adds gateway controller for automatic HTTPRoute/MCPServerRegistration creation |
+| `quay.io/jrao/mcp-lifecycle-operator:gateway-credential-ref` | Same fork, branch `gateway-credential-ref` — adds `credentialRef` annotation support for per-server credential secrets |
 | `quay.io/keycloak/keycloak:26.3` | Upstream Keycloak OIDC provider (no custom build) |
 
 ## Key Findings
@@ -203,4 +210,8 @@ The experiment surfaced several integration friction points documented in detail
 
 6. **TLS termination is transparent to the MCP protocol** — Kuadrant TLSPolicy + cert-manager adds HTTPS with zero application changes. TLS terminates at Envoy; backends stay plain HTTP. The only client-side change is URL scheme and CA certificate trust. cert-manager must be installed before Kuadrant — the TLSPolicy controller checks for it at startup and never re-checks.
 
-See [docs/experimentation.md](docs/experimentation.md) for the full narrative including the auth layer investigation (Istio 403 vs OAuth 401), the OIDC/PKCE flow, the Keycloak migration, and the per-tool authorization evolution.
+7. **Per-user credential exchange works entirely at the gateway** — Vault token exchange (Keycloak JWT → Vault JWT login → per-user secret read → inject upstream credential) is implemented purely in AuthPolicy metadata evaluators. No application code changes, no sidecars, no per-user MCP server deployments. The gateway swaps the user's JWT for their stored API token before forwarding to the upstream MCP server.
+
+8. **MCP servers that only read credentials from environment variables force per-user deployments** — the GitHub MCP server accepts `Authorization: Bearer` headers in HTTP mode, making per-user Vault credential injection possible. Servers that only read tokens from env vars (e.g., Slack MCP server) require a separate deployment per user — the gateway can't inject credentials into environment variables at request time.
+
+See [docs/experimentation.md](docs/experimentation.md) for the full narrative including the auth layer investigation (Istio 403 vs OAuth 401), the OIDC/PKCE flow, the Keycloak migration, the per-tool authorization evolution, and the Vault credential exchange flow.

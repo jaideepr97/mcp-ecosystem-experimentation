@@ -1,0 +1,26 @@
+apiVersion: mcp.x-k8s.io/v1alpha1
+kind: MCPServer
+metadata:
+  name: github
+  namespace: mcp-test
+  annotations:
+    mcp.x-k8s.io/gateway-ref: gateway-system/mcp-gateway
+    mcp.x-k8s.io/gateway-credential-ref: github-broker-credential
+spec:
+  source:
+    type: ContainerImage
+    containerImage:
+      ref: ghcr.io/github/github-mcp-server:latest
+  config:
+    port: 8082
+    path: /mcp
+    arguments:
+      - http
+      - --port
+      - "8082"
+      - --toolsets
+      - repos,issues,pull_requests,users
+  runtime:
+    security:
+      securityContext:
+        runAsNonRoot: false

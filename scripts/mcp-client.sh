@@ -135,6 +135,7 @@ print(f'{user} (groups: {\", \".join(groups) if groups else \"none\"})')
   local init_response
   init_response=$(curl -si -H "Authorization: Bearer $ACCESS_TOKEN" \
     -H "Content-Type: application/json" \
+    -H "Accept: application/json, text/event-stream" \
     -d '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-03-26","capabilities":{},"clientInfo":{"name":"mcp-cli","version":"1.0"}}}' \
     "${GATEWAY_URL}/mcp" 2>&1)
 
@@ -154,7 +155,7 @@ print(f'{user} (groups: {\", \".join(groups) if groups else \"none\"})')
 
 mcp_call() {
   local method="$1"
-  local params="${2:-\{\}}"
+  local params="${2:-"{}"}"
   local id=$((RANDOM % 10000 + 2))
 
   local payload
@@ -171,25 +172,59 @@ print(json.dumps({
   response=$(curl -s -H "Authorization: Bearer $ACCESS_TOKEN" \
     -H "Mcp-Session-Id: $SESSION_ID" \
     -H "Content-Type: application/json" \
+    -H "Accept: application/json, text/event-stream" \
     -d "$payload" \
     "${GATEWAY_URL}/mcp")
 
-  echo "$response" | python3 -m json.tool 2>/dev/null || echo "$response"
+  # Handle both plain JSON and SSE (event: message\ndata: {...}) response formats
+  printf '%s\n' "$response" | python3 -c "
+import sys, json
+raw = sys.stdin.read().strip()
+# Try plain JSON first
+try:
+    print(json.dumps(json.loads(raw), indent=2))
+except json.JSONDecodeError:
+    # Parse SSE format: extract 'data:' lines
+    for line in raw.splitlines():
+        if line.startswith('data: '):
+            try:
+                print(json.dumps(json.loads(line[6:]), indent=2))
+            except json.JSONDecodeError:
+                print(line)
+        elif line and not line.startswith('event:'):
+            print(line)
+" 2>/dev/null || printf '%s\n' "$response"
 }
 
 # --- Print tools ---
 
 print_tools() {
-  local tools_json
-  tools_json=$(mcp_call "tools/list")
-  echo "$tools_json" | python3 -c "
+  local tools_raw
+  tools_raw=$(mcp_call "tools/list")
+  printf '%s\n' "$tools_raw" | python3 -c "
 import sys, json
-data = json.load(sys.stdin)
+raw = sys.stdin.read().strip()
+# Handle both plain JSON and SSE format
+try:
+    data = json.loads(raw)
+except json.JSONDecodeError:
+    # Parse SSE: find 'data:' line
+    data = None
+    for line in raw.splitlines():
+        if line.startswith('data: '):
+            try:
+                data = json.loads(line[6:])
+                break
+            except json.JSONDecodeError:
+                pass
+    if data is None:
+        print(raw)
+        sys.exit(0)
 for t in data.get('result', {}).get('tools', []):
     params = list(t.get('inputSchema', {}).get('properties', {}).keys())
     param_str = f'({\", \".join(params)})' if params else '()'
     print(f'  {t[\"name\"]}{param_str} — {t.get(\"description\", \"\")}')
-" 2>/dev/null || echo "$tools_json"
+" 2>/dev/null || printf '%s\n' "$tools_raw"
 }
 
 # --- Initial login ---

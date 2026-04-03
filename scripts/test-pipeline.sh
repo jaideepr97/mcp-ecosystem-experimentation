@@ -9,6 +9,7 @@
 #   Phase 5: Gateway tool access (session init, tool federation, tool calls)
 #   Phase 6: Authorization matrix (3 users × 5 tools = 15 allow/deny cases)
 #   Phase 7: TLS (cert-manager, TLSPolicy, HTTPS endpoints)
+#   Phase 8: Vault + GitHub (credential exchange, GitHub MCP server tools)
 #
 # Usage: ./scripts/test-pipeline.sh
 
@@ -408,6 +409,68 @@ else
   check "MCP session via HTTPS" "false" "skipped (no CA cert)"
   check "Tools listed via HTTPS" "false" "skipped (no CA cert)"
 fi
+
+########################################
+# Phase 8: Vault credential exchange
+########################################
+echo ""
+echo "--- Phase 8: Vault credential exchange ---"
+
+# Vault running
+VAULT_READY=$(kubectl get pods -n vault -l app=vault -o jsonpath='{.items[0].status.phase}' 2>/dev/null)
+check "Vault pod is Running" "$([ "$VAULT_READY" = "Running" ] && echo true || echo false)" "status: $VAULT_READY"
+
+# Vault JWT auth method enabled
+VAULT_POD=$(kubectl get pod -n vault -l app=vault -o jsonpath='{.items[0].metadata.name}' 2>/dev/null)
+VAULT_AUTH=$(kubectl exec -n vault "$VAULT_POD" -- env VAULT_TOKEN=root VAULT_ADDR=http://127.0.0.1:8200 vault auth list -format=json 2>/dev/null | python3 -c "import sys,json; print('true' if 'jwt/' in json.load(sys.stdin) else 'false')" 2>/dev/null || echo "false")
+check "Vault JWT auth method enabled" "$VAULT_AUTH"
+
+# Store a dummy test token in Vault for alice's sub
+ALICE_SUB=$(printf '%s\n' "$ALICE_TOKEN" | python3 -c "
+import sys,json,base64
+t = sys.stdin.read().strip()
+parts = t.split('.')
+payload = parts[1] + '=' * (4 - len(parts[1]) % 4)
+print(json.loads(base64.urlsafe_b64decode(payload))['sub'])
+" 2>/dev/null || echo "")
+DUMMY_PAT="test-dummy-pat-pipeline-$(date +%s)"
+VENV="env VAULT_TOKEN=root VAULT_ADDR=http://127.0.0.1:8200"
+kubectl exec -n vault "$VAULT_POD" -- $VENV \
+  vault kv put "secret/mcp-gateway/${ALICE_SUB}" github_pat="$DUMMY_PAT" >/dev/null 2>&1
+
+# Test Vault JWT login with Keycloak token (via vault CLI — no curl in container)
+VAULT_LOGIN_RESP=$(kubectl exec -n vault "$VAULT_POD" -- env VAULT_ADDR=http://127.0.0.1:8200 \
+  vault write -format=json auth/jwt/login role=authorino jwt="$ALICE_TOKEN" 2>/dev/null)
+VAULT_CLIENT_TOKEN=$(printf '%s\n' "$VAULT_LOGIN_RESP" | python3 -c "import sys,json; print(json.load(sys.stdin).get('auth',{}).get('client_token',''))" 2>/dev/null || echo "")
+check "Vault JWT login with Keycloak token" "$([ -n "$VAULT_CLIENT_TOKEN" ] && echo true || echo false)"
+
+# Test Vault secret read with the client token
+if [ -n "$VAULT_CLIENT_TOKEN" ]; then
+  RETRIEVED_PAT=$(kubectl exec -n vault "$VAULT_POD" -- env VAULT_ADDR=http://127.0.0.1:8200 \
+    vault kv get -field=github_pat "secret/mcp-gateway/${ALICE_SUB}" 2>/dev/null || echo "")
+  # That reads with root — now test with the JWT-derived token to prove the policy works
+  VAULT_READ_RESP=$(kubectl exec -n vault "$VAULT_POD" -- env VAULT_ADDR=http://127.0.0.1:8200 VAULT_TOKEN="$VAULT_CLIENT_TOKEN" \
+    vault kv get -format=json "secret/mcp-gateway/${ALICE_SUB}" 2>/dev/null)
+  RETRIEVED_PAT=$(printf '%s\n' "$VAULT_READ_RESP" | python3 -c "import sys,json; print(json.load(sys.stdin).get('data',{}).get('data',{}).get('github_pat',''))" 2>/dev/null || echo "")
+  check "Vault returns stored credential via JWT token" "$([ "$RETRIEVED_PAT" = "$DUMMY_PAT" ] && echo true || echo false)" "expected=$DUMMY_PAT got=$RETRIEVED_PAT"
+else
+  check "Vault returns stored credential via JWT token" "false" "skipped (no client token)"
+fi
+
+# GitHub MCPServerRegistration exists and has tools
+GITHUB_REG=$(kubectl get mcpserverregistration github -n mcp-test -o jsonpath='{.status.conditions[?(@.type=="Ready")].status}' 2>/dev/null)
+check "GitHub MCPServerRegistration is Ready" "$([ "$GITHUB_REG" = "True" ] && echo true || echo false)"
+
+GITHUB_TOOLS=$(kubectl get mcpserverregistration github -n mcp-test -o jsonpath='{.status.discoveredTools}' 2>/dev/null || echo "0")
+check "GitHub server has tools registered" "$([ "${GITHUB_TOOLS:-0}" -gt 0 ] 2>/dev/null && echo true || echo false)" "found ${GITHUB_TOOLS} tools"
+
+# GitHub AuthPolicy exists
+GITHUB_AP=$(kubectl get authpolicy github-auth-policy -n mcp-test -o name 2>/dev/null)
+check "AuthPolicy github-auth-policy exists" "$([ -n "$GITHUB_AP" ] && echo true || echo false)"
+
+# Credential secret exists with correct label
+CRED_LABEL=$(kubectl get secret github-broker-credential -n mcp-test -o jsonpath='{.metadata.labels.mcp\.kuadrant\.io/secret}' 2>/dev/null)
+check "Credential secret has correct label" "$([ "$CRED_LABEL" = "true" ] && echo true || echo false)"
 
 ########################################
 # Summary

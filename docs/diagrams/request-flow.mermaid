@@ -6,6 +6,7 @@ sequenceDiagram
     participant E as Envoy Proxy<br/>(gateway-system)
     participant R as Router<br/>(ext_proc, mcp-system)
     participant A as Authorino<br/>(Wasm plugin → kuadrant-system)
+    participant V as Vault<br/>(vault namespace)
     participant B as Broker<br/>(mcp-system)
     participant S as MCP Server<br/>(mcp-test)
 
@@ -78,5 +79,40 @@ sequenceDiagram
         else Unauthorized (wrong group or tool)
             A-->>E: DENIED
             E-->>C: 403 Forbidden<br/>{"error":"Forbidden","message":"You do not have access to this tool."}
+        end
+
+    else tools/call on credentialed server (Vault exchange path)
+        Note over C,S: 3c. tools/call → Router + Vault token exchange + credential injection
+
+        Note over R: 1. Parse JSON-RPC body<br/>2. Extract tool "github_get_me"<br/>3. Strip prefix → "get_me"<br/>4. Set headers:<br/>   :authority = github.mcp.local<br/>   x-mcp-toolname = get_me<br/>   x-mcp-servername = mcp-test/github
+
+        R-->>E: Modified headers + body
+
+        Note over E: Wasm plugin calls Authorino
+        E->>A: CheckRequest<br/>(host=github.mcp.local,<br/>x-mcp-toolname=get_me, JWT)
+
+        Note over A: GitHub AuthPolicy metadata evaluators:
+
+        A->>V: POST /v1/auth/jwt/login<br/>{"role":"authorino","jwt":"eyJ..."}
+        Note over V: Validate JWT via Keycloak JWKS<br/>Check aud: mcp-gateway<br/>Extract sub claim
+        V-->>A: {"auth":{"client_token":"hvs.xxx"}}
+
+        A->>V: GET /v1/secret/data/mcp-gateway/{sub}<br/>X-Vault-Token: hvs.xxx
+        V-->>A: {"data":{"data":{"github_pat":"ghp_xxx"}}}
+
+        Note over A: Authorization rule:<br/>Verify github_pat exists in Vault response
+
+        Note over A: Response rule:<br/>Set Authorization: Bearer ghp_xxx<br/>Set x-mcp-api-key: ghp_xxx
+
+        A-->>E: OK + injected headers
+
+        E->>S: POST /mcp<br/>Authorization: Bearer ghp_xxx<br/>{"method":"tools/call","params":{"name":"get_me"}}
+        S-->>E: {"result":{"content":[{"text":"{\"login\":\"user\"}"}]}}
+        E-->>C: 200 OK + GitHub profile data
+
+        alt No PAT in Vault for this user
+            V-->>A: 404 (no secret at path)
+            A-->>E: DENIED
+            E-->>C: 403 Forbidden<br/>{"error":"Forbidden","message":"No GitHub PAT found in Vault for this user."}
         end
     end

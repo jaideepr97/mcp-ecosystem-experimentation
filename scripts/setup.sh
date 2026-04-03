@@ -314,6 +314,98 @@ if [ -f /tmp/mcp-ca.crt ]; then
 fi
 
 ########################################
+# Phase 15: Vault (token exchange)
+########################################
+info "Deploying Vault..."
+kubectl apply -f "${REPO_DIR}/infrastructure/vault/namespace.yaml"
+kubectl apply -f "${REPO_DIR}/infrastructure/vault/deployment.yaml"
+wait_for "Vault to be ready..."
+kubectl wait --for=condition=Ready pod -l app=vault -n vault --timeout=120s
+
+info "Configuring Vault JWT auth..."
+"${REPO_DIR}/infrastructure/vault/configure.sh"
+
+# Store GitHub PATs for test users (if GITHUB_PAT is set)
+if [ -n "${GITHUB_PAT:-}" ]; then
+  info "Storing GitHub PAT in Vault for test users..."
+  KEYCLOAK_INTERNAL="http://keycloak.127-0-0-1.sslip.io:8002"
+
+  for USER in alice bob carol; do
+    USER_SUB=$(curl -s "${KEYCLOAK_INTERNAL}/realms/mcp/protocol/openid-connect/token" \
+      -d "grant_type=password" -d "client_id=mcp-cli" \
+      -d "username=${USER}" -d "password=${USER}" -d "scope=openid" 2>/dev/null | \
+      python3 -c "import sys,json,base64; t=json.load(sys.stdin)['access_token']; print(json.loads(base64.urlsafe_b64decode(t.split('.')[1]+'=='))['sub'])" 2>/dev/null)
+
+    if [ -n "$USER_SUB" ]; then
+      kubectl exec -n vault deploy/vault -- sh -c \
+        "VAULT_ADDR=http://127.0.0.1:8200 VAULT_TOKEN=root vault kv put secret/mcp-gateway/${USER_SUB} github_pat=${GITHUB_PAT}"
+      info "  Stored PAT for ${USER} (sub: ${USER_SUB})"
+    else
+      warn "  Could not get sub for ${USER}"
+    fi
+  done
+else
+  warn "GITHUB_PAT not set — skipping Vault PAT storage."
+  warn "To store PATs later, run:"
+  warn "  export GITHUB_PAT=ghp_YOUR_TOKEN"
+  warn "  ./scripts/store-github-pat.sh <username>"
+fi
+
+########################################
+# Phase 16: GitHub MCP server
+########################################
+if [ -n "${GITHUB_PAT:-}" ]; then
+  info "Deploying GitHub MCP server..."
+
+  # Pre-load the image into Kind
+  GITHUB_IMAGE="ghcr.io/github/github-mcp-server:latest"
+  ${CONTAINER_ENGINE} pull "${GITHUB_IMAGE}" 2>/dev/null || true
+  TMP_TAR="/tmp/github-mcp-server-$$.tar"
+  ${CONTAINER_ENGINE} save "${GITHUB_IMAGE}" -o "${TMP_TAR}"
+  kind load image-archive "${TMP_TAR}" --name "${KIND_CLUSTER_NAME}"
+  rm -f "${TMP_TAR}"
+
+  # Create credential secret for broker tool discovery
+  kubectl apply -f - <<CRED_EOF
+apiVersion: v1
+kind: Secret
+metadata:
+  name: github-broker-credential
+  namespace: mcp-test
+  labels:
+    mcp.kuadrant.io/secret: "true"
+type: Opaque
+stringData:
+  token: "${GITHUB_PAT}"
+CRED_EOF
+
+  kubectl apply -f "${REPO_DIR}/infrastructure/test-servers/github-server.yaml"
+  wait_for "GitHub MCPServer pod to be running..."
+  kubectl wait --for=condition=Available deployment/github -n mcp-test --timeout=120s 2>/dev/null || \
+    warn "GitHub deployment not available yet"
+
+  # Wait for operator to create the MCPServerRegistration with credentialRef
+  # (operator propagates mcp.x-k8s.io/gateway-credential-ref annotation automatically)
+  wait_for "GitHub MCPServerRegistration..."
+  for i in $(seq 1 12); do
+    kubectl get mcpserverregistration github -n mcp-test &>/dev/null && break
+    sleep 5
+  done
+
+  # Restart gateway to pick up registration with credentials
+  info "Restarting mcp-gateway to pick up GitHub server registration..."
+  kubectl rollout restart deployment mcp-gateway -n mcp-system 2>/dev/null || true
+  kubectl rollout status deployment mcp-gateway -n mcp-system --timeout=120s 2>/dev/null || true
+
+  info "Applying GitHub AuthPolicy (Vault token exchange)..."
+  sleep 5
+  kubectl apply -f "${REPO_DIR}/infrastructure/auth/authpolicy-github.yaml"
+else
+  warn "GITHUB_PAT not set — skipping GitHub MCP server deployment."
+  warn "To deploy later, set GITHUB_PAT and re-run setup or deploy manually."
+fi
+
+########################################
 # Done
 ########################################
 echo ""
@@ -331,6 +423,10 @@ info "  Keycloak:     https://keycloak.127-0-0-1.sslip.io:8445 (admin/admin)"
 info "  CA cert:      /tmp/mcp-ca.crt"
 info ""
 info "  Launcher:     http://localhost:8004"
+echo ""
+info "Vault:"
+info "  Vault:        http://vault.vault.svc.cluster.local:8200 (root token: root)"
+info "  PAT path:     secret/mcp-gateway/<user-sub>"
 echo ""
 info "Test users (password = username):"
 info "  alice (developers) | bob (ops) | carol (both)"

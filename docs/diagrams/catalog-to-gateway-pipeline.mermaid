@@ -26,6 +26,12 @@ flowchart LR
         authorino["Authorino<br/>(JWT validation +<br/>per-tool authorization)"]
     end
 
+    subgraph credentials["Credential Exchange"]
+        vault["Vault<br/>(JWT auth + KV store)"]
+        cred-secret[("Per-user secrets<br/>secret/mcp-gateway/{sub}")]
+        vault --> cred-secret
+    end
+
     %% Pipeline flow
     catalog -->|"REST API<br/>/api/mcp_catalog/..."| launcher
     launcher -->|"creates"| mcpserver
@@ -41,6 +47,8 @@ flowchart LR
 
     oidc -.->|"issues tokens"| authorino
     authorino -.->|"validates JWT +<br/>enforces AuthPolicy"| gateway
+    authorino -.->|"JWT login +<br/>secret read"| vault
+    vault -.->|"validates JWT via"| oidc
 
     %% Styling
     classDef discoveryStyle fill:#e3f2fd,stroke:#1565C0,stroke-width:2px
@@ -48,9 +56,11 @@ flowchart LR
     classDef routeStyle fill:#e8f5e9,stroke:#2E7D32,stroke-width:2px
     classDef authStyle fill:#fce4ec,stroke:#C62828,stroke-width:2px
     classDef crStyle fill:#f3e5f5,stroke:#7B1FA2,stroke-width:1px
+    classDef credStyle fill:#e0f2f1,stroke:#00695C,stroke-width:2px
 
     class catalog,sources discoveryStyle
     class launcher,operator deployStyle
     class mcpserver,deploy crStyle
     class gw-controller,httproute,registration,gateway routeStyle
     class oidc,authorino authStyle
+    class vault,cred-secret credStyle

@@ -18,6 +18,7 @@ type: project
 - **No code changes made.** Deployed using existing make targets.
 - **Observation (from earlier phases):** The ext_proc Router unconditionally rewrites `:authority` header on ALL port 8080 traffic (`internal/mcp-router/request_handlers.go:198`), which prevents non-MCP services from being exposed through the same Envoy gateway. Mini-oidc had to be exposed via a separate NodePort to avoid this.
 - **Observation:** MCPServerRegistration API group is `mcp.kuadrant.io` but mcp-launcher hardcoded `mcp.kagenti.com`. This was fixed in our launcher fork. The group name difference suggests the CRD API group may have changed at some point — consumers need to track the correct group.
+- **Observation:** The credential secret label required by the mcp-gateway controller is `mcp.kuadrant.io/secret=true`, not `mcp.kuadrant.io/credential=true` as documented in the project's CLAUDE.md. Without this label, the MCPServerRegistration fails validation with a clear error, but the mismatch between documentation and implementation is a source of confusion.
 
 ### mcp-lifecycle-operator
 - **No code changes to upstream.** CRD and operator binary were redeployed from latest source (schema had changed from flat to nested since initial deployment).
@@ -29,6 +30,7 @@ type: project
 - **Changes:** Integrated gateway controller from [openshift/mcp-lifecycle-operator#3](https://github.com/openshift/mcp-lifecycle-operator/pull/3), adapted for current nested spec schema and correct API group (`mcp.kuadrant.io`).
 - Added `MCPServerGatewayReconciler` — a separate controller that watches MCPServer CRs and creates HTTPRoute + MCPServerRegistration when `mcp.x-k8s.io/gateway-ref` annotation is present.
 - This closes the operator → gateway registration gap. The full pipeline (catalog → launcher → operator → gateway) is now automated.
+- **Observation:** The gateway controller's `reconcileMCPServerRegistration` overwrites the entire `spec` map on every reconciliation (`mcpserver_gateway_controller.go:208`), dropping any fields not explicitly set — including `credentialRef`. This prevents servers that require authentication for broker tool discovery (e.g., GitHub MCP server needs a PAT for `tools/list`) from being fully managed through the operator. The broker connects directly to backends (not through Envoy), so AuthPolicy/Vault token exchange doesn't apply to discovery. The broker's only credential mechanism is `credentialRef` → K8s Secret, which the operator silently removes. A fix would require either preserving existing spec fields during reconciliation or adding annotation-driven `credentialRef` support (e.g., `mcp.x-k8s.io/gateway-credential-ref`).
 
 ### Catalog → Operator handoff friction (cross-project integration gap)
 These are the most significant findings — gaps in the **contract between catalog metadata and operator deployment**:
@@ -190,6 +192,17 @@ authorization:
 
 The 500 is a presentation issue in the broker — it doesn't distinguish "server is down" from "you're not authorized."
 
+### mcp-lifecycle-operator (Phase 15)
+- **`credentialRef` annotation support** — added `mcp.x-k8s.io/gateway-credential-ref` and `mcp.x-k8s.io/gateway-credential-key` annotations to the operator's gateway controller. The operator now propagates `credentialRef` to the MCPServerRegistration, fixing a reconciler overwrite issue where the gateway controller's `reconcileMCPServerRegistration` replaced the entire `spec` map, dropping any externally-added fields. Branch: `gateway-credential-ref`. Image: `quay.io/jrao/mcp-lifecycle-operator:gateway-credential-ref`. Tests: 81/81 (3 new).
+
+### Vault token exchange (Phase 15)
+- **No code changes to any upstream project.** The Vault token exchange flow (Keycloak JWT → Vault JWT login → per-user secret read → inject upstream credential) is implemented entirely in Kuadrant AuthPolicy metadata evaluators.
+- **Observation:** The flow requires MCP servers to accept credentials via HTTP headers (e.g., `Authorization: Bearer`). Servers that only read tokens from environment variables (e.g., Slack MCP server) cannot use gateway-level credential injection and require per-user deployments.
+- **Observation:** Vault's JWT auth method validates the `aud` claim. Keycloak's realm-import had the `mcp-gateway-audience` scope as a default client scope on the realm, but it wasn't applied to the `mcp-gateway` client. Must DELETE from optional scopes first, then PUT as default — just adding as default doesn't remove from optional.
+
+### mcp-client.sh (Phase 15)
+- **Fixed JSONDecode error** — the `mcp_call` function's default params value was `\{\}` (literal backslash-brace) instead of `{}`. This caused `json.loads` to fail when `mcp_call` was invoked without a second argument (e.g., `tools/list`). Also replaced `echo "$var"` with `printf '%s\n' "$var"` for zsh compatibility — zsh's `echo` interprets `\n` as newlines, corrupting JSON strings containing escape sequences.
+
 ### mini-oidc (removed)
 - **Removed from cluster and experiment repo.** Replaced entirely by Keycloak.
 - mini-oidc served its purpose as an educational tool for understanding OIDC flows (Phase 4). For multi-tenancy and role-based access control, Keycloak provides the necessary user/group/role management.
@@ -211,3 +224,9 @@ The 500 is a presentation issue in the broker — it doesn't distinguish "server
 - TLSPolicy `mcp-gateway-tls` in `gateway-system` (auto-creates HTTPS certificates)
 - Gateway HTTPS listener `mcp-https` on port 8443 (in base gateway.yaml)
 - NodePort entries for HTTPS (30443→8443, 30445→8445)
+- Vault Deployment + Service in `vault` namespace (dev mode)
+- Vault JWT auth method + policy + role (configure.sh)
+- GitHub MCP server Deployment + Service in `mcp-test` (HTTP mode, port 8082)
+- MCPServer `github` in `mcp-test` (with `gateway-credential-ref` annotation)
+- Secret `github-broker-credential` in `mcp-test` (label: `mcp.kuadrant.io/secret: "true"`)
+- AuthPolicy `github-auth-policy` in `mcp-test` (Vault token exchange flow)

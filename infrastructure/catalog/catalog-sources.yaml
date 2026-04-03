@@ -45,21 +45,26 @@ data:
         license: mit
         description: >-
           Official GitHub MCP server for repository, issue, and pull request
-          management. Hosted remotely by GitHub — no local deployment required.
+          management. Deployed locally from the official container image.
+          Requires a GitHub PAT for authentication (injected per-request via Vault).
         version: "latest"
         transports:
           - http
-        deploymentMode: remote
-        endpoints:
-          http: https://api.githubcopilot.com/mcp/
+        deploymentMode: local
+        artifacts:
+          - uri: oci://ghcr.io/github/github-mcp-server:latest
         tools:
-          - name: search_code
-            description: Search for code across GitHub repositories
+          - name: get_me
+            description: Get the authenticated GitHub user's profile
+            accessType: read_only
+            parameters: []
+          - name: search_repositories
+            description: Search for GitHub repositories
             accessType: read_only
             parameters:
               - name: query
                 type: string
-                description: GitHub code search query
+                description: Search query
                 required: true
           - name: list_issues
             description: List issues for a repository
@@ -81,9 +86,12 @@ data:
               - name: repo
                 type: string
                 required: true
+        runtimeMetadata:
+          defaultPort: 8082
+          mcpPath: /mcp
         securityIndicators:
           verifiedSource: true
-          secureEndpoint: true
+          secureEndpoint: false
         createTimeSinceEpoch: "1736467200000"
         lastUpdateTimeSinceEpoch: "1736467200000"
   sources.yaml: |

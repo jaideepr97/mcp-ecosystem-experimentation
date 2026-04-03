@@ -26,16 +26,22 @@ flowchart TD
 
     create-hr --> check-reg{"MCPServerRegistration<br/>exists?"}
     update-hr --> check-reg
-    check-reg -->|No| create-reg["Create MCPServerRegistration<br/>(toolPrefix, targetRef)"]
+    check-reg -->|No| check-cred{"Has credential-ref<br/>annotation?"}
     check-reg -->|Yes| check-prefix{"toolPrefix<br/>changed?"}
     check-prefix -->|No| status["Set GatewayReady<br/>status condition"]
     check-prefix -->|Yes| recreate["Delete + Recreate<br/>(toolPrefix is immutable)"]
+
+    check-cred -->|No| create-reg["Create MCPServerRegistration<br/>(toolPrefix, targetRef)"]
+    check-cred -->|Yes| create-reg-cred["Create MCPServerRegistration<br/>(toolPrefix, targetRef,<br/>credentialRef from annotation)"]
+
     create-reg --> status
+    create-reg-cred --> status
     recreate --> status
 
     status --> done-gw["Done ✓"]
 
     note1["Owner references set on all<br/>created resources — automatic<br/>garbage collection on CR deletion"]
+    note2["credential-ref annotation:<br/>mcp.x-k8s.io/gateway-credential-ref<br/>mcp.x-k8s.io/gateway-credential-key"]
 
     classDef decision fill:#fff9c4,stroke:#F9A825,stroke-width:2px
     classDef action fill:#e8f4fd,stroke:#2196F3,stroke-width:1px
@@ -44,7 +50,7 @@ flowchart TD
     classDef note fill:#f5f5f5,stroke:#9E9E9E,stroke-width:1px,stroke-dasharray:3 3
 
     class cr start
-    class check-deploy,check-svc,check-ann,check-hr,check-reg,check-prefix decision
-    class create-deploy,update-deploy,create-svc,create-hr,update-hr,create-reg,recreate,status,parse action
+    class check-deploy,check-svc,check-ann,check-hr,check-reg,check-prefix,check-cred decision
+    class create-deploy,update-deploy,create-svc,create-hr,update-hr,create-reg,create-reg-cred,recreate,status,parse action
     class done-main,done-gw,skip done
-    class note1 note
+    class note1,note2 note

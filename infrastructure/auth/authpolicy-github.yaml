@@ -1,0 +1,68 @@
+apiVersion: kuadrant.io/v1
+kind: AuthPolicy
+metadata:
+  name: github-auth-policy
+  namespace: mcp-test
+spec:
+  targetRef:
+    group: gateway.networking.k8s.io
+    kind: HTTPRoute
+    name: github
+  rules:
+    authentication:
+      "keycloak":
+        jwt:
+          issuerUrl: http://keycloak.127-0-0-1.sslip.io:8002/realms/mcp
+    metadata:
+      "vault-login":
+        priority: 0
+        http:
+          url: http://vault.vault.svc.cluster.local:8200/v1/auth/jwt/login
+          method: POST
+          body:
+            expression: |
+              "{\"role\": \"authorino\", \"jwt\": \"" + request.headers["authorization"].split("Bearer ")[1] + "\"}"
+        cache:
+          key:
+            expression: auth.identity.sub
+          ttl: 300
+      "vault":
+        priority: 1
+        when:
+        - predicate: auth.metadata.exists(p, p == "vault-login") && has(auth.metadata["vault-login"].auth) && has(auth.metadata["vault-login"].auth.client_token)
+        http:
+          urlExpression: |
+            "http://vault.vault.svc.cluster.local:8200/v1/secret/data/mcp-gateway/" + auth.identity.sub
+          method: GET
+          headers:
+            "X-Vault-Token":
+              expression: auth.metadata["vault-login"].auth.client_token
+    authorization:
+      "found-vault-secret":
+        patternMatching:
+          patterns:
+          - predicate: |
+              has(auth.metadata.vault.data) && has(auth.metadata.vault.data.data) && has(auth.metadata.vault.data.data.github_pat) && type(auth.metadata.vault.data.data.github_pat) == string
+    response:
+      success:
+        headers:
+          "authorization":
+            plain:
+              expression: |
+                "Bearer " + auth.metadata.vault.data.data.github_pat
+          "x-mcp-api-key":
+            plain:
+              expression: |
+                auth.metadata.vault.data.data.github_pat
+      unauthenticated:
+        headers:
+          "WWW-Authenticate":
+            value: >-
+              Bearer resource_metadata="http://mcp.127-0-0-1.sslip.io:8001/.well-known/oauth-protected-resource"
+        body:
+          value: |
+            {"error":"Unauthorized","message":"Authentication required."}
+      unauthorized:
+        body:
+          value: |
+            {"error":"Forbidden","message":"No GitHub PAT found in Vault for this user. Store your PAT with: vault kv put secret/mcp-gateway/<your-sub> github_pat=ghp_YOUR_TOKEN"}

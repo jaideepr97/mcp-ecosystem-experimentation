@@ -764,6 +764,23 @@ mcp-launcher's `PackageArguments` are meant to be appended to the container comm
 
 The list endpoint returns `toolCount` but not the tools themselves. Tools require a separate per-server call. A consumer building a UI must make N+1 API calls.
 
+### 6. Operator gateway controller overwrites MCPServerRegistration spec
+
+The gateway controller's `reconcileMCPServerRegistration` (`mcpserver_gateway_controller.go:208`) replaces the entire `spec` map on every reconciliation:
+
+```go
+reg.Object["spec"] = map[string]any{
+    "toolPrefix": toolPrefix,
+    "targetRef":  map[string]any{...},
+}
+```
+
+This overwrites any fields added out-of-band — including `credentialRef`, which the broker needs to authenticate to backends that require credentials for tool discovery (`tools/list`). The GitHub MCP server, for example, requires a PAT for all requests including tool listing. Without `credentialRef`, the broker gets a 401 and marks the server unhealthy.
+
+**Why this matters**: The gateway's auth architecture has an intentional separation between broker-level credentials (static, for tool discovery) and per-user credentials (dynamic, via Vault/AuthPolicy for tool calls). The broker connects directly to backends — it doesn't go through Envoy, so AuthPolicy/Vault token exchange never fires. The broker's only credential mechanism is `credentialRef` pointing to a Kubernetes Secret. The operator's gateway controller doesn't support setting this, and actively prevents it by overwriting the spec.
+
+**Root cause**: The controller uses `CreateOrUpdate` with a mutate function that sets `spec` as a flat map literal. Any fields not explicitly included are dropped. The fix would be to either preserve existing fields during reconciliation, or support a `credentialRef` annotation on the MCPServer CR (similar to `mcp.x-k8s.io/gateway-tool-prefix`).
+
 ### Temporary workarounds implemented
 
 | Friction point | Workaround |
@@ -774,6 +791,7 @@ The list endpoint returns `toolCount` but not the tools themselves. Tools requir
 | Stale leader lease after operator restart | Manually deleted lease: `kubectl delete lease bed7462b.x-k8s.io` |
 | N+1 API calls for tools | Launcher makes per-server `/tools` call in a loop during `List()` |
 | Gateway code in launcher | Removed entirely — launcher only bridges catalog → operator; gateway registration handled by operator's gateway controller via annotation |
+| Operator overwrites `credentialRef` | setup.sh patches MCPServerRegistration after creation, but operator reconciler reverts it. Must scale down operator or patch repeatedly. Proper fix requires operator change. |
 
 ---
 
@@ -1275,9 +1293,98 @@ Total: 55/55 tests passing on a clean cluster (setup.sh → test-pipeline.sh).
 
 ---
 
-## Architecture Summary (as of Phase 14)
+## Phase 15: Per-User Credential Exchange via Vault
 
-This snapshot captures the cluster state after Phase 14 — the full pipeline from catalog discovery through deployment, gateway registration, per-tool authorization with Kuadrant, and TLS termination at the gateway.
+> **User instruction**: *"i think we can do TLS in phase 14, token exchange in phase 15 and then probably cut another branch."*
+
+The goal was to enable per-user credential injection at the gateway: when a user calls a tool on a credentialed MCP server (e.g., GitHub), the gateway swaps their Keycloak JWT for their personal API token stored in Vault, then forwards the request with the upstream credential. No application code changes, no per-user server deployments.
+
+### The credential exchange flow
+
+The AuthPolicy implements a three-step metadata evaluator chain:
+
+1. **Vault JWT login** (priority 0) — takes the user's Keycloak JWT from the `Authorization` header, sends it to `http://vault:8200/v1/auth/jwt/login` with `role: authorino`. Vault validates the JWT against Keycloak's JWKS, checks the `aud: mcp-gateway` claim, and returns a Vault client token scoped to the `authorino` policy.
+
+2. **Vault secret read** (priority 1, conditional) — uses the Vault client token from step 1 to read `secret/data/mcp-gateway/{sub}`, where `{sub}` is the user's Keycloak subject ID. Returns the stored credential (e.g., `github_pat`).
+
+3. **Response injection** — sets `Authorization: Bearer {github_pat}` and `x-mcp-api-key: {github_pat}` headers on the request before it reaches the MCP server.
+
+An authorization rule (`found-vault-secret`) verifies that the Vault secret was successfully retrieved and contains the expected field. If the secret doesn't exist (user hasn't stored a PAT), the request is denied with a 403 explaining how to store one.
+
+### Vault setup
+
+Vault runs in dev mode (single-pod, in-memory storage, root token: `root`):
+
+- **JWT auth method** — backed by Keycloak's JWKS endpoint (`http://keycloak.keycloak.svc.cluster.local/realms/mcp/protocol/openid-connect/certs`)
+- **Role `authorino`** — bound audience: `mcp-gateway`, user claim: `sub`, token TTL: 1h
+- **Policy `authorino`** — read access to `secret/data/mcp-gateway/*`
+- **Secret path convention** — `secret/mcp-gateway/{keycloak-sub}` with field `github_pat`
+
+Vault login responses are cached by Authorino (TTL: 300s, key: `auth.identity.sub`), so the JWT login doesn't happen on every request.
+
+### GitHub MCP server deployment
+
+The GitHub MCP server (`ghcr.io/github/github-mcp-server:latest`) runs in HTTP mode on port 8082 with toolsets: `repos,issues,pull_requests,users` (23 tools). Unlike many MCP servers that only read credentials from environment variables, the GitHub server accepts `Authorization: Bearer` headers in HTTP mode — this is what makes per-user credential injection possible at the gateway.
+
+The MCPServer CR uses the `mcp.x-k8s.io/gateway-credential-ref` annotation to specify the broker credential secret. This required adding annotation support to the operator's gateway controller, because the reconciler previously replaced the entire MCPServerRegistration `spec` map, dropping any externally-added fields including `credentialRef`.
+
+### Operator credential-ref support
+
+The operator's gateway controller was updated (branch: `gateway-credential-ref`, image: `quay.io/jrao/mcp-lifecycle-operator:gateway-credential-ref`) to propagate credential references from annotations:
+
+```yaml
+metadata:
+  annotations:
+    mcp.x-k8s.io/gateway-ref: gateway-system/mcp-gateway
+    mcp.x-k8s.io/gateway-credential-ref: github-broker-credential
+    mcp.x-k8s.io/gateway-credential-key: token
+```
+
+The broker uses this static credential (`github-broker-credential` Secret) for tool discovery at startup. Per-user credentials flow through the AuthPolicy Vault exchange at request time. This is an intentional split: the broker connects directly to backends (not through Envoy), so AuthPolicy never fires for discovery. The router hairpins through Envoy, triggering the per-user credential exchange.
+
+### Keycloak scope issues
+
+Two Keycloak configuration issues surfaced:
+
+1. **`mcp-gateway-audience` scope not applied to client** — the realm-import defined the scope and listed it in `defaultClientScopes`, but Keycloak's `--import-realm` didn't apply it to the `mcp-gateway` client. Vault JWT auth requires `aud: mcp-gateway`, so tokens were rejected. Fixed via admin API.
+
+2. **Moving a scope from optional to default requires two API calls** — calling `PUT .../default-client-scopes/{id}` doesn't remove the scope from optional. Must `DELETE .../optional-client-scopes/{id}` first, then `PUT .../default-client-scopes/{id}`. This was also updated in the realm-import.yaml to prevent recurrence on fresh clusters.
+
+### Credential secret label mismatch
+
+The credential secret initially used `mcp.kuadrant.io/credential: "true"` but the mcp-gateway controller validates `mcp.kuadrant.io/secret: "true"`. The label name is unintuitive and even the project's own CLAUDE.md documents it incorrectly. Without it, MCPServerRegistration status reports a clear error but the secret appears correct — only the label is missing.
+
+### mcp-client.sh fix
+
+The interactive client had a JSONDecode error that was traced to two bugs:
+
+1. **Broken default params** — `mcp_call`'s default params was `\{\}` (literal backslash-brace, invalid JSON) instead of `{}`. When called without a second argument (e.g., `tools/list`), the payload python script crashed, producing an empty curl request.
+
+2. **`echo` vs `printf` for zsh** — zsh's builtin `echo` interprets `\n` as newlines by default. The GitHub tool descriptions contain 16 occurrences of `\n` in JSON strings. After `mcp_call` pretty-printed the response, `echo "$tools_raw"` in zsh converted these to actual newlines, producing invalid JSON. Fixed all `echo "$var"` calls to `printf '%s\n' "$var"` for cross-shell portability.
+
+### Test coverage
+
+The test pipeline was extended with Phase 8 (Vault credential exchange), adding 8 checks:
+1. Vault pod is Running
+2. Vault JWT auth method enabled
+3. Vault JWT login with Keycloak token succeeds
+4. Vault returns stored credential via JWT-derived token (round-trip with dummy PAT)
+5. GitHub MCPServerRegistration is Ready
+6. GitHub server has tools registered (23 tools)
+7. AuthPolicy `github-auth-policy` exists
+8. Credential secret has correct label
+
+Total: 63/63 tests passing.
+
+### Env-var credential limitation
+
+> **Observation:** MCP servers that only read credentials from environment variables (e.g., Slack MCP server) cannot use gateway-level credential injection. The gateway can inject credentials into HTTP headers at request time, but it cannot modify a running container's environment variables per-request. These servers require a per-user deployment model — one pod per user, each with its own credentials in env vars. The GitHub server avoids this by accepting `Authorization: Bearer` headers in HTTP mode, making it compatible with the Vault token exchange pattern.
+
+---
+
+## Architecture Summary (as of Phase 15)
+
+This snapshot captures the cluster state after Phase 15 — the full pipeline from catalog discovery through deployment, gateway registration, per-tool authorization with Kuadrant, TLS termination, and per-user credential exchange via Vault.
 
 ### Components on the cluster
 
@@ -1329,15 +1436,25 @@ Kind Node (mcp-gateway)
 |   +-- HTTPRoute (mcp-gateway-route) — routes to broker
 |   +-- Secret (config) — upstream server list
 |
++-- vault namespace
+|   +-- Vault pod (dev mode, in-memory storage, root token: root)
+|   +-- JWT auth method (Keycloak JWKS-backed)
+|   +-- Role authorino (aud: mcp-gateway, user_claim: sub)
+|   +-- Policy authorino (read secret/data/mcp-gateway/*)
+|   +-- Per-user secrets at secret/mcp-gateway/{keycloak-sub}
+|
 +-- mcp-test namespace
 |   +-- mcp-launcher pod (catalog UI + deployer)
 |   +-- mcp-launcher Service + NodePort (30472 -> host port 8004)
 |   +-- mcp-launcher RBAC (ServiceAccount, ClusterRole, ClusterRoleBinding)
 |   +-- test-server1 pod + Service + HTTPRoute + MCPServerRegistration
 |   +-- test-server2 pod + Service + HTTPRoute + MCPServerRegistration
+|   +-- github pod + Service + HTTPRoute + MCPServerRegistration (23 tools)
+|   +-- Secret github-broker-credential (broker discovery credential)
 |   +-- AuthPolicy (server1-auth-policy) — developers group + tool ACLs
 |   +-- AuthPolicy (server2-auth-policy) — ops group + tool ACLs
-|   +-- MCPServer CRs (with gateway-ref annotations)
+|   +-- AuthPolicy (github-auth-policy) — Vault token exchange flow
+|   +-- MCPServer CRs (with gateway-ref + credential-ref annotations)
 |
 +-- mcp-lifecycle-operator-system namespace
 |   +-- lifecycle operator pod (main reconciler + gateway reconciler)
@@ -1356,21 +1473,23 @@ Kind Node (mcp-gateway)
 | localhost:8445 | nodePort 30445 → Envoy :8445 → Keycloak | OIDC Provider (HTTPS) |
 | localhost:8004 | nodePort 30472 → mcp-launcher :8080 | MCP Launcher UI |
 
-### The catalog → deploy → authorize → route pipeline (complete)
+### The catalog → deploy → authorize → exchange → route pipeline (complete)
 
 ```
 Catalog API (catalog-system)          — "what's available"
   ↓ REST API
 MCP Launcher (mcp-test)               — "browse, configure, deploy"
-  ↓ creates MCPServer CR (with gateway-ref annotation)
+  ↓ creates MCPServer CR (with gateway-ref + credential-ref annotations)
 Lifecycle Operator (operator-system)  — "make it run AND make it routable"
   ↓ creates Deployment + Service + HTTPRoute + MCPServerRegistration
 Kuadrant AuthPolicy (per-HTTPRoute)   — "who can call which tools"
   ↓ CEL predicates: group membership + tool name
+Vault Token Exchange (AuthPolicy)     — "swap user JWT for upstream API credential"
+  ↓ Keycloak JWT → Vault JWT login → per-user secret read → header injection
 Gateway (gateway-system)              — "route authorized requests to the server"
 ```
 
-The end-to-end pipeline is now fully automated with per-tool authorization. A user browses the catalog, deploys a server, and the operator handles deployment + gateway registration. AuthPolicies on the auto-created HTTPRoutes enforce per-group, per-tool access control.
+The end-to-end pipeline is now fully automated with per-tool authorization and per-user credential exchange. A user browses the catalog, deploys a server, and the operator handles deployment + gateway registration. AuthPolicies on the auto-created HTTPRoutes enforce per-group, per-tool access control. For credentialed upstream servers, the AuthPolicy's metadata evaluators exchange the user's JWT for their personal API token stored in Vault.
 
 ---
 
@@ -1439,6 +1558,18 @@ The end-to-end pipeline is now fully automated with per-tool authorization. A us
 31. **TLSPolicy auto-creates certificates with deterministic naming** — a single TLSPolicy targeting a Gateway scans for HTTPS listeners and creates Certificate CRs named `{gateway}-{listener}`, with secrets named `{gateway}-{listener}-tls`. The Gateway's `certificateRefs` must match these auto-generated names. This convention is undocumented but reliable — knowing it avoids trial-and-error.
 
 32. **Denied server access returns 500, denied tool access returns 403** — when a user is blocked from an entire server, the broker can't establish a session and wraps the 403 as a generic "failed to create session" 500 error. When a user can reach the server but is denied a specific tool, the 403 from Authorino passes through cleanly. The 500 is a presentation issue in the broker — it doesn't distinguish "server is down" from "you're not authorized."
+
+33. **Keycloak realm import silently drops `defaultClientScopes` on clients** — when a realm export defines both a client scope and a client that references it in `defaultClientScopes`, Keycloak's `--import-realm` may not apply the scope to the client. The scope is created, but the client doesn't get it. Tokens are then missing expected claims (in our case, `aud: mcp-gateway` required by Vault JWT auth). This is not an experiment-specific issue — any production setup using Keycloak realm imports with custom audience mappers would hit it. The fix is to verify scopes are applied after import via the admin API (`GET /admin/realms/{realm}/clients/{id}/default-client-scopes`) and add them if missing (`PUT .../default-client-scopes/{scope-id}`).
+
+34. **Broker credential secret label is `mcp.kuadrant.io/secret`, not `mcp.kuadrant.io/credential`** — the mcp-gateway controller validates that secrets referenced by `credentialRef` have the label `mcp.kuadrant.io/secret=true`. The label name is not intuitive and is easy to get wrong. Without it, the MCPServerRegistration status reports a clear error message, but the secret appears to exist and have correct data — only the label is missing. The mcp-gateway CLAUDE.md documents this as `mcp.kuadrant.io/credential`, which is also incorrect.
+
+35. **Gateway auth architecture has an intentional broker/router split for credentials** — the broker uses static K8s Secret credentials (`credentialRef`) for tool discovery at startup. Per-user credentials flow through the Envoy AuthPolicy layer (Vault token exchange) at request time. The broker connects directly to backends (not through Envoy), so AuthPolicy never fires for discovery. The router, however, hairpins through Envoy for session initialization, which triggers AuthPolicy. This means the broker and router have fundamentally different credential paths for the same backend — static for discovery, dynamic for user requests. Understanding this split is essential for debugging auth issues with authenticated backends.
+
+36. **Per-user credential exchange works entirely in AuthPolicy metadata evaluators** — the Vault token exchange (JWT login + secret read + header injection) is implemented purely in Kuadrant AuthPolicy metadata and response rules. No application code changes, no sidecars, no webhook interceptors. Authorino's metadata evaluators execute HTTP calls in a priority-ordered chain, and the response rules inject the retrieved credential into upstream request headers. This demonstrates that Kuadrant's auth architecture is general enough to handle credential brokering, not just access control.
+
+37. **MCP servers must accept credentials via HTTP headers for gateway-level credential injection** — the GitHub MCP server accepts `Authorization: Bearer` headers in HTTP mode, making it compatible with the Vault exchange pattern. Servers that only read credentials from environment variables (e.g., Slack MCP server) force a per-user deployment model. This is a fundamental design consideration for MCP server authors: supporting HTTP header-based credentials enables multi-tenant gateway architectures.
+
+38. **Operator reconcilers must merge, not replace, spec maps for extensibility** — the gateway controller's `reconcileMCPServerRegistration` initially replaced the entire `spec` map, dropping any externally-added fields including `credentialRef`. The fix was annotation-driven propagation of `credentialRef`. The general lesson: reconcilers that own a resource should merge their fields into the existing spec rather than replacing it wholesale, or risk overwriting fields set by other controllers or manual configuration.
 
 ---
 
