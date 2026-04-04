@@ -1,0 +1,364 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>MCP Architecture Diagrams</title>
+<style>
+  *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+  body {
+    font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+    background: #0d1117;
+    color: #c9d1d9;
+    min-height: 100vh;
+  }
+  header {
+    padding: 1.5rem 2rem 0;
+    text-align: center;
+  }
+  header h1 {
+    font-size: 1.4rem;
+    font-weight: 600;
+    color: #e6edf3;
+    letter-spacing: -0.02em;
+  }
+  .tabs {
+    display: flex;
+    justify-content: center;
+    gap: 0.5rem;
+    padding: 1.25rem 2rem 0;
+  }
+  .tab {
+    padding: 0.55rem 1.25rem;
+    border: 1px solid #30363d;
+    border-radius: 8px;
+    background: #161b22;
+    color: #8b949e;
+    cursor: pointer;
+    font-size: 0.875rem;
+    font-weight: 500;
+    transition: all 0.15s ease;
+  }
+  .tab:hover { border-color: #58a6ff; color: #c9d1d9; }
+  .tab.active { background: #1f6feb; border-color: #1f6feb; color: #fff; }
+  .diagram-container {
+    padding: 1.5rem 2rem 2rem;
+    display: flex;
+    justify-content: center;
+  }
+  .diagram {
+    display: none;
+    background: #ffffff;
+    border-radius: 12px;
+    padding: 2rem;
+    overflow: auto;
+    max-width: 100%;
+    max-height: calc(100vh - 160px);
+    box-shadow: 0 4px 24px rgba(0,0,0,0.4);
+  }
+  .diagram.active { display: block; }
+  .diagram svg { max-width: 100%; height: auto; }
+</style>
+</head>
+<body>
+<header><h1>MCP Ecosystem — Architecture Diagrams</h1></header>
+<div class="tabs">
+  <button class="tab active" data-target="tls">TLS Architecture</button>
+  <button class="tab" data-target="component">Component Architecture</button>
+  <button class="tab" data-target="request">Request Flow</button>
+</div>
+<div class="diagram-container">
+
+<div id="tls" class="diagram active">
+<pre class="mermaid">
+flowchart TB
+    subgraph External ["External (Host Machine)"]
+        Client["Client&lt;br/&gt;(curl / mcp-client.sh)"]
+    end
+    subgraph Kind ["Kind Cluster"]
+        subgraph CM ["cert-manager namespace"]
+            SI["ClusterIssuer&lt;br/&gt;selfsigned-issuer"]
+            CA["Certificate&lt;br/&gt;mcp-ca-cert&lt;br/&gt;(isCA: true)"]
+            CAI["ClusterIssuer&lt;br/&gt;mcp-ca-issuer"]
+            CAS["Secret&lt;br/&gt;mcp-ca-secret&lt;br/&gt;(CA key + cert)"]
+            SI -->|signs| CA
+            CA -->|stored in| CAS
+            CAS -->|referenced by| CAI
+        end
+        subgraph KS ["kuadrant-system namespace"]
+            TP["TLSPolicy&lt;br/&gt;mcp-gateway-tls&lt;br/&gt;(targets Gateway,&lt;br/&gt;references mcp-ca-issuer)"]
+        end
+        subgraph GS ["gateway-system namespace"]
+            GW["Gateway&lt;br/&gt;mcp-gateway"]
+            subgraph Listeners ["Listeners"]
+                L1["mcp&lt;br/&gt;:8080 HTTP"]
+                L2["keycloak&lt;br/&gt;:8002 HTTP"]
+                L3["mcp-https&lt;br/&gt;:8443 HTTPS"]
+                L4["keycloak-https&lt;br/&gt;:8445 HTTPS"]
+            end
+            CERT1["Certificate&lt;br/&gt;mcp-gateway-mcp-https"]
+            CERT2["Certificate&lt;br/&gt;mcp-gateway-keycloak-https"]
+            SEC1["Secret&lt;br/&gt;mcp-gateway-mcp-https-tls"]
+            SEC2["Secret&lt;br/&gt;mcp-gateway-keycloak-https-tls"]
+            GW --- Listeners
+            CERT1 -->|stored in| SEC1
+            CERT2 -->|stored in| SEC2
+            SEC1 -->|certificateRef| L3
+            SEC2 -->|certificateRef| L4
+        end
+        subgraph NP ["NodePort Service"]
+            P1["30080 → 8080&lt;br/&gt;(host :8001)"]
+            P2["30089 → 8002&lt;br/&gt;(host :8002)"]
+            P3["30443 → 8443&lt;br/&gt;(host :8443)"]
+            P4["30445 → 8445&lt;br/&gt;(host :8445)"]
+        end
+        subgraph Backend ["Backend (plain HTTP)"]
+            Broker["mcp-gateway&lt;br/&gt;broker/router"]
+            KC["Keycloak"]
+        end
+    end
+    TP -->|"creates Certificates&lt;br/&gt;for HTTPS listeners"| CERT1
+    TP -->|"creates Certificates&lt;br/&gt;for HTTPS listeners"| CERT2
+    CAI -->|signs| CERT1
+    CAI -->|signs| CERT2
+    Client -->|"https://:8443"| P3
+    Client -->|"https://:8445"| P4
+    Client -->|"http://:8001"| P1
+    Client -->|"http://:8002"| P2
+    P1 --> L1
+    P2 --> L2
+    P3 --> L3
+    P4 --> L4
+    L1 -->|HTTP| Broker
+    L2 -->|HTTP| KC
+    L3 -->|"TLS terminated&lt;br/&gt;→ HTTP"| Broker
+    L4 -->|"TLS terminated&lt;br/&gt;→ HTTP"| KC
+    style L3 fill:#2d6a4f,color:#fff
+    style L4 fill:#2d6a4f,color:#fff
+    style SEC1 fill:#1b4332,color:#fff
+    style SEC2 fill:#1b4332,color:#fff
+    style TP fill:#40916c,color:#fff
+</pre>
+</div>
+
+<div id="component" class="diagram">
+<pre class="mermaid">
+graph TB
+    subgraph kind["Kind Cluster (mcp-gateway)"]
+        subgraph catalog-system["catalog-system namespace"]
+            postgres[(PostgreSQL)]
+            catalog-cm[/"ConfigMap&lt;br/&gt;mcp-catalog-sources"/]
+            catalog-api["Catalog API&lt;br/&gt;(REST :8080)"]
+            catalog-api --> postgres
+            catalog-api --> catalog-cm
+        end
+        subgraph cert-manager-ns["cert-manager namespace"]
+            selfsigned-issuer["ClusterIssuer&lt;br/&gt;selfsigned-issuer"]
+            ca-cert["Certificate&lt;br/&gt;mcp-ca-cert (isCA)"]
+            ca-secret["Secret&lt;br/&gt;mcp-ca-secret"]
+            ca-issuer["ClusterIssuer&lt;br/&gt;mcp-ca-issuer"]
+            selfsigned-issuer -->|signs| ca-cert
+            ca-cert -->|stored in| ca-secret
+            ca-secret -->|referenced by| ca-issuer
+        end
+        subgraph gateway-system["gateway-system namespace"]
+            envoy["Envoy Proxy&lt;br/&gt;(mcp-gateway-istio&lt;br/&gt;:8080/:8002/:8443/:8445)"]
+            gateway-res["Gateway Resource"]
+            ref-grant["ReferenceGrant"]
+            ef-extproc["EnvoyFilter&lt;br/&gt;(ext_proc → Router)"]
+            gw-authpolicy["AuthPolicy&lt;br/&gt;(mcp-auth-policy)&lt;br/&gt;JWT auth + 401 response"]
+            tls-policy["TLSPolicy&lt;br/&gt;(mcp-gateway-tls)"]
+            gw-cert-mcp["Certificate&lt;br/&gt;mcp-gateway-mcp-https"]
+            gw-cert-kc["Certificate&lt;br/&gt;mcp-gateway-keycloak-https"]
+            nodeport-gw["NodePort Service&lt;br/&gt;30080→8080 (MCP HTTP)&lt;br/&gt;30089→8002 (KC HTTP)&lt;br/&gt;30443→8443 (MCP HTTPS)&lt;br/&gt;30445→8445 (KC HTTPS)"]
+            nodeport-gw --> envoy
+            tls-policy -->|creates| gw-cert-mcp
+            tls-policy -->|creates| gw-cert-kc
+        end
+        subgraph kuadrant-system["kuadrant-system namespace"]
+            authorino["Authorino&lt;br/&gt;(auth engine)"]
+            kuadrant-op["Kuadrant Operator"]
+            limitador["Limitador&lt;br/&gt;(rate limiting)"]
+        end
+        subgraph keycloak-ns["keycloak namespace"]
+            keycloak["Keycloak 26.3&lt;br/&gt;(OIDC provider :8080)"]
+            realm-cm[/"ConfigMap&lt;br/&gt;realm-import"/]
+            kc-svc["Service&lt;br/&gt;:80 → :8080"]
+            kc-httproute["HTTPRoute&lt;br/&gt;(OAuth discovery rewrite)"]
+            kc-svc --> keycloak
+            keycloak --> realm-cm
+        end
+        subgraph istio-system["istio-system namespace"]
+            istiod["istiod&lt;br/&gt;(Gateway API controller)"]
+        end
+        subgraph mcp-system["mcp-system namespace"]
+            mcp-gw-pod["mcp-gateway pod&lt;br/&gt;(broker + router)"]
+            mcp-ctrl["mcp-controller pod"]
+            mcp-gw-ext["MCPGatewayExtension"]
+            httproute-gw["HTTPRoute&lt;br/&gt;(mcp-gateway-route)"]
+            config-secret["Secret (config)"]
+        end
+        subgraph mcp-test["mcp-test namespace"]
+            launcher["MCP Launcher&lt;br/&gt;(catalog UI + deployer :8080)"]
+            launcher-rbac["RBAC&lt;br/&gt;(SA + ClusterRole + CRB)"]
+            mcpserver-cr1["MCPServer CR&lt;br/&gt;test-server1&lt;br/&gt;(gateway-ref annotation)"]
+            mcpserver-cr2["MCPServer CR&lt;br/&gt;test-server2&lt;br/&gt;(gateway-ref annotation)"]
+            server1-pod["test-server1 pod&lt;br/&gt;(MCP server :9090)"]
+            server1-svc["test-server1 Service"]
+            server1-httproute["HTTPRoute&lt;br/&gt;(test-server1)"]
+            server1-reg["MCPServerRegistration&lt;br/&gt;(test-server1)"]
+            server1-authpolicy["AuthPolicy&lt;br/&gt;(server1-auth-policy)&lt;br/&gt;developers→greet, ops→add_tool"]
+            server2-pod["test-server2 pod&lt;br/&gt;(MCP server :9090)"]
+            server2-svc["test-server2 Service"]
+            server2-httproute["HTTPRoute&lt;br/&gt;(test-server2)"]
+            server2-reg["MCPServerRegistration&lt;br/&gt;(test-server2)"]
+            server2-authpolicy["AuthPolicy&lt;br/&gt;(server2-auth-policy)&lt;br/&gt;developers→set_time, ops→auth1234+set_time"]
+            nodeport-launcher["NodePort Service&lt;br/&gt;30472"]
+            nodeport-launcher --> launcher
+            server1-svc --> server1-pod
+            server2-svc --> server2-pod
+        end
+        subgraph operator-system["mcp-lifecycle-operator-system namespace"]
+            operator["Lifecycle Operator&lt;br/&gt;(main + gateway reconciler)"]
+        end
+        subgraph metallb-system["metallb-system namespace"]
+            metallb["MetalLB"]
+        end
+        istiod -.->|"programs via xDS"| envoy
+        operator -->|"creates"| server1-pod
+        operator -->|"creates"| server1-svc
+        operator -->|"creates"| server1-httproute
+        operator -->|"creates"| server1-reg
+        operator -->|"creates"| server2-pod
+        operator -->|"creates"| server2-svc
+        operator -->|"creates"| server2-httproute
+        operator -->|"creates"| server2-reg
+        operator -.->|"watches"| mcpserver-cr1
+        operator -.->|"watches"| mcpserver-cr2
+        ca-issuer -->|signs| gw-cert-mcp
+        ca-issuer -->|signs| gw-cert-kc
+        tls-policy -.->|"targets"| gateway-res
+        kuadrant-op -.->|"configures"| authorino
+        kuadrant-op -.->|"creates WasmPlugin"| envoy
+        envoy -->|"ext_proc"| mcp-gw-pod
+        envoy -->|"routes to"| server1-svc
+        envoy -->|"routes to"| server2-svc
+        envoy -->|"routes to (:8002)"| kc-svc
+        envoy -.->|"Wasm plugin calls"| authorino
+        authorino -.->|"JWKS (in-cluster)"| keycloak
+        launcher -->|"reads catalog"| catalog-api
+        launcher -->|"creates"| mcpserver-cr1
+        mcp-ctrl -.->|"watches"| server1-reg
+        mcp-ctrl -.->|"watches"| server2-reg
+    end
+    client["Client / mcp-client.sh"]
+    client -->|":8001 (MCP HTTP)"| nodeport-gw
+    client -->|":8443 (MCP HTTPS)"| nodeport-gw
+    client -->|":8002 (KC HTTP)"| nodeport-gw
+    client -->|":8445 (KC HTTPS)"| nodeport-gw
+    client -->|":8004"| nodeport-launcher
+    subgraph kc-clients["Keycloak Clients"]
+        kc-gw-client["mcp-gateway&lt;br/&gt;(confidential, client_credentials)"]
+        kc-cli-client["mcp-cli&lt;br/&gt;(public, device auth +&lt;br/&gt;direct access grant)"]
+        kc-inspector-client["mcp-inspector&lt;br/&gt;(public, auth code + PKCE)"]
+    end
+    subgraph kc-users["Users &amp; Groups"]
+        alice["alice → developers"]
+        bob["bob → ops"]
+        carol["carol → developers, ops"]
+    end
+    classDef ns fill:none,stroke:#666,stroke-width:2px,stroke-dasharray:5 5
+    classDef pod fill:#e8f4fd,stroke:#2196F3,stroke-width:1px
+    classDef svc fill:#fff3e0,stroke:#FF9800,stroke-width:1px
+    classDef cr fill:#e8f5e9,stroke:#4CAF50,stroke-width:1px
+    classDef storage fill:#fce4ec,stroke:#E91E63,stroke-width:1px
+    classDef external fill:#f3e5f5,stroke:#9C27B0,stroke-width:2px
+    classDef auth fill:#fff9c4,stroke:#FBC02D,stroke-width:1px
+    class catalog-system,gateway-system,istio-system,mcp-system,mcp-test,operator-system,metallb-system,keycloak-ns,kuadrant-system,cert-manager-ns ns
+    class envoy,catalog-api,mcp-gw-pod,mcp-ctrl,launcher,server1-pod,server2-pod,keycloak,operator,istiod,metallb,authorino,kuadrant-op,limitador pod
+    class nodeport-gw,nodeport-launcher,server1-svc,server2-svc,kc-svc svc
+    class mcpserver-cr1,mcpserver-cr2,server1-httproute,server1-reg,server2-httproute,server2-reg,gateway-res,ref-grant,ef-extproc,mcp-gw-ext,httproute-gw,config-secret,launcher-rbac,kc-httproute,tls-policy,gw-cert-mcp,gw-cert-kc,selfsigned-issuer,ca-cert,ca-issuer cr
+    class ca-secret storage
+    class postgres,catalog-cm,realm-cm storage
+    class client external
+    class kc-gw-client,kc-cli-client,kc-inspector-client,alice,bob,carol,kc-clients,kc-users,gw-authpolicy,server1-authpolicy,server2-authpolicy auth
+</pre>
+</div>
+
+<div id="request" class="diagram">
+<pre class="mermaid">
+sequenceDiagram
+    participant C as Client&lt;br/&gt;(mcp-client.sh)
+    participant KC as Keycloak&lt;br/&gt;(OIDC Provider)
+    participant E as Envoy Proxy&lt;br/&gt;(gateway-system)
+    participant R as Router&lt;br/&gt;(ext_proc, mcp-system)
+    participant A as Authorino&lt;br/&gt;(Wasm plugin → kuadrant-system)
+    participant B as Broker&lt;br/&gt;(mcp-system)
+    participant S as MCP Server&lt;br/&gt;(mcp-test)
+    Note over C,S: 1. Token Acquisition (Device Authorization Grant)
+    C->>KC: POST /auth/device&lt;br/&gt;client_id=mcp-cli&amp;scope=openid groups
+    KC-->>C: device_code, user_code ABCD-EFGH, verification_uri
+    Note over C: Opens browser → user logs in
+    C->>KC: POST /token&lt;br/&gt;grant_type=device_code
+    KC-->>C: access_token, id_token, refresh_token
+    Note over C: Token contains: sub, groups, iss
+    Note over C,S: 2. Authenticated Request (HTTP or HTTPS)
+    alt HTTPS (port 8443)
+        Note over C,E: TLS handshake using cert signed by mcp-ca-issuer
+        C->>E: POST https://.../mcp Authorization: Bearer eyJ...
+        Note over E: TLS terminated at Gateway
+    else HTTP (port 8001)
+        C->>E: POST http://.../mcp Authorization: Bearer eyJ...
+    end
+    Note over E: Filter chain: ext_proc → Wasm → router
+    E->>R: ext_proc: headers + body
+    alt initialize / tools/list (aggregation path)
+        Note over C,S: 3a. Initialize or tools/list → Broker aggregates
+        R-->>E: authority unchanged, x-mcp-method set
+        E->>A: CheckRequest (host, path, JWT)
+        Note over A: Gateway AuthPolicy: Validate JWT via JWKS
+        A-->>E: OK (authorized)
+        alt Missing/invalid token
+            A-->>E: DENIED
+            E-->>C: 401 Unauthorized
+        end
+        E->>B: POST /mcp tools/list
+        B->>S: POST /mcp → tools/list
+        S-->>B: tools response
+        B-->>E: Aggregated tools
+        E-->>C: Aggregated tools/list response
+    else tools/call (direct routing path)
+        Note over C,S: 3b. tools/call → Router + AuthPolicy + direct to server
+        R-->>E: authority=test-server1.mcp.local, x-mcp-toolname=greet
+        E->>A: CheckRequest (host, toolname, JWT)
+        Note over A: Per-HTTPRoute AuthPolicy: group + tool ACL check
+        alt Authorized
+            A-->>E: OK
+            E->>S: POST /mcp tools/call greet
+            S-->>E: tool result
+            E-->>C: 200 OK + tool result
+        else Unauthorized
+            A-->>E: DENIED
+            E-->>C: 403 Forbidden
+        end
+    end
+</pre>
+</div>
+
+</div>
+
+<script type="module">
+import mermaid from 'https://cdn.jsdelivr.net/npm/mermaid@11/dist/mermaid.esm.min.mjs';
+mermaid.initialize({ startOnLoad: true, theme: 'default', securityLevel: 'loose' });
+
+document.querySelectorAll('.tab').forEach(tab => {
+  tab.addEventListener('click', () => {
+    document.querySelectorAll('.tab').forEach(t => t.classList.remove('active'));
+    document.querySelectorAll('.diagram').forEach(d => d.classList.remove('active'));
+    tab.classList.add('active');
+    document.getElementById(tab.dataset.target).classList.add('active');
+  });
+});
+</script>
+</body>
+</html>

@@ -96,6 +96,55 @@ This verifies the full pipeline end-to-end (15 checks):
 4. **Authentication** — mini-oidc issues tokens, unauthenticated requests are rejected with 401
 5. **Gateway tool access** — MCP session initializes, tools are federated with prefixes, tool calls return results
 
+### Interactive client
+
+```bash
+./scripts/mcp-client.sh
+```
+Authenticates via mini OIDC, then drops into a tool-calling REPL. Log in as any mcpuser. Use /tools to list tools, /whoami to check identity.
+
+```bash
+╰─ ./scripts/mcp-client.sh                                                                     ─╯
+Authenticating with mini-oidc...
+Authenticated as mcp-user
+
+Connecting to gateway at http://mcp.127-0-0-1.sslip.io:8001/mcp ...
+Session established.
+
+Available tools:
+----------------
+  test_server1_add_tool(description, name) — dynamically add a new tool (triggers notifications/tools/list_changed)
+  test_server1_greet(name) — say hi
+  test_server1_headers() — get headers
+  test_server1_slow(seconds) — delay N seconds
+  test_server1_time() — get current time
+  test_server2_auth1234() — check authorization header
+  test_server2_headers() — get HTTP headers
+  test_server2_hello_world(name) — Say hello to someone
+  test_server2_pour_chocolate_into_mold(quantity) — Pour chocolate into mold
+  test_server2_set_time(time) — Set the clock
+  test_server2_slow(seconds) — Delay for N seconds
+  test_server2_time() — Get the current time
+
+Enter tool calls as: tool_name {"param": "value"}
+  or with key=value:  tool_name name=World
+Commands: /tools, /whoami, /raw METHOD {params}, /quit
+
+mcp> test_server2_time
+{
+  "jsonrpc": "2.0",
+  "id": 8287,
+  "result": {
+    "content": [
+      {
+        "type": "text",
+        "text": "2026-04-04 00:47:21.839257598 +0000 UTC m=+1543.175988466"
+      }
+    ]
+}
+mcp>
+```
+
 ### Quick test (curl)
 
 ```bash
