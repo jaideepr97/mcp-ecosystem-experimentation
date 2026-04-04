@@ -1,0 +1,35 @@
+apiVersion: kuadrant.io/v1
+kind: AuthPolicy
+metadata:
+  name: team-a-auth-server-a2
+  namespace: team-a
+spec:
+  targetRef:
+    group: gateway.networking.k8s.io
+    kind: HTTPRoute
+    name: test-server-a2
+  rules:
+    authentication:
+      keycloak:
+        jwt:
+          issuerUrl: http://keycloak.127-0-0-1.sslip.io:8002/realms/mcp
+    authorization:
+      group-tool-access:
+        patternMatching:
+          patterns:
+            - predicate: >-
+                (auth.identity.groups.exists(g, g == 'team-a-developers')
+                && request.headers['x-mcp-toolname'] in ['hello_world', 'time', 'headers'])
+                || (auth.identity.groups.exists(g, g == 'team-a-ops')
+                && request.headers['x-mcp-toolname'] in ['auth1234', 'set_time', 'slow', 'pour_chocolate_into_mold'])
+                || (auth.identity.groups.exists(g, g == 'team-a-leads')
+                && request.headers['x-mcp-toolname'] in ['auth1234', 'headers', 'hello_world', 'pour_chocolate_into_mold', 'set_time', 'slow', 'time'])
+    response:
+      unauthenticated:
+        body:
+          value: |
+            {"error":"Unauthorized","message":"Authentication required."}
+      unauthorized:
+        body:
+          value: |
+            {"error":"Forbidden","message":"You do not have access to this tool."}

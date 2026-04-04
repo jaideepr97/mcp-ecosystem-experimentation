@@ -123,6 +123,14 @@ This document captures both the technical outcomes and the learning process: wha
   - [Verification: server isolation](#verification-server-isolation)
   - [End-to-end tool call routing](#end-to-end-tool-call-routing)
   - [Resource footprint](#resource-footprint)
+- [Phase 17: VirtualMCPServers + AuthPolicies in team-a](#phase-17-virtualmcpservers--authpolicies-in-team-a)
+  - [Keycloak setup: users and groups](#keycloak-setup-users-and-groups)
+  - [Keycloak access fix](#keycloak-access-fix)
+  - [Gateway-level AuthPolicy](#gateway-level-authpolicy)
+  - [VirtualMCPServers](#virtualmcpservers)
+  - [Per-HTTPRoute AuthPolicies](#per-httproute-authpolicies)
+  - [Test results](#test-results)
+  - [Infrastructure files created](#infrastructure-files-created)
 - [Key Learnings](#key-learnings)
 - [Reflection: How AI Was Used in This Experiment](#reflection-how-ai-was-used-in-this-experiment)
   - [Pattern of interaction](#pattern-of-interaction)
@@ -1788,6 +1796,76 @@ The operator, catalog, Keycloak, and Vault remain shared at the cluster level �
 
 ---
 
+## Phase 17: VirtualMCPServers + AuthPolicies in team-a
+
+With namespace isolation established in Phase 16, Phase 17 layered identity-aware tool filtering and per-tool authorization on top of team-a's gateway. The goal was to validate the full VirtualMCPServer + AuthPolicy pattern in a namespace-isolated deployment: different groups of users see different tool subsets, and authorization enforces that only allowed tools can be called.
+
+### Keycloak setup: users and groups
+
+Three groups were created in Keycloak to represent team-a's organizational structure:
+
+- **team-a-developers** — dev1, dev2
+- **team-a-ops** — ops1, ops2
+- **team-a-leads** — lead1
+
+Five users total. The Keycloak 26 "Account is not fully set up" issue resurfaced — users need an email address set even when the field appears optional in the profile configuration. This is the same behavior documented in the changes tracker from Phase 12 (Finding 22).
+
+### Keycloak access fix
+
+Authorino (Kuadrant's auth backend) couldn't reach Keycloak's JWKS endpoint. The old gateway that exposed Keycloak on port 8002 was the problem — it was an external-facing gateway resource, not a cluster-internal service.
+
+**Fix**: deleted the old gateway resource and created a new `keycloak-auth` Service in the `keycloak` namespace (port 8002 → targetPort 8080). Updated CoreDNS to point `keycloak.127-0-0-1.sslip.io` to the new service's ClusterIP. This gave Authorino a reliable in-cluster path to Keycloak's JWKS endpoint.
+
+### Gateway-level AuthPolicy
+
+Applied `team-a-gateway-auth` targeting `team-a-gateway` with `sectionName: mcp` and a `defaults` strategy:
+
+- **JWT authentication** via Keycloak's JWKS endpoint
+- **Response rule** injects the `X-Mcp-Virtualserver` header based on group membership using a CEL ternary expression:
+  - leads → `team-a/team-a-lead-tools`
+  - ops → `team-a/team-a-ops-tools`
+  - developers → `team-a/team-a-dev-tools`
+
+This is the platform-driven VirtualMCPServer selection pattern described in Finding 44 — the client is unaware of virtual servers entirely; the gateway injects the header based on JWT claims.
+
+### VirtualMCPServers
+
+Three VirtualMCPServer CRs were created, each curating a different tool subset from team-a's two upstream servers (test-server-a1 with 5 tools, test-server-a2 with 7 tools):
+
+- **team-a-dev-tools**: 6 tools (greet, time, headers from both servers)
+- **team-a-ops-tools**: 6 tools (add_tool, slow, auth1234, set_time, slow, pour_chocolate_into_mold)
+- **team-a-lead-tools**: all 12 tools
+
+The VirtualMCPServer controller writes to a hardcoded `mcp-system` namespace rather than the MCPGatewayExtension's namespace (Finding 48). The workaround was to manually add `virtualServers` entries to team-a's config Secret.
+
+### Per-HTTPRoute AuthPolicies
+
+Two AuthPolicies were created, one per upstream server's HTTPRoute:
+
+- **team-a-auth-server-a1** targeting HTTPRoute `test-server-a1`
+- **team-a-auth-server-a2** targeting HTTPRoute `test-server-a2`
+
+Each uses CEL predicates matching group membership to allowed tool names — a whitelist pattern where unlisted tools are denied. Kuadrant only allows one AuthPolicy per HTTPRoute target (Finding 50), so adding a new group's tool access means editing the existing per-HTTPRoute AuthPolicy to add another CEL predicate clause, rather than creating a separate AuthPolicy per group.
+
+### Test results
+
+**VirtualMCPServer filtering**: dev1 sees 6 tools, ops1 sees 6 tools, lead1 sees all 12. Group-to-virtual-server mapping via the gateway AuthPolicy's response rule worked correctly.
+
+**Authorization matrix**: 14/14 cases correct (8 allows, 6 denies). Every group member could call their authorized tools and was blocked from unauthorized ones.
+
+**Tool delisting test**: removed `greet` from the dev-tools VirtualMCPServer, confirmed it disappeared from `tools/list` but remained callable via `tools/call` (200 response). This experimentally confirms Finding 39 — VirtualMCPServers are a filtering/curation mechanism, not a security boundary. AuthPolicy is the only enforcement layer.
+
+**500 vs 403 on denied `tools/call`**: the broker wraps the 403 from Authorino as a transport error, returning 500 to the client. This is the known issue documented in Finding 32.
+
+### Infrastructure files created
+
+- `infrastructure/team-a/gateway-auth-policy.yaml`
+- `infrastructure/team-a/virtualserver-dev.yaml`, `virtualserver-ops.yaml`, `virtualserver-leads.yaml`
+- `infrastructure/team-a/authpolicy-server-a1.yaml`, `authpolicy-server-a2.yaml`
+- `infrastructure/keycloak/keycloak-auth-service.yaml` (new service on port 8002)
+
+---
+
 ## Key Learnings
 
 1. **Istio is not a service mesh here** — only istiod is used, purely as a Gateway API controller that programs Envoy. No sidecars, no ambient mode.
@@ -1893,6 +1971,12 @@ The operator, catalog, Keycloak, and Vault remain shared at the cluster level �
     This is a case where the experimentation process — building with Phase 1 primitives, hitting scalability walls, and reasoning about what a better architecture would look like — led us to independently identify the same problems the gateway team had already designed solutions for. The findings remain valid as documentation of Phase 1 limitations and as motivation for why Phase 2 is necessary. Example sample AuthPolicies for both patterns are available at `config/samples/oauth-token-exchange/tools-list-auth.yaml` and `tools-call-auth.yaml` in the mcp-gateway repo.
 
 47. **Namespace-isolated gateway provides complete server isolation via per-namespace config Secrets** — the mcp-controller writes server configuration to an `mcp-gateway-config` Secret scoped to each MCPGatewayExtension's namespace. Since each broker reads only its own namespace's config Secret, server isolation is architectural, not policy-based. A team's broker physically cannot discover servers registered against a different gateway. Combined with Istio's automatic per-Gateway Envoy pod creation, each namespace gets a fully independent request path: dedicated Envoy → dedicated broker/router → namespace-local upstream servers. The shared cluster services (operator, catalog, Keycloak, Vault) are not duplicated — the per-team incremental cost is 2 infrastructure pods (Envoy + broker/router) plus the team's MCP servers.
+
+48. **VirtualMCPServer controller writes to hardcoded `mcp-system` namespace** — the MCPVirtualServer reconciler uses `config.DefaultNamespaceName` (hardcoded to `mcp-system/mcp-gateway-config`) instead of discovering the MCPGatewayExtension's namespace like the MCPServerRegistration reconciler does. In a gateway-per-namespace setup, VirtualMCPServer CRs are applied to the team namespace but the controller writes their config to the wrong Secret. Workaround: manually add `virtualServers` entries to the team namespace's config Secret. This breaks the CRD workflow — VirtualMCPServer CRs are applied but the controller can't deliver them to the right broker.
+
+49. **`X-Mcp-Virtualserver` header requires namespaced name** — the broker's `GetVirtualSeverByHeader` matches against the full `namespace/name` format (e.g., `team-a/team-a-dev-tools`), not the bare name. AuthPolicy response rules must include the namespace prefix. Not documented — discovered through debugging when the broker logged "virtual server team-a-dev-tools not found."
+
+50. **AuthPolicy per-tool predicates require editing existing CRs, not apply/delete** — Kuadrant only allows one AuthPolicy per HTTPRoute target. You can't create separate AuthPolicies per group for the same server. Adding a new group's tool access means editing the existing per-HTTPRoute AuthPolicy to add another CEL predicate clause. This contradicts the "apply/delete CRs" operational model. Auth Phase 2 (Keycloak `resource_access` + wristband JWTs) would solve this by moving the group-to-tool mapping to Keycloak, reducing the AuthPolicy to a single generic CR.
 
 ---
 

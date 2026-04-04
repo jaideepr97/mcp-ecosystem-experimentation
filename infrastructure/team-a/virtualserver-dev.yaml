@@ -1,0 +1,14 @@
+apiVersion: mcp.kuadrant.io/v1alpha1
+kind: MCPVirtualServer
+metadata:
+  name: team-a-dev-tools
+  namespace: team-a
+spec:
+  description: Developer tools for team-a — utility and inspection tools
+  tools:
+    - test_server_a1_greet
+    - test_server_a1_time
+    - test_server_a1_headers
+    - test_server_a2_hello_world
+    - test_server_a2_time
+    - test_server_a2_headers
