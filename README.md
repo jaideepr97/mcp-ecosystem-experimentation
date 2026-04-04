@@ -2,6 +2,8 @@
 
 A reproducible experiment exploring how MCP ecosystem projects work together end-to-end: **discovery** (model-registry catalog), **deployment** (lifecycle operator), **routing** (mcp-gateway), **authentication** (Keycloak + Kuadrant/Authorino), **per-tool authorization** (AuthPolicy with CEL predicates), **TLS** (cert-manager + Kuadrant TLSPolicy), and **per-user credential exchange** (Vault token exchange for upstream API tokens).
 
+Powered heavily by Claude Code 
+
 ## Acknowledgements
 
 - [@matzew](https://github.com/matzew) for [mcp-launcher](https://github.com/matzew/mcp-launcher) — the catalog UI and deployment frontend used in this experiment (forked with catalog API integration)
