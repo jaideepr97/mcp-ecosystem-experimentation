@@ -47,6 +47,8 @@ MCP Gateway          — "route requests securely to the server"
 
 Walk through each phase interactively with explanations of what each component does and why:
 
+**NOTE:** This setup deploys the GitHub MCP server, which requires a PAT to be set to work as expected. Set your GitHub PAT by running `export GITHUB_PAT=<pat>` beforehand.
+
 ```bash
 ./scripts/guided-setup.sh
 ```
