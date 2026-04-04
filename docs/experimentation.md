@@ -1493,6 +1493,127 @@ The end-to-end pipeline is now fully automated with per-tool authorization and p
 
 ---
 
+## Phase 16-20: Design Scoping — From Single-User Experiment to Multi-Tenant Production
+
+> **User instruction**: *"The motivation behind this entire experiment has been this ticket RHAISTRAT-1149. Read the description and comments carefully to understand the scope of the problem. That should help us narrow down the various cases/scenarios we should explore."*
+
+With Phase 15 complete, the experiment had proven the full pipeline end-to-end for a single gateway, single namespace setup. The next challenge was making it production-representative: multiple teams, namespace isolation, intra-team access control, and credential management at scale. Rather than jumping straight to implementation, this phase was a design discussion that started from the motivating Jira ticket and progressively narrowed scope through architecture analysis and code review.
+
+### Starting from the ticket: RHAISTRAT-1149
+
+[RHAISTRAT-1149](https://redhat.atlassian.net/browse/RHAISTRAT-1149) — "Document Best Practices for Deploying MCP Servers with OpenShift AI" — frames the MCP ecosystem around two personas: **Platform Engineers** who deploy, register, and manage MCP servers, and **AI Engineers** who consume tools via Gen AI Studio without needing Kubernetes expertise. The documentation scope covers the full lifecycle: Catalog → Deployment → Gateway Registration → VirtualMCPServer → Gen AI Studio consumption.
+
+Chris Hambridge's comment (Jan 26, from RHAISTRAT-1084 feature refinement) identified four specific gaps that needed to be addressed:
+
+1. **MCP Gateway Registration flow** — how a platform engineer registers a server and gets the endpoint + header for AI engineers
+2. **Creating an MCP Gateway per namespace** — namespace-level isolation of registered MCP servers
+3. **VirtualMCPServers as best practice** — 1:1 mapping with tool sets for tool delisting
+4. **MCP Server/Tool Revocation** — removing from catalog, identifying deployed versions, scaling down, unregistering from gateway
+
+This narrowed the earlier open-ended multi-tenancy brainstorm (which included multi-cluster, ACM, OPA/Rego, SpiceDB, Redis session stores) to a focused set of scenarios directly tied to the ticket's deliverables.
+
+### Questioning VirtualMCPServers
+
+> **User question**: *"How are VirtualMCPServers set up in the gateway, and is it different from the test-auth-matrix thing we have?"*
+
+Code review of the mcp-gateway broker revealed that VirtualMCPServers operate at a fundamentally different layer than expected. The CRD is minimal — just a list of tool names and an optional description. The broker filters `tools/list` responses when the `X-Mcp-Virtualserver` header is present, but critically, **does not enforce anything on `tools/call`**. Anyone who knows a tool name can call it regardless of virtual server membership. AuthPolicy remains the only security boundary.
+
+This led to a series of questions that progressively uncovered the operational complexity:
+
+> **User**: *"How did we add the per tool auth? Sounds like if we are doing both, we would have to make sure they line up."*
+
+Our existing per-tool AuthPolicy uses CEL predicates on the `x-mcp-toolname` header — a whitelist approach where tools not listed get denied. If VirtualMCPServers show tools that the user's group can't call (or hide tools they can), the UX breaks. The platform engineer must manually keep tool names synchronized across VirtualMCPServer CRs and AuthPolicy predicates.
+
+> **User**: *"Can VirtualMCPServers be tied to groups?"*
+
+No — the CRD has no concept of identity. It's selected by client header, not JWT claims. The correct pattern would be platform-driven: AuthPolicy injects the header based on group membership, so the client is unaware of virtual servers entirely. But this means maintaining two independent CRD systems (mcp-gateway VirtualMCPServer CRs and Kuadrant AuthPolicy response rules) with no automatic bridging.
+
+> **User**: *"How would VirtualMCPServers be discovered by users?"*
+
+No gateway API exists to list available virtual servers. The broker stores them internally with lookup by header only. Users must discover them via `kubectl get mcpvirtualservers` (requires K8s access), out-of-band communication, or Gen AI Studio UI.
+
+> **User**: *"Even assuming VirtualMCPServers are present and the user knows which one they want, how are they currently meant to express that?"*
+
+Via the `X-Mcp-Virtualserver` HTTP header — but standard MCP clients (Claude Desktop, Cursor) cannot inject custom headers. Only Gen AI Studio or custom clients can set it. This means VirtualMCPServer selection is inherently tied to the client implementation.
+
+> **User**: *"So something has to know which VirtualMCPServer a client should be pointing to and add that header then basically, right? Clients choosing VirtualMCPServers while possessing awareness of them makes no sense."*
+
+This reframed VirtualMCPServers entirely: they are a **platform concept, not a client concept**. The client should be completely unaware. The platform injects the header via AuthPolicy response rules based on the user's identity.
+
+### The alignment problem and Auth Phase 2
+
+> **User**: *"Would it be necessary to create a VirtualMCPServer for each actual MCPServer? Seems a bit redundant if the idea of the VirtualMCPServer is to make logical groupings across actual servers."*
+
+This questioned Chris Hambridge's 1:1 recommendation. If the value of VirtualMCPServers is cross-server tool curation for specific roles, then 1:1 just duplicates the registered tool list. The 1:1 pattern only buys tool delisting — and even then, delisting just hides from `tools/list` without blocking `tools/call`.
+
+> **User**: *"Are AuthPolicies typically used in production? I imagine using predicates won't be very sustainable at scale."*
+
+Inline CEL predicates (hardcoding tool names and groups) become unmanageable at scale — 50 tools × 8 groups is unwieldy. This prompted a check: is there already a better solution?
+
+> **User**: *"Could be a good suggestion, but that would require a new controller. Are we 100% sure this isn't an already solved problem?"*
+
+This led to discovering the mcp-gateway project's **Auth Phase 2 design** (`docs/design/auth-phase-2.md`), which already addresses most of the identified gaps:
+
+- Tool permissions move to Keycloak as client roles on resource server clients
+- A single generic AuthPolicy uses OPA/Rego + Authorino's wristband feature to sign the user's allowed tools into an `x-authorized-tools` JWT
+- The broker validates the signature and filters `tools/list` — no per-tool CEL predicates
+- `tools/call` authorization also reads `resource_access` from the JWT
+- A future `KeycloakToolRoleMappingPolicy` CRD (described in `VISION.md`) would further abstract the configuration
+
+This was a case where the experimentation process — building with Phase 1 primitives, hitting scalability walls, and reasoning about what a better architecture would look like — independently identified the same problems the gateway team had already designed solutions for.
+
+> **User**: *"What role will VirtualMCPServers play in Phase 2 if Keycloak handles the mapping at a tool level and not at a server level?"*
+
+Almost none. With identity-based filtering via `x-authorized-tools`, VirtualMCPServers become redundant for access control. Their only remaining use case is workflow-specific tool scoping for LLM ergonomics — reducing the tool set an AI agent sees to minimize context confusion. This is a significant finding for RHAISTRAT-1149 documentation: VirtualMCPServers are a key best practice in Phase 1, but their importance diminishes substantially once Phase 2 is adopted.
+
+### Ecosystem deployment topology
+
+> **User**: *"How should the various ecosystem components be deployed on the cluster? Gateway per namespace seems fine. Maybe catalog per namespace too?"*
+
+The discussion settled on a clear topology:
+
+- **Catalog** — 1 per cluster. Discovery should be broad; teams should browse all available servers even if they can't deploy everything. Per-namespace catalogs fragment discovery.
+- **Lifecycle Operator** — 1 per cluster. It's a K8s controller watching MCPServer CRs across namespaces. RBAC scoping handles per-namespace access.
+- **MCP Gateway** — 1 per namespace (team). This is the isolation boundary.
+- **Keycloak + Vault** — shared cluster services.
+- **MCP Servers** — deployed in team namespaces. The `mcp.x-k8s.io/gateway-ref` annotation (currently `gateway-system/mcp-gateway`) would point to that namespace's gateway.
+
+### Credential patterns at scale
+
+> **User**: *"How would token exchange work at this scale? Do we just store team-level PATs in secrets and everyone in a specific team/group gets to use those credentials?"*
+
+Three credential patterns emerged:
+
+1. **Shared team credential** — one PAT per service per team in Vault, keyed off group claim. For shared services (GitHub org account, internal APIs).
+2. **Per-user Vault credential** — individual PATs keyed off `sub` claim. For identity-bound services (Jira, where permissions are per-user).
+3. **OAuth2 token exchange** (Phase 2) — RFC 8693 exchange at the gateway, no stored credentials. For services that trust the same Keycloak realm.
+
+> **User**: *"I'm just wondering in a team setup when would an individual developer's personal token ever be needed? Seems like an anti pattern."*
+
+For most team tooling, team-level credentials are correct. Per-user credentials only make sense for services where permissions are inherently identity-bound (e.g., Jira, where a shared service account would lose attribution and either over- or under-privilege).
+
+> **User**: *"If everything is in Vault do we still need to create Kube secrets for anything?"*
+
+Yes — for broker tool discovery. The broker connects directly to backends (not through Envoy), so AuthPolicy/Vault never fires for `tools/list`. The broker's only credential mechanism is `credentialRef` → K8s Secret. For servers that require auth even for tool discovery, a Secret with a minimal read-only service account credential is still needed alongside Vault.
+
+### The concrete plan
+
+> **User**: *"I have a rough idea for an end state of the cluster over the next couple of phases. We should have 3 namespaces with a gateway in each, single operator, single catalog and Keycloak etc. 2 servers and 3 groups in each namespace. Maybe 15 dummy users distributed arbitrarily."*
+
+This produced a concrete namespace layout: per namespace, 13 CRs (1 MCPGatewayExtension, 2 MCPServerRegistrations, 2 MCPServers, 3 VirtualMCPServers, 3 AuthPolicies, 2 K8s Secrets) plus Vault secrets for team-level and per-user credentials. The full cluster would have 27+ namespace CRs plus shared infrastructure.
+
+> **User**: *"I want to split up Phase 17 to tackle VirtualMCPServers and AuthPolicies first since that is a new concept for this phase."*
+
+The implementation was structured into phases that separate new concepts from full integration:
+
+- **Phase 16**: Namespace-isolated gateways — create `team-a` with its own gateway, deploy 2 servers, verify isolation
+- **Phase 17**: VirtualMCPServers + AuthPolicies — 3 groups, 5 users, 3 VirtualMCPServers, per-server AuthPolicies, gateway virtual server header injection, test matrix
+- **Phase 18**: Vault credential patterns — team-level and per-user credentials, K8s Secrets for broker discovery, AuthPolicy Vault metadata evaluators
+- **Phase 19**: Multi-namespace expansion — replicate to `team-b` and `team-c`, cross-namespace users, single operator + catalog serving all
+- **Phase 20**: Rate limiting — RateLimitPolicy with Limitador
+
+---
+
 ## Key Learnings
 
 1. **Istio is not a service mesh here** — only istiod is used, purely as a Gateway API controller that programs Envoy. No sidecars, no ambient mode.
@@ -1584,6 +1705,18 @@ The end-to-end pipeline is now fully automated with per-tool authorization and p
 44. **VirtualMCPServer-to-group binding requires manual coordination across two independent CRD systems** — the correct pattern for VirtualMCPServer is platform-driven: AuthPolicy injects the `X-Mcp-Virtualserver` header based on JWT group claims, so the client is unaware of virtual servers entirely. But this means the platform engineer must manually maintain two independent resources: a VirtualMCPServer CR (mcp-gateway controller) defining the tool list, and an AuthPolicy response rule (Kuadrant/Authorino) mapping groups to virtual server names. Nothing connects these automatically — the mcp-controller doesn't generate AuthPolicy rules, and Authorino doesn't read VirtualMCPServer CRs. A higher-level abstraction that declares "this virtual server is for this group" and generates both would close the gap, but doesn't exist today.
 
 45. **VirtualMCPServer selection requires custom HTTP headers that standard MCP clients can't set** — the broker selects a virtual server based on the `X-Mcp-Virtualserver` HTTP header on each request. The MCP protocol has no concept of virtual server selection — clients just connect to a URL and send JSON-RPC. Off-the-shelf MCP clients (Claude Desktop, Cursor, etc.) cannot inject custom headers, so VirtualMCPServer selection only works for clients that explicitly support it: Gen AI Studio (which can add the header behind the scenes) or custom-built clients. An alternative that would work with any MCP client would be per-virtual-server URL paths (e.g., `/mcp/dev-tools`), but the gateway's broker exposes a single `/mcp` endpoint today.
+
+46. **The gateway's Auth Phase 2 design already addresses the manual coordination gap we identified** — Findings 39-45 documented a series of operational pain points with VirtualMCPServers and per-tool AuthPolicy: manual CEL predicates don't scale (42), VirtualMCPServer-to-group binding requires coordinating two independent CRD systems (44), and clients can't discover or select virtual servers natively (41, 45). After identifying these gaps through architecture analysis, we discovered that the mcp-gateway project's Auth Phase 2 design (`docs/design/auth-phase-2.md`) already solves most of them through a fundamentally different approach:
+
+    - **Tool permissions move to Keycloak**, not AuthPolicy — each MCP server is a Keycloak "resource server" client, each tool is a client role, and users are assigned tools via group-to-role mappings. The JWT's `resource_access` claim carries the full tool permission set.
+    - **A single generic AuthPolicy** uses OPA/Rego to extract `resource_access` from the JWT and Authorino's **wristband** feature to sign it into an `x-authorized-tools` JWT header. The broker validates the signature and filters `tools/list`. No per-tool CEL predicates, no manual tool name lists in the policy.
+    - **`tools/call` authorization** also reads `resource_access` from the JWT and checks that the requested tool (via `x-mcp-toolname` header) is in the user's roles for that server. Combined with Vault API key lookup (priority 0) and OAuth2 token exchange (priority 1, RFC 8693) for upstream credential injection.
+    - **VirtualMCPServers become optional** — identity-based filtering via `x-authorized-tools` handles per-user tool visibility. VirtualMCPServers remain available as an additional curation layer but are no longer the primary mechanism for controlling who sees what.
+    - A future `KeycloakToolRoleMappingPolicy` CRD is envisioned in `VISION.md` to further abstract the AuthPolicy configuration, but even without it, the Phase 2 design eliminates the need for per-tool predicates and multi-CRD coordination.
+
+    Notably, Phase 2 also diminishes the role of VirtualMCPServers significantly. When Keycloak's `resource_access` claim defines per-user tool permissions at the individual tool level (not server level), and the `x-authorized-tools` wristband JWT handles `tools/list` filtering, VirtualMCPServers become redundant for access control. Their only remaining use case is workflow-specific tool scoping — an AI agent wanting a focused subset of its authorized tools to reduce LLM context — which is a client-side UX concern, not a platform concern. This matters for RHAISTRAT-1149 documentation: VirtualMCPServers are a key best practice in Phase 1 (the only tool visibility mechanism), but their importance drops substantially once Phase 2 is adopted. The documentation should be clear about which auth phase the deployment is targeting.
+
+    This is a case where the experimentation process — building with Phase 1 primitives, hitting scalability walls, and reasoning about what a better architecture would look like — led us to independently identify the same problems the gateway team had already designed solutions for. The findings remain valid as documentation of Phase 1 limitations and as motivation for why Phase 2 is necessary. Example sample AuthPolicies for both patterns are available at `config/samples/oauth-token-exchange/tools-list-auth.yaml` and `tools-call-auth.yaml` in the mcp-gateway repo.
 
 ---
 
