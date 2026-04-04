@@ -21,21 +21,6 @@ graph TB
             ca-secret -->|referenced by| ca-issuer
         end
 
-        subgraph gateway-system["gateway-system namespace"]
-            envoy["Envoy Proxy<br/>(mcp-gateway-istio<br/>:8080/:8002/:8443/:8445)"]
-            gateway-res["Gateway Resource"]
-            ref-grant["ReferenceGrant"]
-            ef-extproc["EnvoyFilter<br/>(ext_proc → Router)"]
-            gw-authpolicy["AuthPolicy<br/>(mcp-auth-policy)<br/>JWT auth + 401 response"]
-            tls-policy["TLSPolicy<br/>(mcp-gateway-tls)"]
-            gw-cert-mcp["Certificate<br/>mcp-gateway-mcp-https"]
-            gw-cert-kc["Certificate<br/>mcp-gateway-keycloak-https"]
-            nodeport-gw["NodePort Service<br/>30080→8080 (MCP HTTP)<br/>30089→8002 (KC HTTP)<br/>30443→8443 (MCP HTTPS)<br/>30445→8445 (KC HTTPS)"]
-            nodeport-gw --> envoy
-            tls-policy -->|creates| gw-cert-mcp
-            tls-policy -->|creates| gw-cert-kc
-        end
-
         subgraph kuadrant-system["kuadrant-system namespace"]
             authorino["Authorino<br/>(auth engine)"]
             kuadrant-op["Kuadrant Operator"]
@@ -46,21 +31,17 @@ graph TB
             keycloak["Keycloak 26.3<br/>(OIDC provider :8080)"]
             realm-cm[/"ConfigMap<br/>realm-import"/]
             kc-svc["Service<br/>:80 → :8080"]
-            kc-httproute["HTTPRoute<br/>(OAuth discovery rewrite)"]
-            kc-svc --> keycloak
             keycloak --> realm-cm
+            kc-svc --> keycloak
         end
 
         subgraph istio-system["istio-system namespace"]
             istiod["istiod<br/>(Gateway API controller)"]
+            sail-operator["Sail Operator"]
         end
 
         subgraph mcp-system["mcp-system namespace"]
-            mcp-gw-pod["mcp-gateway pod<br/>(broker + router)"]
-            mcp-ctrl["mcp-controller pod"]
-            mcp-gw-ext["MCPGatewayExtension"]
-            httproute-gw["HTTPRoute<br/>(mcp-gateway-route)"]
-            config-secret["Secret (config)"]
+            mcp-ctrl["mcp-controller pod<br/>(cluster-wide CRD reconciler)"]
         end
 
         subgraph vault-ns["vault namespace"]
@@ -73,33 +54,25 @@ graph TB
             vault-pod --- vault-secrets
         end
 
-        subgraph mcp-test["mcp-test namespace"]
-            launcher["MCP Launcher<br/>(catalog UI + deployer :8080)"]
-            launcher-rbac["RBAC<br/>(SA + ClusterRole + CRB)"]
-            mcpserver-cr1["MCPServer CR<br/>test-server1<br/>(gateway-ref annotation)"]
-            mcpserver-cr2["MCPServer CR<br/>test-server2<br/>(gateway-ref annotation)"]
-            mcpserver-cr3["MCPServer CR<br/>github<br/>(gateway-ref +<br/>credential-ref annotations)"]
-            server1-pod["test-server1 pod<br/>(MCP server :9090)"]
-            server1-svc["test-server1 Service"]
-            server1-httproute["HTTPRoute<br/>(test-server1)"]
-            server1-reg["MCPServerRegistration<br/>(test-server1)"]
-            server1-authpolicy["AuthPolicy<br/>(server1-auth-policy)<br/>developers→greet, ops→add_tool"]
-            server2-pod["test-server2 pod<br/>(MCP server :9090)"]
-            server2-svc["test-server2 Service"]
-            server2-httproute["HTTPRoute<br/>(test-server2)"]
-            server2-reg["MCPServerRegistration<br/>(test-server2)"]
-            server2-authpolicy["AuthPolicy<br/>(server2-auth-policy)<br/>developers→set_time, ops→auth1234+set_time"]
-            github-pod["github pod<br/>(GitHub MCP server :8082)"]
-            github-svc["github Service"]
-            github-httproute["HTTPRoute<br/>(github)"]
-            github-reg["MCPServerRegistration<br/>(github, 23 tools)"]
-            github-authpolicy["AuthPolicy<br/>(github-auth-policy)<br/>Vault token exchange"]
-            github-cred["Secret<br/>github-broker-credential"]
-            nodeport-launcher["NodePort Service<br/>30472"]
-            nodeport-launcher --> launcher
-            server1-svc --> server1-pod
-            server2-svc --> server2-pod
-            github-svc --> github-pod
+        subgraph team-a["team-a namespace"]
+            team-a-gw["Gateway CR<br/>(team-a-gateway)"]
+            team-a-envoy["Envoy Proxy<br/>(auto-created by Istio)"]
+            team-a-gw-ext["MCPGatewayExtension<br/>(team-a-gateway-extension)"]
+            team-a-mcp-gw["mcp-gateway pod<br/>(broker + router,<br/>auto-created by controller)"]
+            team-a-config-secret["Secret (config)<br/>(auto-created by controller)"]
+
+            server-a1-pod["test-server-a1 pod<br/>(MCP server :9090)<br/>5 tools: add_tool, greet,<br/>headers, slow, time"]
+            server-a1-svc["test-server-a1 Service"]
+            server-a1-httproute["HTTPRoute<br/>(test-server-a1)<br/>(auto-created by operator)"]
+            server-a1-reg["MCPServerRegistration<br/>(test-server-a1)<br/>(auto-created by operator)"]
+
+            server-a2-pod["test-server-a2 pod<br/>(MCP server :9090)<br/>7 tools: auth1234, headers,<br/>hello_world, pour_chocolate_into_mold,<br/>set_time, slow, time"]
+            server-a2-svc["test-server-a2 Service"]
+            server-a2-httproute["HTTPRoute<br/>(test-server-a2)<br/>(auto-created by operator)"]
+            server-a2-reg["MCPServerRegistration<br/>(test-server-a2)<br/>(auto-created by operator)"]
+
+            server-a1-svc --> server-a1-pod
+            server-a2-svc --> server-a2-pod
         end
 
         subgraph operator-system["mcp-lifecycle-operator-system namespace"]
@@ -107,68 +80,49 @@ graph TB
         end
 
         subgraph metallb-system["metallb-system namespace"]
-            metallb["MetalLB"]
+            metallb["MetalLB<br/>(controller + speaker)"]
         end
 
         %% Control plane relationships
-        istiod -.->|"programs via xDS"| envoy
-        operator -->|"creates"| server1-pod
-        operator -->|"creates"| server1-svc
-        operator -->|"creates"| server1-httproute
-        operator -->|"creates"| server1-reg
-        operator -->|"creates"| server2-pod
-        operator -->|"creates"| server2-svc
-        operator -->|"creates"| server2-httproute
-        operator -->|"creates"| server2-reg
-        operator -.->|"watches"| mcpserver-cr1
-        operator -.->|"watches"| mcpserver-cr2
-        operator -.->|"watches"| mcpserver-cr3
-        operator -->|"creates"| github-pod
-        operator -->|"creates"| github-svc
-        operator -->|"creates"| github-httproute
-        operator -->|"creates"| github-reg
+        istiod -.->|"programs via xDS"| team-a-envoy
 
-        %% TLS relationships
-        ca-issuer -->|signs| gw-cert-mcp
-        ca-issuer -->|signs| gw-cert-kc
-        tls-policy -.->|"targets"| gateway-res
+        %% Controller watches registrations
+        mcp-ctrl -.->|"watches"| server-a1-reg
+        mcp-ctrl -.->|"watches"| server-a2-reg
+        mcp-ctrl -->|"creates"| team-a-mcp-gw
+        mcp-ctrl -->|"creates"| team-a-config-secret
+
+        %% Operator creates resources
+        operator -->|"creates"| server-a1-pod
+        operator -->|"creates"| server-a1-svc
+        operator -->|"creates"| server-a1-httproute
+        operator -->|"creates"| server-a1-reg
+        operator -->|"creates"| server-a2-pod
+        operator -->|"creates"| server-a2-svc
+        operator -->|"creates"| server-a2-httproute
+        operator -->|"creates"| server-a2-reg
 
         %% Kuadrant relationships
         kuadrant-op -.->|"configures"| authorino
-        kuadrant-op -.->|"creates WasmPlugin"| envoy
+        kuadrant-op -.->|"creates WasmPlugin"| team-a-envoy
 
         %% Data path
-        envoy -->|"ext_proc"| mcp-gw-pod
-        envoy -->|"routes to"| server1-svc
-        envoy -->|"routes to"| server2-svc
-        envoy -->|"routes to"| github-svc
-        envoy -->|"routes to (:8002)"| kc-svc
+        team-a-envoy -->|"ext_proc"| team-a-mcp-gw
+        team-a-envoy -->|"routes to"| server-a1-svc
+        team-a-envoy -->|"routes to"| server-a2-svc
 
         %% Auth flow
-        envoy -.->|"Wasm plugin calls"| authorino
+        team-a-envoy -.->|"Wasm plugin calls"| authorino
         authorino -.->|"JWKS (in-cluster)"| keycloak
 
         %% Vault credential exchange
         authorino -.->|"JWT login +<br/>secret read"| vault-pod
         vault-jwt-auth -.->|"validates JWT via"| keycloak
-
-        %% Launcher flow
-        launcher -->|"reads catalog"| catalog-api
-        launcher -->|"creates"| mcpserver-cr1
-
-        %% Gateway registration
-        mcp-ctrl -.->|"watches"| server1-reg
-        mcp-ctrl -.->|"watches"| server2-reg
-        mcp-ctrl -.->|"watches"| github-reg
     end
 
     %% External access
     client["Client / mcp-client.sh"]
-    client -->|":8001 (MCP HTTP)"| nodeport-gw
-    client -->|":8443 (MCP HTTPS)"| nodeport-gw
-    client -->|":8002 (KC HTTP)"| nodeport-gw
-    client -->|":8445 (KC HTTPS)"| nodeport-gw
-    client -->|":8004"| nodeport-launcher
+    client -->|"team-a gateway"| team-a-envoy
 
     %% Keycloak clients
     subgraph kc-clients["Keycloak Clients"]
@@ -191,11 +145,11 @@ graph TB
     classDef external fill:#f3e5f5,stroke:#9C27B0,stroke-width:2px
     classDef auth fill:#fff9c4,stroke:#FBC02D,stroke-width:1px
 
-    class catalog-system,gateway-system,istio-system,mcp-system,mcp-test,operator-system,metallb-system,keycloak-ns,kuadrant-system,cert-manager-ns,vault-ns ns
-    class envoy,catalog-api,mcp-gw-pod,mcp-ctrl,launcher,server1-pod,server2-pod,github-pod,keycloak,operator,istiod,metallb,authorino,kuadrant-op,limitador,vault-pod pod
-    class nodeport-gw,nodeport-launcher,server1-svc,server2-svc,github-svc,kc-svc svc
-    class mcpserver-cr1,mcpserver-cr2,mcpserver-cr3,server1-httproute,server1-reg,server2-httproute,server2-reg,github-httproute,github-reg,gateway-res,ref-grant,ef-extproc,mcp-gw-ext,httproute-gw,config-secret,launcher-rbac,kc-httproute,tls-policy,gw-cert-mcp,gw-cert-kc,selfsigned-issuer,ca-cert,ca-issuer,vault-jwt-auth,vault-role,vault-policy cr
-    class ca-secret,github-cred storage
+    class catalog-system,istio-system,mcp-system,team-a,operator-system,metallb-system,keycloak-ns,kuadrant-system,cert-manager-ns,vault-ns ns
+    class team-a-envoy,catalog-api,team-a-mcp-gw,mcp-ctrl,server-a1-pod,server-a2-pod,keycloak,operator,istiod,sail-operator,metallb,authorino,kuadrant-op,limitador,vault-pod pod
+    class server-a1-svc,server-a2-svc,kc-svc svc
+    class server-a1-httproute,server-a1-reg,server-a2-httproute,server-a2-reg,team-a-gw,team-a-gw-ext,team-a-config-secret,selfsigned-issuer,ca-cert,ca-issuer,vault-jwt-auth,vault-role,vault-policy cr
+    class ca-secret storage
     class postgres,catalog-cm,realm-cm,vault-secrets storage
     class client external
-    class kc-gw-client,kc-cli-client,kc-inspector-client,alice,bob,carol,kc-clients,kc-users,gw-authpolicy,server1-authpolicy,server2-authpolicy,github-authpolicy auth
+    class kc-gw-client,kc-cli-client,kc-inspector-client,alice,bob,carol,kc-clients,kc-users auth

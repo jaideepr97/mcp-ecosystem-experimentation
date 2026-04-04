@@ -1,10 +1,10 @@
 apiVersion: mcp.x-k8s.io/v1alpha1
 kind: MCPServer
 metadata:
-  name: test-server2
-  namespace: mcp-test
+  name: test-server-a2
+  namespace: team-a
   annotations:
-    mcp.x-k8s.io/gateway-ref: gateway-system/mcp-gateway
+    mcp.x-k8s.io/gateway-ref: team-a/team-a-gateway
 spec:
   source:
     type: ContainerImage

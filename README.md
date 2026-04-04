@@ -1,6 +1,6 @@
 # MCP Ecosystem Experimentation
 
-A reproducible experiment exploring how MCP ecosystem projects work together end-to-end: **discovery** (model-registry catalog), **deployment** (lifecycle operator), **routing** (mcp-gateway), **authentication** (Keycloak + Kuadrant/Authorino), **per-tool authorization** (AuthPolicy with CEL predicates), **TLS** (cert-manager + Kuadrant TLSPolicy), and **per-user credential exchange** (Vault token exchange for upstream API tokens).
+A reproducible experiment exploring how MCP ecosystem projects work together end-to-end: **discovery** (model-registry catalog), **deployment** (lifecycle operator), **routing** (mcp-gateway with namespace-isolated gateways), **authentication** (Keycloak + Kuadrant/Authorino), **per-tool authorization** (AuthPolicy with CEL predicates), **TLS** (cert-manager + Kuadrant TLSPolicy), **per-user credential exchange** (Vault token exchange for upstream API tokens), and **multi-tenancy** (gateway-per-namespace isolation).
 
 Powered heavily by Claude Code 
 
@@ -12,7 +12,7 @@ This repo has three branches at increasing levels of complexity:
 |--------|--------|----------------|
 | [`basic`](../../tree/basic) | 1-10 | Core pipeline: Kind + Istio + mcp-gateway + lifecycle operator + catalog + mini-oidc authentication |
 | [`intermediate`](../../tree/intermediate) | 1-16 | Adds Keycloak, Kuadrant/Authorino, per-tool authorization, TLS, Vault credential exchange, GitHub MCP server |
-| [`main`](../../tree/main) | 1-16+ | Active development — production deployment patterns, advanced configuration |
+| [`main`](../../tree/main) | 1-16+ | Active development — multi-tenancy patterns, namespace-isolated gateways |
 
 Start with `basic` to understand the fundamentals, then move to `intermediate` for the full auth and security stack.
 
@@ -37,11 +37,23 @@ Kuadrant AuthPolicy  — "who can call which tools on which servers"
 Vault Token Exchange — "swap user JWT for upstream API credentials"
   | Keycloak JWT → Vault JWT login → per-user secret read
 MCP Gateway          — "route requests securely to the server"
+  (one gateway per team namespace for isolation)
 ```
+
+## Current State (Phase 16+)
+
+The experiment has transitioned from a shared-gateway model (Phases 1-15) to a **gateway-per-namespace multi-tenancy model**:
+
+- The `mcp-test` namespace and its test servers have been removed
+- The shared gateway in `gateway-system` has been removed
+- `team-a` is the first team namespace, with its own gateway, MCP gateway extension, and test servers
+- Each team namespace is fully isolated: its own Gateway, its own MCP servers, its own routes
+
+See [docs/experimentation.md](docs/experimentation.md) for the full chronological narrative.
 
 ## Documentation
 
-- [docs/experimentation.md](docs/experimentation.md) — Full chronological narrative of the experiment (Phases 1-15), from initial project analysis through deployment, request tracing, authentication, catalog integration, gateway automation, per-tool authorization, TLS, and Vault credential exchange
+- [docs/experimentation.md](docs/experimentation.md) — Full chronological narrative of the experiment (Phases 1-16+), from initial project analysis through deployment, request tracing, authentication, catalog integration, gateway automation, per-tool authorization, TLS, Vault credential exchange, and multi-tenancy refactoring
 - [docs/changes-tracker.md](docs/changes-tracker.md) — Structured changelog of every code modification and integration friction point discovered
 - [docs/diagrams/](docs/diagrams/) — Mermaid diagrams of the architecture, request flow, pipeline, and operator reconciliation logic
 
@@ -83,7 +95,9 @@ For a non-interactive setup that runs all phases without prompts:
 ./scripts/setup.sh
 ```
 
-This takes approximately 10 minutes and sets up: Kind cluster, Istio (as Gateway API controller), MetalLB, cert-manager, Envoy gateway, mcp-gateway (broker/router/controller), lifecycle operator, catalog system, Keycloak, Kuadrant (Authorino), two test MCP servers, per-tool AuthPolicies, TLS termination, Vault, and optionally a GitHub MCP server.
+> **Note:** The setup scripts currently deploy the Phases 1-15 layout (shared gateway in `gateway-system`, test servers in `mcp-test`). The multi-tenancy model (gateway-per-namespace, `team-a`) was set up manually during Phase 16. Setup scripts are being updated to support the new model.
+
+This takes approximately 10 minutes and sets up: Kind cluster, Istio (as Gateway API controller), MetalLB, cert-manager, Envoy gateway, mcp-gateway (broker/router/controller), lifecycle operator, catalog system, Keycloak, Kuadrant (Authorino), and optionally a GitHub MCP server.
 
 To reuse an existing Kind cluster:
 
@@ -105,19 +119,21 @@ Run the automated pipeline test:
 ./scripts/test-pipeline.sh
 ```
 
+> **Note:** The test pipeline currently validates the Phases 1-15 layout (shared gateway, `mcp-test` servers, per-tool authorization matrix). Tests are being updated for the multi-tenancy model with `team-a` namespace.
+
 This verifies the full pipeline end-to-end across 8 phases (63 checks):
 1. **Catalog API** — lists available servers with OCI artifact URIs
 2. **Operator resources** — MCPServer CRs triggered Deployment + Service creation for both servers
 3. **Gateway integration** — operator created HTTPRoute + MCPServerRegistration + AuthPolicies
 4. **Authentication** — Keycloak issues tokens for all users, unauthenticated requests are rejected with 401
 5. **Gateway tool access** — MCP sessions initialize, tools from both servers are federated, tool calls return results
-6. **Authorization matrix** — 15 allow/deny cases across 3 users × 5 tools (see matrix below)
+6. **Authorization matrix** — 15 allow/deny cases across 3 users x 5 tools
 7. **TLS** — cert-manager, TLSPolicy, HTTPS endpoints for MCP gateway and Keycloak
 8. **Vault credential exchange** — Vault JWT login with Keycloak token, per-user secret read via JWT-derived policy, GitHub MCPServerRegistration + AuthPolicy
 
-### Authorization Matrix
+### Authorization Matrix (Historical — Phases 1-15)
 
-Two test servers with distinct tools, five access control patterns:
+The following authorization matrix was used with the shared gateway and `mcp-test` namespace. It validated per-tool, per-group access control across two test servers:
 
 | | greet | add_tool | hello_world | auth1234 | set_time |
 |---|---|---|---|---|---|
@@ -136,72 +152,13 @@ Two test servers with distinct tools, five access control patterns:
 ./scripts/mcp-client.sh
 ```
 
+> **Note:** The interactive client is configured for the Phases 1-15 shared gateway. It needs updating to target the `team-a` namespace gateway (via port-forward).
+
 Authenticates against Keycloak via browser-based device flow, then drops into a tool-calling REPL. Log in as any user (alice/alice, bob/bob, carol/carol). Use `/login` to switch users, `/tools` to list tools, `/whoami` to check identity.
 
-```bash
-╰─ ./scripts/mcp-client.sh                                                           ─╯
-Requesting device code...
-
-==========================================
-  Open this URL in your browser:
-
-  http://keycloak.127-0-0-1.sslip.io:8002/realms/mcp/device?user_code=VTVY-ZGVW
-
-  Or go to: http://keycloak.127-0-0-1.sslip.io:8002/realms/mcp/device
-  and enter code: VTVY-ZGVW
-==========================================
-
-Waiting for you to log in...
-
-Authenticated as: 0e8ae6e5-1e7c-491a-b1d2-81bb26668110 (groups: developers)
-
-Initializing MCP session...
-Session established.
-
-Available tools:
-----------------
-  github_get_commit(include_diff, owner, page, perPage, repo, sha) — Get details for a commit from a GitHub repository
-  github_get_file_contents(owner, path, ref, repo, sha) — Get the contents of a file or directory from a GitHub repository
-  github_get_label(name, owner, repo) — Get a specific label from a repository.
-  github_get_latest_release(owner, repo) — Get the latest release in a GitHub repository
-  github_get_me() — Get details of the authenticated GitHub user. Use this when a request is about the user's own profile for GitHub. Or when information is missing to build other tool calls.
-  github_get_release_by_tag(owner, repo, tag) — Get a specific release by its tag name in a GitHub repository
-  github_get_tag(owner, repo, tag) — Get details about a specific git tag in a GitHub repository
-  github_get_team_members(org, team_slug) — Get member usernames of a specific team in an organization. Limited to organizations accessible with current credentials
-  github_get_teams(user) — Get details of the teams the user is a member of. Limited to organizations accessible with current credentials
-  github_issue_read(issue_number, method, owner, page, perPage, repo) — Get information about a specific issue in a GitHub repository.
-  github_list_branches(owner, page, perPage, repo) — List branches in a GitHub repository
-  github_list_commits(author, owner, page, perPage, repo, sha) — Get list of commits of a branch in a GitHub repository. Returns at least 30 results per page by default, but can return more if specified using the perPage parameter (up to 100).
-  github_list_issue_types(owner) — List supported issue types for repository owner (organization).
-  github_list_issues(after, direction, labels, orderBy, owner, perPage, repo, since, state) — List issues in a GitHub repository. For pagination, use the 'endCursor' from the previous response's 'pageInfo' in the 'after' parameter.
-  github_list_pull_requests(base, direction, head, owner, page, perPage, repo, sort, state) — List pull requests in a GitHub repository. If the user specifies an author, then DO NOT use this tool and use the search_pull_requests tool instead.
-  github_list_releases(owner, page, perPage, repo) — List releases in a GitHub repository
-  github_list_tags(owner, page, perPage, repo) — List git tags in a GitHub repository
-  github_pull_request_read(method, owner, page, perPage, pullNumber, repo) — Get information on a specific pull request in GitHub repository.
-  github_search_code(order, page, perPage, query, sort) — Fast and precise code search across ALL GitHub repositories using GitHub's native search engine. Best for finding exact symbols, functions, classes, or specific code patterns.
-  github_search_issues(order, owner, page, perPage, query, repo, sort) — Search for issues in GitHub repositories using issues search syntax already scoped to is:issue
-  github_search_pull_requests(order, owner, page, perPage, query, repo, sort) — Search for pull requests in GitHub repositories using issues search syntax already scoped to is:pr
-  github_search_repositories(minimal_output, order, page, perPage, query, sort) — Find GitHub repositories by name, description, readme, topics, or other metadata. Perfect for discovering projects, finding examples, or locating specific repositories across GitHub.
-  github_search_users(order, page, perPage, query, sort) — Find GitHub users by username, real name, or other profile information. Useful for locating developers, contributors, or team members.
-  test_server1_add_tool(description, name) — dynamically add a new tool (triggers notifications/tools/list_changed)
-  test_server1_greet(name) — say hi
-  test_server1_headers() — get headers
-  test_server1_slow(seconds) — delay N seconds
-  test_server1_time() — get current time
-  test_server2_auth1234() — check authorization header
-  test_server2_headers() — get HTTP headers
-  test_server2_hello_world(name) — Say hello to someone
-  test_server2_pour_chocolate_into_mold(quantity) — Pour chocolate into mold
-  test_server2_set_time(time) — Set the clock
-  test_server2_slow(seconds) — Delay for N seconds
-  test_server2_time() — Get the current time
-
-Enter tool calls as: tool_name {"param": "value"}
-  or with key=value:  tool_name name=luffy
-Commands: /login (switch user), /tools, /whoami, /raw METHOD {params}, /quit
-```
-
 ### Quick Test (curl)
+
+> **Note:** The URLs below reference the Phases 1-15 shared gateway (NodePort on port 8001). For the current `team-a` namespace, use `kubectl port-forward` to the team-a gateway and adjust URLs accordingly.
 
 ```bash
 # Get a token (direct access grant)
@@ -209,7 +166,7 @@ TOKEN=$(curl -s -X POST http://keycloak.127-0-0-1.sslip.io:8002/realms/mcp/proto
   -d 'grant_type=password&client_id=mcp-cli&username=alice&password=alice&scope=openid groups' \
   | python3 -c "import sys,json; print(json.load(sys.stdin)['access_token'])")
 
-# Initialize an MCP session
+# Initialize an MCP session (adjust URL for team-a port-forward)
 SESSION=$(curl -si -H "Authorization: Bearer $TOKEN" \
   -H "Content-Type: application/json" \
   -d '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-03-26","capabilities":{},"clientInfo":{"name":"test","version":"1.0"}}}' \
@@ -227,29 +184,27 @@ curl -s -H "Authorization: Bearer $TOKEN" \
 
 | Service | URL | Description |
 |---------|-----|-------------|
-| MCP Gateway (HTTP) | http://mcp.127-0-0-1.sslip.io:8001/mcp | Envoy gateway (authenticated) |
-| MCP Gateway (HTTPS) | https://mcp.127-0-0-1.sslip.io:8443/mcp | TLS-terminated (use `--cacert /tmp/mcp-ca.crt`) |
 | Keycloak (HTTP) | http://keycloak.127-0-0-1.sslip.io:8002 | OIDC provider (admin: admin/admin) |
 | Keycloak (HTTPS) | https://keycloak.127-0-0-1.sslip.io:8445 | TLS-terminated (use `--cacert /tmp/mcp-ca.crt`) |
-| MCP Launcher | http://localhost:8004 | Catalog UI + deployment |
 | Keycloak OIDC Discovery | http://keycloak.127-0-0-1.sslip.io:8002/realms/mcp/.well-known/openid-configuration | Realm endpoints |
 | Vault | ClusterIP only (`vault.vault.svc:8200`) | Dev mode, root token: `root` |
+| team-a MCP Gateway | `kubectl port-forward -n team-a svc/<gateway-svc> 8080:80` | Per-namespace gateway (port-forward) |
 
 ## Test Users
 
 All passwords match the username.
 
-| User | Password | Groups | Server1 access | Server2 access |
-|------|----------|--------|----------------|----------------|
-| alice | alice | developers | greet | set_time |
-| bob | bob | ops | add_tool | auth1234, set_time |
-| carol | carol | developers, ops | greet, add_tool | auth1234, set_time |
+| User | Password | Groups |
+|------|----------|--------|
+| alice | alice | developers |
+| bob | bob | ops |
+| carol | carol | developers, ops |
 
 ## Repository Structure
 
 ```
 ├── docs/
-│   ├── experimentation.md                      # Full experiment narrative (Phases 1-14)
+│   ├── experimentation.md                      # Full experiment narrative (Phases 1-16+)
 │   ├── changes-tracker.md                      # Code changes + friction points
 │   └── diagrams/
 │       ├── component-architecture.mermaid      # Cluster component map
@@ -260,7 +215,6 @@ All passwords match the username.
 ├── infrastructure/
 │   ├── kind/                                   # Kind cluster config (HTTP + HTTPS ports)
 │   ├── istio/                                  # Istio (Sail operator) config
-│   ├── gateway/                                # Gateway namespace, resource, nodeport
 │   ├── metallb/                                # MetalLB IP pool script
 │   ├── cert-manager/                           # CA issuers + TLSPolicy
 │   ├── mcp-gateway/                            # CRDs + controller/broker deployment
@@ -268,15 +222,13 @@ All passwords match the username.
 │   ├── kuadrant/                               # Kuadrant CR
 │   ├── catalog/                                # Catalog API + PostgreSQL
 │   ├── keycloak/                               # Keycloak deployment + realm import + TLS
-│   ├── launcher/                               # MCP Launcher deployment + RBAC
 │   ├── operator-gateway/                       # Operator gateway RBAC additions
 │   ├── vault/                                  # Vault deployment + configuration script
-│   ├── auth/                                   # Kuadrant AuthPolicies (gateway + per-server + Vault exchange)
-│   └── test-servers/                           # MCPServer CRs for test-server1, test-server2, and GitHub
+│   └── team-a/                                 # Team-A namespace: gateway, MCP extension, test servers
 ├── scripts/
 │   ├── guided-setup.sh                         # Interactive guided setup with gum TUI
-│   ├── setup.sh                                # Non-interactive full cluster setup (16 phases)
-│   ├── test-pipeline.sh                        # Full pipeline + auth matrix + TLS + Vault (63 checks)
+│   ├── setup.sh                                # Non-interactive full cluster setup
+│   ├── test-pipeline.sh                        # Full pipeline + auth matrix + TLS + Vault tests
 │   ├── test-auth-matrix.sh                     # Auth matrix only (subset of test-pipeline)
 │   ├── mcp-client.sh                           # Interactive MCP client (device auth flow)
 │   └── store-github-pat.sh                     # Store a GitHub PAT in Vault for a Keycloak user
@@ -315,4 +267,6 @@ The experiment surfaced several integration friction points documented in detail
 
 8. **MCP servers that only read credentials from environment variables force per-user deployments** — the GitHub MCP server accepts `Authorization: Bearer` headers in HTTP mode, making per-user Vault credential injection possible. Servers that only read tokens from env vars (e.g., Slack MCP server) require a separate deployment per user — the gateway can't inject credentials into environment variables at request time.
 
-See [docs/experimentation.md](docs/experimentation.md) for the full narrative including the auth layer investigation (Istio 403 vs OAuth 401), the OIDC/PKCE flow, the Keycloak migration, the per-tool authorization evolution, and the Vault credential exchange flow.
+9. **Namespace-isolated gateways enable multi-tenancy** — moving from a shared gateway in `gateway-system` to a gateway-per-namespace model (Phase 16) provides team-level isolation. Each namespace gets its own Gateway, MCP gateway extension, and servers, avoiding cross-team routing conflicts and enabling independent lifecycle management.
+
+See [docs/experimentation.md](docs/experimentation.md) for the full narrative including the auth layer investigation (Istio 403 vs OAuth 401), the OIDC/PKCE flow, the Keycloak migration, the per-tool authorization evolution, the Vault credential exchange flow, and the multi-tenancy refactoring.

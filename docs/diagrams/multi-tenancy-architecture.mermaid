@@ -1,0 +1,106 @@
+%%{ init: { 'theme': 'base', 'themeVariables': { 'primaryColor': '#e8f4fd', 'primaryBorderColor': '#2196F3', 'secondaryColor': '#fff3e0', 'tertiaryColor': '#e8f5e9' } } }%%
+
+graph TB
+    %% External clients
+    client["Client (authenticated via Keycloak)"]
+
+    subgraph cluster["Kind Cluster"]
+
+        subgraph control-plane["Shared Control Plane (cluster-scoped)"]
+            catalog["Catalog API<br/>(catalog-system)"]
+            operator["Lifecycle Operator<br/>(mcp-lifecycle-operator-system)"]
+            mcp-ctrl["MCP Controller<br/>(mcp-system)"]
+            keycloak["Keycloak<br/>(keycloak)"]
+            vault["Vault<br/>(vault)"]
+            authorino["Authorino<br/>(kuadrant-system)"]
+            limitador["Limitador<br/>(kuadrant-system)"]
+            istiod["istiod<br/>(istio-system)"]
+            cert-mgr["cert-manager"]
+        end
+
+        subgraph team-a["team-a namespace"]
+            gw-a["Gateway<br/>(Envoy)"]
+            broker-a["Broker / Router"]
+            server-a1["test-server-a1<br/>(5 tools)"]
+            server-a2["test-server-a2<br/>(7 tools)"]
+            config-a["Config Secret"]
+
+            gw-a --> broker-a
+            broker-a --> server-a1
+            broker-a --> server-a2
+            broker-a -.- config-a
+        end
+
+        subgraph team-b["team-b namespace (planned)"]
+            gw-b["Gateway<br/>(Envoy)"]
+            broker-b["Broker / Router"]
+            server-b1["server-b1"]
+            server-b2["server-b2"]
+
+            gw-b --> broker-b
+            broker-b --> server-b1
+            broker-b --> server-b2
+        end
+
+        subgraph team-c["team-c namespace (planned)"]
+            gw-c["Gateway<br/>(Envoy)"]
+            broker-c["Broker / Router"]
+            server-c1["server-c1"]
+
+            gw-c --> broker-c
+            broker-c --> server-c1
+        end
+
+        %% Control plane --> team namespaces (dashed = control plane)
+        operator -.->|"watches MCPServer CRs,<br/>creates Deployments,<br/>Services, HTTPRoutes,<br/>MCPServerRegistrations"| team-a
+        operator -.-> team-b
+        operator -.-> team-c
+
+        mcp-ctrl -.->|"watches MCPGatewayExtension,<br/>deploys broker/router"| broker-a
+        mcp-ctrl -.->|"watches MCPServerRegistrations,<br/>writes config"| config-a
+        mcp-ctrl -.-> broker-b
+        mcp-ctrl -.-> broker-c
+
+        istiod -.->|"programs Envoy<br/>via xDS"| gw-a
+        istiod -.-> gw-b
+        istiod -.-> gw-c
+
+        authorino -.->|"enforces AuthPolicy<br/>per namespace"| gw-a
+        authorino -.-> gw-b
+        authorino -.-> gw-c
+
+        limitador -.->|"rate limits"| gw-a
+
+        cert-mgr -.->|"TLS certs"| gw-a
+
+        %% Auth relationships (dashed)
+        authorino -.->|"JWKS validation"| keycloak
+        authorino -.->|"credential exchange"| vault
+        vault -.->|"JWT auth via"| keycloak
+    end
+
+    %% Client connections (solid = data path)
+    client -->|"HTTPS"| gw-a
+    client -->|"HTTPS"| gw-b
+    client -->|"HTTPS"| gw-c
+    client -.->|"authenticate (OIDC)"| keycloak
+
+    %% Isolation note
+    isolation["Each namespace is an isolation boundary.<br/>Broker only sees its own servers.<br/>Users access teams via Keycloak group membership."]
+
+    %% Styles
+    classDef controlPlane fill:#e8f4fd,stroke:#2196F3,stroke-width:1px
+    classDef activeNs fill:none,stroke:#4CAF50,stroke-width:2px
+    classDef plannedNs fill:none,stroke:#9E9E9E,stroke-width:2px,stroke-dasharray:5 5
+    classDef activeComponent fill:#e8f5e9,stroke:#4CAF50,stroke-width:1px
+    classDef plannedComponent fill:#f5f5f5,stroke:#BDBDBD,stroke-width:1px,color:#9E9E9E
+    classDef external fill:#f3e5f5,stroke:#9C27B0,stroke-width:2px
+    classDef note fill:#FFFDE7,stroke:#FBC02D,stroke-width:1px,font-size:12px
+
+    class catalog,operator,mcp-ctrl,keycloak,vault,authorino,limitador,istiod,cert-mgr controlPlane
+    class team-a activeNs
+    class team-b,team-c plannedNs
+    class gw-a,broker-a,server-a1,server-a2,config-a activeComponent
+    class gw-b,broker-b,server-b1,server-b2,gw-c,broker-c,server-c1 plannedComponent
+    class client external
+    class isolation note

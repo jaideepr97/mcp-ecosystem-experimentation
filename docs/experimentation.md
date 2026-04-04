@@ -117,6 +117,12 @@ This document captures both the technical outcomes and the learning process: wha
   - [Ecosystem deployment topology](#ecosystem-deployment-topology)
   - [Credential patterns at scale](#credential-patterns-at-scale)
   - [The concrete plan](#the-concrete-plan)
+- [Phase 16: Namespace-Isolated Gateway](#phase-16-namespace-isolated-gateway)
+  - [Infrastructure setup](#infrastructure-setup-1)
+  - [How namespace isolation works](#how-namespace-isolation-works)
+  - [Verification: server isolation](#verification-server-isolation)
+  - [End-to-end tool call routing](#end-to-end-tool-call-routing)
+  - [Resource footprint](#resource-footprint)
 - [Key Learnings](#key-learnings)
 - [Reflection: How AI Was Used in This Experiment](#reflection-how-ai-was-used-in-this-experiment)
   - [Pattern of interaction](#pattern-of-interaction)
@@ -1734,6 +1740,54 @@ The implementation was structured into phases that separate new concepts from fu
 
 ---
 
+## Phase 16: Namespace-Isolated Gateway
+
+With the design scoping complete, Phase 16 implemented the first item from the concrete plan: a namespace-isolated gateway deployment for `team-a`. The goal was to verify that a team namespace with its own Gateway and MCPGatewayExtension provides complete server isolation — no cross-namespace tool leakage between gateways.
+
+### Infrastructure setup
+
+Six resources were created in `infrastructure/team-a/`:
+
+- `namespace.yaml` — the `team-a` namespace
+- `gateway.yaml` — `team-a-gateway` using `gatewayClassName: istio`
+- `mcpgatewayextension.yaml` — `team-a-gateway-extension` targeting the team-a gateway
+- `test-server-a1.yaml` — test server with 5 tools
+- `test-server-a2.yaml` — test server with 7 tools
+
+The MCPServer CRs use the `mcp.x-k8s.io/gateway-ref: team-a/team-a-gateway` annotation so the lifecycle operator creates HTTPRoutes targeting team-a's gateway rather than the shared gateway in `gateway-system`.
+
+### How namespace isolation works
+
+The isolation mechanism is architectural, not policy-based. Each MCPGatewayExtension triggers the mcp-controller to deploy a broker/router pod in that namespace. The controller writes server configuration to an `mcp-gateway-config` Secret scoped to the MCPGatewayExtension's namespace. Since each broker reads only its own namespace's config Secret, it is physically impossible for one broker to discover servers registered against a different gateway.
+
+The Gateway itself uses `gatewayClassName: istio`, which causes Istio to automatically create a dedicated Envoy pod for that gateway. Traffic entering through team-a's Envoy is routed to team-a's broker/router, which only knows about team-a's servers.
+
+### Verification: server isolation
+
+Server isolation was verified by querying both brokers:
+
+- **team-a's broker**: 12 tools (5 from test-server-a1 + 7 from test-server-a2)
+- **mcp-test's broker**: 35 tools (23 from GitHub + 5 from server1 + 7 from server2)
+
+Zero cross-namespace tool leakage. Each broker sees exactly the servers registered against its gateway — no more, no less. The per-MCPGatewayExtension namespace config Secret is the isolation boundary.
+
+### End-to-end tool call routing
+
+Tool calls through the new gateway were verified end-to-end: client request → team-a's Gateway Envoy → team-a's Router (ext_proc) → upstream server. The Router correctly identifies the target server from the JSON-RPC body, sets routing headers, and Envoy forwards to the upstream service — the same flow as the shared gateway, but entirely within team-a's namespace.
+
+### Resource footprint
+
+Each gateway-per-namespace deployment creates 4 pods:
+
+1. Gateway Envoy (auto-created by Istio from the Gateway CR)
+2. Broker/Router (auto-created by the mcp-controller from the MCPGatewayExtension)
+3. test-server-a1 (upstream MCP server)
+4. test-server-a2 (upstream MCP server)
+
+The operator, catalog, Keycloak, and Vault remain shared at the cluster level — they are not duplicated per namespace. This means the per-team incremental cost is the gateway infrastructure (2 pods) plus whatever MCP servers the team deploys.
+
+---
+
 ## Key Learnings
 
 1. **Istio is not a service mesh here** — only istiod is used, purely as a Gateway API controller that programs Envoy. No sidecars, no ambient mode.
@@ -1837,6 +1891,8 @@ The implementation was structured into phases that separate new concepts from fu
     Notably, Phase 2 also diminishes the role of VirtualMCPServers significantly. When Keycloak's `resource_access` claim defines per-user tool permissions at the individual tool level (not server level), and the `x-authorized-tools` wristband JWT handles `tools/list` filtering, VirtualMCPServers become redundant for access control. Their only remaining use case is workflow-specific tool scoping — an AI agent wanting a focused subset of its authorized tools to reduce LLM context — which is a client-side UX concern, not a platform concern. This matters for RHAISTRAT-1149 documentation: VirtualMCPServers are a key best practice in Phase 1 (the only tool visibility mechanism), but their importance drops substantially once Phase 2 is adopted. The documentation should be clear about which auth phase the deployment is targeting.
 
     This is a case where the experimentation process — building with Phase 1 primitives, hitting scalability walls, and reasoning about what a better architecture would look like — led us to independently identify the same problems the gateway team had already designed solutions for. The findings remain valid as documentation of Phase 1 limitations and as motivation for why Phase 2 is necessary. Example sample AuthPolicies for both patterns are available at `config/samples/oauth-token-exchange/tools-list-auth.yaml` and `tools-call-auth.yaml` in the mcp-gateway repo.
+
+47. **Namespace-isolated gateway provides complete server isolation via per-namespace config Secrets** — the mcp-controller writes server configuration to an `mcp-gateway-config` Secret scoped to each MCPGatewayExtension's namespace. Since each broker reads only its own namespace's config Secret, server isolation is architectural, not policy-based. A team's broker physically cannot discover servers registered against a different gateway. Combined with Istio's automatic per-Gateway Envoy pod creation, each namespace gets a fully independent request path: dedicated Envoy → dedicated broker/router → namespace-local upstream servers. The shared cluster services (operator, catalog, Keycloak, Vault) are not duplicated — the per-team incremental cost is 2 infrastructure pods (Envoy + broker/router) plus the team's MCP servers.
 
 ---
 

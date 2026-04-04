@@ -1,0 +1,13 @@
+apiVersion: mcp.kuadrant.io/v1alpha1
+kind: MCPGatewayExtension
+metadata:
+  name: team-a-gateway-extension
+  namespace: team-a
+spec:
+  publicHost: team-a.mcp.127-0-0-1.sslip.io
+  targetRef:
+    group: gateway.networking.k8s.io
+    kind: Gateway
+    name: team-a-gateway
+    namespace: team-a
+    sectionName: mcp
