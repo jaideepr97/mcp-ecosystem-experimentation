@@ -2,6 +2,8 @@
 
 A reproducible experiment exploring how four MCP ecosystem projects work together end-to-end: **discovery** (model-registry catalog), **deployment** (lifecycle operator), **routing** (mcp-gateway), and **authentication** (Istio + custom OIDC provider).
 
+Powered heavily by Claude Code 
+
 > **Note**: This is the `basic` branch — it covers Phases 1-11 of the experiment, using mini-oidc for authentication and Istio for JWT validation. The `main` branch extends this with Keycloak, Kuadrant/Authorino, and per-tool authorization.
 
 ## Acknowledgements
