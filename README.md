@@ -1,8 +1,10 @@
-# MCP Ecosystem Experimentation
+# MCP Ecosystem Experimentation (Intermediate)
 
 A reproducible experiment exploring how MCP ecosystem projects work together end-to-end: **discovery** (model-registry catalog), **deployment** (lifecycle operator), **routing** (mcp-gateway), **authentication** (Keycloak + Kuadrant/Authorino), **per-tool authorization** (AuthPolicy with CEL predicates), **TLS** (cert-manager + Kuadrant TLSPolicy), and **per-user credential exchange** (Vault token exchange for upstream API tokens).
 
 Powered heavily by Claude Code 
+
+> **Note**: This is the `intermediate` branch — it covers Phases 1-16 of the experiment, adding Keycloak, Kuadrant/Authorino, per-tool authorization, TLS, Vault credential exchange, and GitHub MCP server integration on top of the `basic` branch. See [`basic`](../../tree/basic) for a simpler setup with mini-oidc authentication, or [`main`](../../tree/main) for the latest development branch.
 
 ## Acknowledgements
 
