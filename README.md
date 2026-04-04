@@ -47,6 +47,8 @@ Walk through each phase interactively with explanations of what each component d
 ./scripts/guided-setup.sh
 ```
 
+![Guided Setup](docs/images/guided-setup.gif)
+
 Features:
 - Rich TUI powered by [gum](https://github.com/charmbracelet/gum)
 - Each phase explains what it deploys and why before prompting you to continue
