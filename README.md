@@ -82,7 +82,7 @@ To reuse an existing Kind cluster:
 ### Tear down
 
 ```bash
-kind delete cluster --name mcp-gateway
+kind delete cluster --name mcp-ecosystem
 ```
 
 ## Verifying the Setup

@@ -1984,7 +1984,7 @@ spec:
         - --health-probe-bind-address=:8081
         command:
         - /manager
-        image: quay.io/jrao/mcp-lifecycle-operator:gateway-integration
+        image: quay.io/jrao/mcp-lifecycle-operator:gateway-credential-ref
         livenessProbe:
           httpGet:
             path: /healthz

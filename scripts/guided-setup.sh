@@ -19,7 +19,7 @@ set -uo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_DIR="$(cd "${SCRIPT_DIR}/.." && pwd)"
 STATE_FILE="${REPO_DIR}/.setup-state"
-KIND_CLUSTER_NAME="mcp-gateway"
+KIND_CLUSTER_NAME="mcp-ecosystem"
 CONTAINER_ENGINE="${CONTAINER_ENGINE:-docker}"
 BATCH_MODE=false
 START_PHASE=1
@@ -193,7 +193,7 @@ if [ "$START_PHASE" -le 1 ]; then
 show_phase 1 "Kind Cluster" "
 ## What this does
 
-Creates a **Kind** (Kubernetes in Docker) cluster named \`mcp-gateway\` with custom
+Creates a **Kind** (Kubernetes in Docker) cluster named \`mcp-ecosystem\` with custom
 port mappings so you can reach services from your host machine.
 
 ## Why
@@ -213,7 +213,7 @@ your browser and curl.
 ## What gets created
 
 - A Kind cluster node (Docker container running Kubernetes)
-- kubectl context set to \`kind-mcp-gateway\`
+- kubectl context set to \`kind-mcp-ecosystem\`
 "
 
 if confirm_phase 1; then
@@ -581,7 +581,7 @@ The operator image is pre-built and loaded into Kind from a container registry.
 "
 
 if confirm_phase 8; then
-  OPERATOR_IMAGE="quay.io/jrao/mcp-lifecycle-operator:gateway-integration"
+  OPERATOR_IMAGE="quay.io/jrao/mcp-lifecycle-operator:gateway-credential-ref"
   run_cmd "Pulling operator image..." \
     ${CONTAINER_ENGINE} pull "${OPERATOR_IMAGE}"
   TMP_TAR="/tmp/operator-image-$$.tar"

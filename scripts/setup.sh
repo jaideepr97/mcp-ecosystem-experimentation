@@ -16,7 +16,7 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_DIR="$(cd "${SCRIPT_DIR}/.." && pwd)"
-KIND_CLUSTER_NAME="mcp-gateway"
+KIND_CLUSTER_NAME="mcp-ecosystem"
 CONTAINER_ENGINE="${CONTAINER_ENGINE:-docker}"
 
 # Auto-detect podman: check if docker is missing or if docker is actually podman
@@ -158,7 +158,7 @@ kubectl wait --for=condition=Ready mcpgatewayextension/mcp-gateway-extension -n 
 ########################################
 # Pre-load the image into Kind so it doesn't need to pull from registry
 info "Loading lifecycle operator image into Kind..."
-OPERATOR_IMAGE="quay.io/jrao/mcp-lifecycle-operator:gateway-integration"
+OPERATOR_IMAGE="quay.io/jrao/mcp-lifecycle-operator:gateway-credential-ref"
 ${CONTAINER_ENGINE} pull "${OPERATOR_IMAGE}" 2>/dev/null || true
 TMP_TAR="/tmp/operator-image-$$.tar"
 ${CONTAINER_ENGINE} save "${OPERATOR_IMAGE}" -o "${TMP_TAR}"
