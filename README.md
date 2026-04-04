@@ -124,7 +124,70 @@ Two test servers with distinct tools, five access control patterns:
 ./scripts/mcp-client.sh
 ```
 
-Authenticates via browser-based device flow, then drops into a tool-calling REPL. Log in as any user (alice/alice, bob/bob, carol/carol). Use `/login` to switch users, `/tools` to list tools, `/whoami` to check identity.
+Authenticates against Keycloak via browser-based device flow, then drops into a tool-calling REPL. Log in as any user (alice/alice, bob/bob, carol/carol). Use `/login` to switch users, `/tools` to list tools, `/whoami` to check identity.
+
+```bash
+╰─ ./scripts/mcp-client.sh                                                           ─╯
+Requesting device code...
+
+==========================================
+  Open this URL in your browser:
+
+  http://keycloak.127-0-0-1.sslip.io:8002/realms/mcp/device?user_code=VTVY-ZGVW
+
+  Or go to: http://keycloak.127-0-0-1.sslip.io:8002/realms/mcp/device
+  and enter code: VTVY-ZGVW
+==========================================
+
+Waiting for you to log in...
+
+Authenticated as: 0e8ae6e5-1e7c-491a-b1d2-81bb26668110 (groups: developers)
+
+Initializing MCP session...
+Session established.
+
+Available tools:
+----------------
+  github_get_commit(include_diff, owner, page, perPage, repo, sha) — Get details for a commit from a GitHub repository
+  github_get_file_contents(owner, path, ref, repo, sha) — Get the contents of a file or directory from a GitHub repository
+  github_get_label(name, owner, repo) — Get a specific label from a repository.
+  github_get_latest_release(owner, repo) — Get the latest release in a GitHub repository
+  github_get_me() — Get details of the authenticated GitHub user. Use this when a request is about the user's own profile for GitHub. Or when information is missing to build other tool calls.
+  github_get_release_by_tag(owner, repo, tag) — Get a specific release by its tag name in a GitHub repository
+  github_get_tag(owner, repo, tag) — Get details about a specific git tag in a GitHub repository
+  github_get_team_members(org, team_slug) — Get member usernames of a specific team in an organization. Limited to organizations accessible with current credentials
+  github_get_teams(user) — Get details of the teams the user is a member of. Limited to organizations accessible with current credentials
+  github_issue_read(issue_number, method, owner, page, perPage, repo) — Get information about a specific issue in a GitHub repository.
+  github_list_branches(owner, page, perPage, repo) — List branches in a GitHub repository
+  github_list_commits(author, owner, page, perPage, repo, sha) — Get list of commits of a branch in a GitHub repository. Returns at least 30 results per page by default, but can return more if specified using the perPage parameter (up to 100).
+  github_list_issue_types(owner) — List supported issue types for repository owner (organization).
+  github_list_issues(after, direction, labels, orderBy, owner, perPage, repo, since, state) — List issues in a GitHub repository. For pagination, use the 'endCursor' from the previous response's 'pageInfo' in the 'after' parameter.
+  github_list_pull_requests(base, direction, head, owner, page, perPage, repo, sort, state) — List pull requests in a GitHub repository. If the user specifies an author, then DO NOT use this tool and use the search_pull_requests tool instead.
+  github_list_releases(owner, page, perPage, repo) — List releases in a GitHub repository
+  github_list_tags(owner, page, perPage, repo) — List git tags in a GitHub repository
+  github_pull_request_read(method, owner, page, perPage, pullNumber, repo) — Get information on a specific pull request in GitHub repository.
+  github_search_code(order, page, perPage, query, sort) — Fast and precise code search across ALL GitHub repositories using GitHub's native search engine. Best for finding exact symbols, functions, classes, or specific code patterns.
+  github_search_issues(order, owner, page, perPage, query, repo, sort) — Search for issues in GitHub repositories using issues search syntax already scoped to is:issue
+  github_search_pull_requests(order, owner, page, perPage, query, repo, sort) — Search for pull requests in GitHub repositories using issues search syntax already scoped to is:pr
+  github_search_repositories(minimal_output, order, page, perPage, query, sort) — Find GitHub repositories by name, description, readme, topics, or other metadata. Perfect for discovering projects, finding examples, or locating specific repositories across GitHub.
+  github_search_users(order, page, perPage, query, sort) — Find GitHub users by username, real name, or other profile information. Useful for locating developers, contributors, or team members.
+  test_server1_add_tool(description, name) — dynamically add a new tool (triggers notifications/tools/list_changed)
+  test_server1_greet(name) — say hi
+  test_server1_headers() — get headers
+  test_server1_slow(seconds) — delay N seconds
+  test_server1_time() — get current time
+  test_server2_auth1234() — check authorization header
+  test_server2_headers() — get HTTP headers
+  test_server2_hello_world(name) — Say hello to someone
+  test_server2_pour_chocolate_into_mold(quantity) — Pour chocolate into mold
+  test_server2_set_time(time) — Set the clock
+  test_server2_slow(seconds) — Delay for N seconds
+  test_server2_time() — Get the current time
+
+Enter tool calls as: tool_name {"param": "value"}
+  or with key=value:  tool_name name=luffy
+Commands: /login (switch user), /tools, /whoami, /raw METHOD {params}, /quit
+```
 
 ### Quick Test (curl)
 
