@@ -4,6 +4,18 @@ A reproducible experiment exploring how MCP ecosystem projects work together end
 
 Powered heavily by Claude Code 
 
+## Branches
+
+This repo has three branches at increasing levels of complexity:
+
+| Branch | Phases | What it covers |
+|--------|--------|----------------|
+| [`basic`](../../tree/basic) | 1-10 | Core pipeline: Kind + Istio + mcp-gateway + lifecycle operator + catalog + mini-oidc authentication |
+| [`intermediate`](../../tree/intermediate) | 1-16 | Adds Keycloak, Kuadrant/Authorino, per-tool authorization, TLS, Vault credential exchange, GitHub MCP server |
+| [`main`](../../tree/main) | 1-16+ | Active development — production deployment patterns, advanced configuration |
+
+Start with `basic` to understand the fundamentals, then move to `intermediate` for the full auth and security stack.
+
 ## Acknowledgements
 
 - [@matzew](https://github.com/matzew) for [mcp-launcher](https://github.com/matzew/mcp-launcher) — the catalog UI and deployment frontend used in this experiment (forked with catalog API integration)
