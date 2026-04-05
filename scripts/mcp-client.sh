@@ -10,7 +10,7 @@ set -uo pipefail
 # Note: not using set -e — the interactive loop needs to survive individual command failures
 
 KEYCLOAK_URL="${KEYCLOAK_URL:-http://keycloak.127-0-0-1.sslip.io:8002}"
-GATEWAY_URL="${GATEWAY_URL:-http://mcp.127-0-0-1.sslip.io:8001}"
+GATEWAY_URL="${GATEWAY_URL:-http://team-a.mcp.127-0-0-1.sslip.io:8001}"
 CLIENT_ID="${CLIENT_ID:-mcp-cli}"
 REALM="${REALM:-mcp}"
 SCOPE="${SCOPE:-openid groups}"

@@ -1,36 +1,31 @@
 # Session Handoff — Current State
 
-**Date**: 2026-04-03
-**Last action**: Phase 15 complete — mcp-client.sh fixed, test pipeline expanded to 63 checks, docs updated
+**Date**: 2026-04-04
+**Last action**: Phase 17 complete — VirtualMCPServers + AuthPolicies + per-group tool filtering in team-a
 
 ---
 
 ## Current State Summary
 
-Phase 15 is complete. The full Vault token exchange flow works end-to-end: user authenticates with Keycloak → gateway exchanges JWT for stored credential via Vault → upstream MCP server receives the credential. The GitHub MCP server is deployed and callable through the gateway with 23 tools registered.
-
-The `mcp-client.sh` JSONDecode error has been fixed (two bugs: broken default params `\{\}` → `"{}"`, and `echo` → `printf '%s\n'` for zsh compatibility). The test pipeline now has 63 checks across 8 phases, including Vault JWT login verification and credential round-trip testing with a dummy token.
+Phase 17 is complete. The `team-a` namespace now has full per-group authorization: 3 Keycloak groups with 5 users, 3 VirtualMCPServers for tool filtering, a gateway-level AuthPolicy injecting `X-Mcp-Virtualserver` headers based on group membership, and 2 per-HTTPRoute AuthPolicies enforcing `tools/call` authorization via CEL predicates. The full authorization matrix (14/14 checks) is verified, and tool delisting from VirtualMCPServers correctly removes tools from `tools/list` while they remain callable (confirming VirtualMCPServer is filtering-only, not enforcement). All prior infrastructure (Phases 1-16) remains active.
 
 ### What was completed in this session
 
-1. **mcp-client.sh JSONDecode fix** — Root cause was two bugs:
-   - Default params in `mcp_call` was `\{\}` (literal backslash-brace, not valid JSON). When `mcp_call "tools/list"` was called without a second arg, the payload python script crashed on `json.loads('\{}')`, producing an empty curl request. Fixed to `"{}"`.
-   - `echo "$var"` in zsh interprets `\n` as newlines, corrupting JSON strings from GitHub tool descriptions (16 occurrences of `\n` in tool descriptions). Fixed all `echo` calls to `printf '%s\n'` for portability.
+1. **Keycloak groups and users** — Created 3 groups (`team-a-developers`, `team-a-ops`, `team-a-leads`) and 5 users distributed across them in Keycloak. Groups are included in JWT tokens via the `groups` claim.
 
-2. **Router hairpin auth issue resolved** — The `tools/call` 4xx via curl that was observed in the previous session no longer reproduces. Was likely a transient timing issue.
+2. **Gateway AuthPolicy** — Applied a gateway-level AuthPolicy that authenticates via Keycloak JWT and injects the `X-Mcp-Virtualserver` header based on the user's group membership, so clients never choose their virtual server directly.
 
-3. **Test pipeline Phase 8** — Added 8 new checks for Vault credential exchange:
-   - Vault pod running, JWT auth method enabled
-   - Vault JWT login with Keycloak token (via `vault write auth/jwt/login`)
-   - Vault secret round-trip: stores a dummy PAT, reads it back with the JWT-derived client token, verifies match
-   - GitHub MCPServerRegistration ready with 23 tools
-   - GitHub AuthPolicy and credential secret with correct label
+3. **3 VirtualMCPServers** — Created `virtualserver-dev`, `virtualserver-ops`, and `virtualserver-leads`, each composing a different subset of tools from `test-server-a1` and `test-server-a2` to give each group a tailored tool view.
 
-4. **Documentation updated** — README.md (pipeline description, key findings, repo structure, custom images, services table), changes-tracker.md (operator credential-ref, Vault observations, mcp-client.sh fix), progress.md.
+4. **2 per-HTTPRoute AuthPolicies** — Applied `authpolicy-server-a1` and `authpolicy-server-a2` with CEL predicates matching Keycloak groups, enforcing which groups can call tools on each server.
+
+5. **Authorization matrix verified (14/14)** — Every user tested against every tool category: correct tools visible via `tools/list`, correct `tools/call` allowed/denied per group. Full matrix passed.
+
+6. **Tool delisting test passed** — Removing a tool from a VirtualMCPServer correctly hides it from `tools/list` but the tool remains callable via `tools/call`, confirming VirtualMCPServer is filtering-only (Known Issue #5).
 
 ### Cluster State
 
-- Everything from Phase 14 still active
+- Everything from Phase 15 still active
 - Vault running in `vault` namespace (dev mode, root token: `root`)
 - Vault JWT auth method enabled, backed by Keycloak JWKS
 - Vault policy `authorino`: read `secret/data/mcp-gateway/*`
@@ -42,6 +37,22 @@ The `mcp-client.sh` JSONDecode error has been fixed (two bugs: broken default pa
 - Operator running `quay.io/jrao/mcp-lifecycle-operator:gateway-credential-ref`
 - Keycloak `mcp-gateway` client has default scopes: basic, roles, groups, mcp-gateway-audience
 - Test pipeline: 63/63 passing (8 phases)
+- **team-a namespace (Phases 16-17)**:
+  - `team-a-gateway` — Programmed, Envoy gateway in `team-a` namespace
+  - `team-a-gateway-extension` — Ready, MCPGatewayExtension in `team-a`
+  - `test-server-a1` — 5 tools, registered with `team-a` gateway
+  - `test-server-a2` — 7 tools, registered with `team-a` gateway
+  - 4 pods running in `team-a` namespace (gateway, broker, router, plus server pods)
+  - Isolation confirmed: 12 tools visible via `team-a` gateway, 35 via `mcp-test` gateway
+  - `gateway-auth-policy` — Gateway-level AuthPolicy (JWT auth + `X-Mcp-Virtualserver` injection by group)
+  - `authpolicy-server-a1` — Per-HTTPRoute AuthPolicy for test-server-a1 (CEL group predicates)
+  - `authpolicy-server-a2` — Per-HTTPRoute AuthPolicy for test-server-a2 (CEL group predicates)
+  - `virtualserver-dev` — VirtualMCPServer for developers group
+  - `virtualserver-ops` — VirtualMCPServer for ops group
+  - `virtualserver-leads` — VirtualMCPServer for leads group
+  - 5 Keycloak users across 3 groups (`team-a-developers`, `team-a-ops`, `team-a-leads`)
+  - `keycloak-auth` service — Keycloak authentication backing for AuthPolicies
+  - Authorization matrix: 14/14 checks passing
 
 ---
 
@@ -57,6 +68,8 @@ The `mcp-client.sh` JSONDecode error has been fixed (two bugs: broken default pa
 8. **Per-tool CEL predicates don't scale** — inline `patternMatching` in AuthPolicy works for experimentation but becomes unmanageable at scale (many tools × many groups). Production would need external policy engines (OPA) or coarser authorization at the namespace/gateway level.
 9. **VirtualMCPServer selection requires custom HTTP headers** — standard MCP clients (Claude Desktop, Cursor, etc.) cannot inject the `X-Mcp-Virtualserver` header. Only Gen AI Studio or custom clients can select a virtual server. Per-virtual-server URL paths (e.g., `/mcp/dev-tools`) would work with any client but the broker only exposes a single `/mcp` endpoint today.
 10. **VirtualMCPServer-to-group binding requires manual coordination across two CRD systems** — the correct pattern is platform-driven (AuthPolicy injects the header based on JWT groups, client is unaware), but this means maintaining VirtualMCPServer CRs (mcp-gateway) and AuthPolicy response rules (Kuadrant/Authorino) independently with no automatic bridging between them.
+11. **VirtualMCPServers become largely redundant under Auth Phase 2** — when Keycloak `resource_access` defines per-user tool permissions and the `x-authorized-tools` wristband JWT handles `tools/list` filtering, VirtualMCPServers no longer serve an access control function. They reduce to an optional LLM ergonomics layer for workflow-specific tool scoping. RHAISTRAT-1149 documentation should clarify their role relative to which auth phase is deployed.
+12. **VirtualMCPServer controller writes to hardcoded mcp-system namespace, not MCPGatewayExtension's namespace** — the controller always writes virtual server config to `mcp-system` regardless of which namespace the MCPGatewayExtension lives in. Workaround: manually add `virtualServers` entries to the config Secret in the target namespace.
 
 ---
 
@@ -66,51 +79,54 @@ Scope is now driven by [RHAISTRAT-1149](https://redhat.atlassian.net/browse/RHAI
 
 Chris Hambridge's comment (Jan 26) from RHAISTRAT-1084 feature refinement identified the key gaps. The next phases should demonstrate these concrete scenarios:
 
-### Phase 16: Namespace-Isolated Gateways
-- Create a second namespace (e.g., `team-b`) with its own MCP Gateway
-- Register different MCP servers per namespace
-- Show that teams cannot see each other's registered servers
-- Validates: "How can a Platform Engineer create an MCP Gateway per namespace in order to isolate registered MCP servers"
+### Design Scoping (completed)
 
-### Phase 17: VirtualMCPServer Tool Curation (analysis in progress)
+A design discussion driven by RHAISTRAT-1149 narrowed scope and uncovered key findings about VirtualMCPServers, AuthPolicy alignment, credential patterns, and ecosystem deployment topology. The full narrative is documented in `docs/experimentation.md` under "Phase 16-20: Design Scoping." Key conclusions:
 
-Investigation through code review and architecture discussion has surfaced key findings:
+- VirtualMCPServers are filtering-only (not enforcement), not identity-aware, and have no discovery API
+- Per-tool CEL predicates don't scale; Auth Phase 2 design (wristband JWTs + Keycloak resource_access) solves this but isn't available yet
+- VirtualMCPServers become largely redundant once Phase 2 is adopted
+- Clients should never choose virtual servers — platform injects via AuthPolicy response rules
+- Deployment topology: 1 catalog + 1 operator per cluster, 1 gateway per namespace, shared Keycloak + Vault
+- Three credential patterns: team-level Vault, per-user Vault (identity-bound services like Jira), OAuth2 token exchange (Phase 2)
+- K8s Secrets still needed for broker tool discovery even with Vault
 
-**How VirtualMCPServers work:**
-- CRD is minimal: just `spec.tools` (list of tool names) + `spec.description`
-- Client selects via `X-Mcp-Virtualserver: namespace/name` header
-- Broker filters `tools/list` response — filtering only, does NOT block `tools/call`
-- Can span tools across multiple registered MCP servers (tool names are already prefixed)
+### Phase 16: Namespace-Isolated Gateway (completed)
+- Created `team-a` namespace with its own Gateway + MCPGatewayExtension
+- Deployed 2 test servers (`test-server-a1` with 5 tools, `test-server-a2` with 7 tools), registered with `team-a`'s gateway via `gateway-ref` annotation
+- Isolation verified — `team-a`'s gateway sees 12 tools, `mcp-test` sees 35 tools, zero cross-namespace leakage
+- Tool call routing works through `team-a`'s Envoy gateway
 
-**Alignment with AuthPolicy:**
-- VirtualMCPServer is not per-user/group — it's selected by header
-- AuthPolicy (per-tool CEL predicates) is the actual security enforcement
-- If both are used, they must be kept in sync manually — VirtualMCPServer should only list tools the intended audience is authorized to call, otherwise users see tools they get 403 on
-- Inline CEL predicates don't scale: 50 tools × 8 groups = unmanageable
-- Better pattern: use namespace isolation + VirtualMCPServer for curation, keep AuthPolicy coarse (group can access this namespace's gateway), avoid per-tool predicates
+### Phase 17: VirtualMCPServers + AuthPolicies (completed)
+- 3 namespace-scoped Keycloak groups (`team-a-developers`, `team-a-ops`, `team-a-leads`) with 5 users
+- 3 VirtualMCPServers (one per group's tool view, cross-server tool composition)
+- 2 per-HTTPRoute AuthPolicies for `tools/call` (CEL predicates by group)
+- Gateway AuthPolicy response rule injecting `X-Mcp-Virtualserver` header based on group
+- Authorization matrix verified: 14/14 checks passing
+- Tool delisting test passed: VirtualMCPServer filtering confirmed as presentation-only (Known Issue #5)
 
-**Discovery gap:**
-- No gateway API to list available VirtualMCPServers — broker stores them internally, lookup by header only
-- Users must discover virtual servers via: `kubectl get mcpvirtualservers` (requires K8s access), out-of-band communication, or Gen AI Studio UI (not yet implemented)
-- For direct API/CLI consumers this is a friction point; for Summit MVP it gets papered over by Gen AI Studio UI
+### Phase 18: Vault Credential Patterns
+- Server 1: team-level Vault credential (keyed off group claim) — shared service account
+- Server 2: per-user Vault credentials (keyed off `sub` claim) — Jira stand-in for identity-bound services
+- K8s Secrets for broker discovery on both servers (read-only service account credentials)
+- AuthPolicies updated with Vault metadata evaluators (team-level vs per-user URL expressions)
+- Test: verify correct credential reaches upstream per user/team
 
-**Remaining Phase 17 work:**
-- Deploy sample VirtualMCPServer CRs to validate the filtering behavior end-to-end
-- Test tool delisting (remove a tool from virtual server, confirm it disappears from `tools/list` but remains callable via `tools/call`)
-- Document the recommended pattern and tradeoffs
+### Phase 19: Multi-Namespace Expansion
+- Replicate `team-a` pattern to `team-b` and `team-c`
+- Vary group-to-tool mappings across namespaces
+- 2-3 cross-namespace users (e.g., a lead with access to two teams)
+- Single operator + catalog serving all 3 namespaces
+- 15 total users distributed across namespaces
 
-### Phase 18: MCP Server/Tool Revocation Workflow
-- End-to-end removal: delist from catalog → identify deployed instances → scale down / delete → unregister from gateway (CR deletion)
-- Document the recommended order of operations
-- Validates: "MCP Server or Tool Revocation Process"
-
-### Phase 19: Rate Limiting (RateLimitPolicy)
-- Configure per-user and/or per-tool rate limits using Limitador (already deployed)
-- Falls under "security, observability, and compliance considerations" from the ticket
+### Phase 20: Rate Limiting
+- RateLimitPolicy on at least one namespace using Limitador (already deployed)
+- Falls under "security, observability, and compliance considerations" from RHAISTRAT-1149
 
 ### Deferred (out of scope for RHAISTRAT-1149)
 - Multi-cluster / ACM / DNSPolicy
-- OPA Rego / SpiceDB advanced authorization
+- Auth Phase 2 (Keycloak resource_access + wristband JWTs) — designed but not available for this experiment
+- `KeycloakToolRoleMappingPolicy` higher-level abstraction
 - Redis session store for broker HA
 - Registry and advanced aggregation (explicitly deferred in ticket)
 
@@ -134,6 +150,17 @@ Investigation through code review and architecture discussion has surfaced key f
 | `infrastructure/test-servers/github-server.yaml` | MCPServer CR for GitHub MCP server (with credential-ref annotation) |
 | `infrastructure/keycloak/realm-import.yaml` | Keycloak realm (groups + mcp-gateway-audience as default scopes) |
 | `infrastructure/catalog/catalog-sources.yaml` | Catalog with GitHub server entry (local deployment) |
+| `infrastructure/team-a/namespace.yaml` | team-a namespace definition |
+| `infrastructure/team-a/gateway.yaml` | team-a Gateway + HTTPRoute |
+| `infrastructure/team-a/mcpgatewayextension.yaml` | team-a MCPGatewayExtension |
+| `infrastructure/team-a/test-server-a1.yaml` | Test server A1 (5 tools) for team-a |
+| `infrastructure/team-a/test-server-a2.yaml` | Test server A2 (7 tools) for team-a |
+| `infrastructure/team-a/gateway-auth-policy.yaml` | Gateway-level AuthPolicy (JWT auth + X-Mcp-Virtualserver injection by group) |
+| `infrastructure/team-a/authpolicy-server-a1.yaml` | Per-HTTPRoute AuthPolicy for test-server-a1 (CEL group predicates) |
+| `infrastructure/team-a/authpolicy-server-a2.yaml` | Per-HTTPRoute AuthPolicy for test-server-a2 (CEL group predicates) |
+| `infrastructure/team-a/virtualserver-dev.yaml` | VirtualMCPServer for team-a-developers group |
+| `infrastructure/team-a/virtualserver-ops.yaml` | VirtualMCPServer for team-a-ops group |
+| `infrastructure/team-a/virtualserver-leads.yaml` | VirtualMCPServer for team-a-leads group |
 
 ## Key Ports (host → Kind NodePort → gateway)
 

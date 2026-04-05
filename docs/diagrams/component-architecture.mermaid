@@ -61,18 +61,29 @@ graph TB
             team-a-mcp-gw["mcp-gateway pod<br/>(broker + router,<br/>auto-created by controller)"]
             team-a-config-secret["Secret (config)<br/>(auto-created by controller)"]
 
+            team-a-gw-authpolicy["AuthPolicy<br/>(gateway-auth-policy)<br/>JWT auth + X-Mcp-Virtualserver<br/>injection by group"]
+
             server-a1-pod["test-server-a1 pod<br/>(MCP server :9090)<br/>5 tools: add_tool, greet,<br/>headers, slow, time"]
             server-a1-svc["test-server-a1 Service"]
             server-a1-httproute["HTTPRoute<br/>(test-server-a1)<br/>(auto-created by operator)"]
             server-a1-reg["MCPServerRegistration<br/>(test-server-a1)<br/>(auto-created by operator)"]
+            server-a1-authpolicy["AuthPolicy<br/>(authpolicy-server-a1)<br/>CEL group+tool predicates"]
 
             server-a2-pod["test-server-a2 pod<br/>(MCP server :9090)<br/>7 tools: auth1234, headers,<br/>hello_world, pour_chocolate_into_mold,<br/>set_time, slow, time"]
             server-a2-svc["test-server-a2 Service"]
             server-a2-httproute["HTTPRoute<br/>(test-server-a2)<br/>(auto-created by operator)"]
             server-a2-reg["MCPServerRegistration<br/>(test-server-a2)<br/>(auto-created by operator)"]
+            server-a2-authpolicy["AuthPolicy<br/>(authpolicy-server-a2)<br/>CEL group+tool predicates"]
+
+            vs-dev["VirtualMCPServer<br/>(virtualserver-dev)<br/>developers tool view"]
+            vs-ops["VirtualMCPServer<br/>(virtualserver-ops)<br/>ops tool view"]
+            vs-leads["VirtualMCPServer<br/>(virtualserver-leads)<br/>leads tool view"]
 
             server-a1-svc --> server-a1-pod
             server-a2-svc --> server-a2-pod
+            server-a1-authpolicy -.->|targets| server-a1-httproute
+            server-a2-authpolicy -.->|targets| server-a2-httproute
+            team-a-gw-authpolicy -.->|targets| team-a-gw
         end
 
         subgraph operator-system["mcp-lifecycle-operator-system namespace"]
@@ -131,10 +142,18 @@ graph TB
         kc-inspector-client["mcp-inspector<br/>(public, auth code + PKCE)"]
     end
 
-    subgraph kc-users["Users & Groups"]
+    subgraph kc-users["Users & Groups (mcp-test)"]
         alice["alice → developers"]
         bob["bob → ops"]
         carol["carol → developers, ops"]
+    end
+
+    subgraph kc-team-a-users["Users & Groups (team-a)"]
+        ta-alice["ta-alice → team-a-developers"]
+        ta-bob["ta-bob → team-a-ops"]
+        ta-carol["ta-carol → team-a-leads"]
+        ta-dave["ta-dave → team-a-developers, team-a-ops"]
+        ta-eve["ta-eve → team-a-ops, team-a-leads"]
     end
 
     classDef ns fill:none,stroke:#666,stroke-width:2px,stroke-dasharray:5 5
@@ -153,3 +172,6 @@ graph TB
     class postgres,catalog-cm,realm-cm,vault-secrets storage
     class client external
     class kc-gw-client,kc-cli-client,kc-inspector-client,alice,bob,carol,kc-clients,kc-users auth
+    class ta-alice,ta-bob,ta-carol,ta-dave,ta-eve,kc-team-a-users auth
+    class team-a-gw-authpolicy,server-a1-authpolicy,server-a2-authpolicy auth
+    class vs-dev,vs-ops,vs-leads cr

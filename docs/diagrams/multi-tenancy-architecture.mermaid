@@ -24,11 +24,17 @@ graph TB
             server-a1["test-server-a1<br/>(5 tools)"]
             server-a2["test-server-a2<br/>(7 tools)"]
             config-a["Config Secret"]
+            ap-gw-a["AuthPolicy (gateway)<br/>JWT + VirtualServer injection"]
+            ap-a1["AuthPolicy (server-a1)<br/>CEL group predicates"]
+            ap-a2["AuthPolicy (server-a2)<br/>CEL group predicates"]
+            vs-a["3 VirtualMCPServers<br/>(dev / ops / leads)"]
 
             gw-a --> broker-a
             broker-a --> server-a1
             broker-a --> server-a2
             broker-a -.- config-a
+            broker-a -.- vs-a
+            ap-gw-a -.- gw-a
         end
 
         subgraph team-b["team-b namespace (planned)"]
@@ -100,7 +106,7 @@ graph TB
     class catalog,operator,mcp-ctrl,keycloak,vault,authorino,limitador,istiod,cert-mgr controlPlane
     class team-a activeNs
     class team-b,team-c plannedNs
-    class gw-a,broker-a,server-a1,server-a2,config-a activeComponent
+    class gw-a,broker-a,server-a1,server-a2,config-a,ap-gw-a,ap-a1,ap-a2,vs-a activeComponent
     class gw-b,broker-b,server-b1,server-b2,gw-c,broker-c,server-c1 plannedComponent
     class client external
     class isolation note

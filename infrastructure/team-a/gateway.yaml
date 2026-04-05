@@ -16,6 +16,17 @@ spec:
       allowedRoutes:
         namespaces:
           from: Same
+    - name: mcp-https
+      hostname: 'team-a.mcp.127-0-0-1.sslip.io'
+      port: 8443
+      protocol: HTTPS
+      tls:
+        mode: Terminate
+        certificateRefs:
+          - name: team-a-gateway-mcp-https-tls
+      allowedRoutes:
+        namespaces:
+          from: Same
     - name: mcps
       port: 8080
       protocol: HTTP
