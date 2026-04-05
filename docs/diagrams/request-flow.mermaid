@@ -1,118 +1,144 @@
 %%{ init: { 'theme': 'base', 'sequence': { 'mirrorActors': false } } }%%
 
 sequenceDiagram
-    participant C as Client<br/>(mcp-client.sh)
+    participant C as AI Engineer<br/>(mcp-client.sh)
     participant KC as Keycloak<br/>(OIDC Provider)
-    participant E as Envoy Proxy<br/>(gateway-system)
-    participant R as Router<br/>(ext_proc, mcp-system)
+    participant E as Envoy Proxy<br/>(team-a namespace)
+    participant R as Router<br/>(ext_proc)
     participant A as Authorino<br/>(Wasm plugin → kuadrant-system)
     participant V as Vault<br/>(vault namespace)
-    participant B as Broker<br/>(mcp-system)
-    participant S as MCP Server<br/>(mcp-test)
+    participant B as Broker<br/>(team-a namespace)
+    participant S1 as test-server-a1<br/>(team-level credential)
+    participant S2 as test-server-a2<br/>(per-user credential)
 
-    Note over C,S: 1. Token Acquisition (Device Authorization Grant)
-    C->>KC: POST /auth/device<br/>client_id=mcp-cli&scope=openid groups
-    KC-->>C: {"device_code": "...", "user_code": "ABCD-EFGH",<br/>"verification_uri": "http://keycloak.../device"}
-    Note over C: Opens browser → user logs in
-    C->>KC: POST /token<br/>grant_type=device_code&device_code=...
+    Note over C,S2: 1. Token Acquisition
+
+    C->>KC: POST /token<br/>grant_type=password (or device_code)<br/>client_id=mcp-cli<br/>scope=openid groups
     KC-->>C: {"access_token": "eyJ...",<br/>"id_token": "...", "refresh_token": "..."}
-    Note over C: Token contains: sub, groups, iss
+    Note over C: Token contains: sub, groups<br/>(e.g. groups: ["team-a-developers"])
 
-    Note over C,S: 2. Authenticated Request (HTTP or HTTPS)
+    Note over C,S2: 2. Initialize Session
 
-    alt HTTPS (port 8443)
-        Note over C,E: TLS handshake using cert signed by mcp-ca-issuer<br/>Client verifies with --cacert /tmp/mcp-ca.crt
-        C->>E: POST https://.../mcp<br/>Authorization: Bearer eyJ...
-        Note over E: TLS terminated at Gateway.<br/>Request continues as plain HTTP internally.
-    else HTTP (port 8001)
-        C->>E: POST http://.../mcp<br/>Authorization: Bearer eyJ...
-    end
-
-    Note over E: Filter chain order:<br/>1. ext_proc (Router)<br/>2. Wasm plugin (Authorino)<br/>3. envoy.filters.http.router
+    C->>E: POST /mcp<br/>Authorization: Bearer eyJ...<br/>{"method":"initialize","params":{...}}
 
     E->>R: ext_proc: headers + body
+    Note over R: Method is "initialize"<br/>Leave :authority unchanged<br/>Set x-mcp-method header
+    R-->>E: headers unchanged
 
-    alt initialize / tools/list (aggregation path)
-        Note over C,S: 3a. Initialize or tools/list → Broker aggregates
+    Note over E: Wasm plugin calls Authorino
+    E->>A: CheckRequest (JWT)
+    Note over A: Gateway AuthPolicy (defaults):<br/>1. Validate JWT via Keycloak JWKS<br/>2. Inject X-Mcp-Virtualserver header<br/>   based on groups claim:<br/>   leads → team-a/team-a-lead-tools<br/>   ops → team-a/team-a-ops-tools<br/>   dev → team-a/team-a-dev-tools
+    A-->>E: OK + X-Mcp-Virtualserver header
 
-        Note over R: 1. Parse JSON-RPC body<br/>2. Method is "initialize" or "tools/list"<br/>3. Leave :authority unchanged<br/>4. Set x-mcp-method header
+    E->>B: POST /mcp + X-Mcp-Virtualserver
+    Note over B: Create session,<br/>store virtualserver binding
+    B-->>E: Mcp-Session-Id: eyJ...
+    E-->>C: 200 + Mcp-Session-Id header
 
-        R-->>E: :authority = mcp.127-0-0-1.sslip.io<br/>(unchanged)
+    Note over C,S2: 3. Discover Tools (tools/list) — filtered by VirtualMCPServer
 
-        Note over E: Wasm plugin calls Authorino
-        E->>A: CheckRequest (host, path, JWT)
-        Note over A: Gateway AuthPolicy (defaults):<br/>• Validate JWT via Keycloak JWKS<br/>• Skip if path contains /.well-known
-        A-->>E: OK (authorized)
+    C->>E: POST /mcp<br/>Mcp-Session-Id: eyJ...<br/>{"method":"tools/list"}
 
-        alt Missing/invalid token
-            A-->>E: DENIED
-            E-->>C: 401 Unauthorized<br/>WWW-Authenticate: Bearer<br/>resource_metadata=".../.well-known/oauth-protected-resource"
-        end
+    E->>R: ext_proc: headers + body
+    Note over R: Method is "tools/list"<br/>Leave :authority unchanged
+    R-->>E: headers unchanged
 
-        E->>B: POST /mcp<br/>{"jsonrpc":"2.0","method":"tools/list"}
+    E->>A: CheckRequest (JWT)
+    Note over A: Gateway AuthPolicy:<br/>Validate JWT ✓
+    A-->>E: OK
 
-        Note over B: Fan out to all registered<br/>upstream MCP servers.<br/>Returns ALL tools to ALL users<br/>(no identity-based filtering).
+    E->>B: POST /mcp
+    Note over B: Read VirtualMCPServer from session<br/>Fan out tools/list to all servers<br/>Filter results to only tools<br/>listed in the VirtualMCPServer
 
-        B->>S: POST /mcp → tools/list
-        S-->>B: {"tools": [{"name":"greet"}, ...]}
+    B->>S1: POST /mcp → tools/list
+    S1-->>B: 5 tools
+    B->>S2: POST /mcp → tools/list
+    S2-->>B: 7 tools
 
-        B-->>E: {"tools": [{"name":"test_server1_greet"}, ...]}
-        E-->>C: Aggregated tools/list response
+    Note over B: VirtualMCPServer filter:<br/>dev → 6 of 12 tools<br/>ops → 6 of 12 tools<br/>leads → all 12 tools
 
-    else tools/call (direct routing path)
-        Note over C,S: 3b. tools/call → Router + AuthPolicy + direct to server
+    B-->>E: Filtered tools/list (prefixed names)
+    E-->>C: {"tools": [{"name":"test_server_a1_greet"}, ...]}
 
-        Note over R: 1. Parse JSON-RPC body<br/>2. Extract tool "test_server1_greet"<br/>3. Strip prefix → "greet"<br/>4. Set headers:<br/>   :authority = test-server1.mcp.local<br/>   x-mcp-toolname = greet<br/>   x-mcp-servername = mcp-test/test-server1
+    Note over C,S2: 4a. Call Tool on server-a1 (team-level Vault credential)
 
-        R-->>E: Modified headers + body
+    C->>E: POST /mcp<br/>Mcp-Session-Id: eyJ...<br/>{"method":"tools/call","params":{"name":"test_server_a1_headers"}}
 
-        Note over E: Wasm plugin calls Authorino
-        E->>A: CheckRequest<br/>(host=test-server1.mcp.local,<br/>x-mcp-toolname=greet, JWT)
+    E->>R: ext_proc: headers + body
+    Note over R: 1. Parse tool "test_server_a1_headers"<br/>2. Strip prefix → "headers"<br/>3. Rewrite headers:<br/>   :authority = test-server-a1.mcp.local<br/>   x-mcp-toolname = headers<br/>   x-mcp-servername = team-a/test-server-a1
+    R-->>E: Modified headers + body
 
-        Note over A: Per-HTTPRoute AuthPolicy:<br/>• Validate JWT<br/>• Check group membership<br/>• Check tool name against ACL<br/>e.g. developers && toolname in [greet, time]
+    Note over E: Wasm plugin calls Authorino<br/>(per-HTTPRoute AuthPolicy for server-a1)
+    E->>A: CheckRequest<br/>(host=test-server-a1.mcp.local,<br/>x-mcp-toolname=headers, JWT)
 
-        alt Authorized
-            A-->>E: OK
-            E->>S: POST /mcp<br/>{"method":"tools/call","params":{"name":"greet"}}
-            S-->>E: {"result":{"content":[{"text":"Hi alice"}]}}
-            E-->>C: 200 OK + tool result
-        else Unauthorized (wrong group or tool)
-            A-->>E: DENIED
-            E-->>C: 403 Forbidden<br/>{"error":"Forbidden","message":"You do not have access to this tool."}
-        end
+    Note over A: server-a1 AuthPolicy:
 
-    else tools/call on credentialed server (Vault exchange path)
-        Note over C,S: 3c. tools/call → Router + Vault token exchange + credential injection
+    Note over A: Step 1: Validate JWT ✓
 
-        Note over R: 1. Parse JSON-RPC body<br/>2. Extract tool "github_get_me"<br/>3. Strip prefix → "get_me"<br/>4. Set headers:<br/>   :authority = github.mcp.local<br/>   x-mcp-toolname = get_me<br/>   x-mcp-servername = mcp-test/github
+    Note over A: Step 2: CEL authorization<br/>groups.exists(g, g == 'team-a-developers')<br/>&& 'headers' in ['greet', 'time', 'headers']<br/>→ ALLOWED ✓
 
-        R-->>E: Modified headers + body
+    Note over A: Step 3: Metadata — JWT → Vault token
+    A->>V: POST /v1/auth/jwt/login<br/>{"role":"authorino","jwt":"eyJ..."}
+    Note over V: Validate JWT via Keycloak JWKS<br/>Check aud: mcp-gateway ✓<br/>Extract sub claim
+    V-->>A: {"auth":{"client_token":"hvs.xxx"}}
 
-        Note over E: Wasm plugin calls Authorino
-        E->>A: CheckRequest<br/>(host=github.mcp.local,<br/>x-mcp-toolname=get_me, JWT)
+    Note over A: Step 4: Metadata — read team secret
+    A->>V: GET /v1/secret/data/mcp-gateway/teams/team-a-developers<br/>X-Vault-Token: hvs.xxx
+    Note over V: CEL selected path based on group:<br/>leads → teams/team-a-leads<br/>ops → teams/team-a-ops<br/>developers → teams/team-a-developers
+    V-->>A: {"data":{"data":{"api_key":"team-dev-shared-key-001"}}}
 
-        Note over A: GitHub AuthPolicy metadata evaluators:
+    Note over A: Step 5: Response — inject credential header
+    A-->>E: OK + X-Team-Credential: team-dev-shared-key-001
 
-        A->>V: POST /v1/auth/jwt/login<br/>{"role":"authorino","jwt":"eyJ..."}
-        Note over V: Validate JWT via Keycloak JWKS<br/>Check aud: mcp-gateway<br/>Extract sub claim
-        V-->>A: {"auth":{"client_token":"hvs.xxx"}}
+    E->>S1: POST /mcp<br/>X-Team-Credential: team-dev-shared-key-001<br/>{"method":"tools/call","params":{"name":"headers"}}
+    Note over S1: Server sees X-Team-Credential<br/>header — can use it to call<br/>downstream APIs on behalf<br/>of the team
+    S1-->>E: {"result":{"content":[...]}}
+    E-->>C: 200 OK + tool result
 
-        A->>V: GET /v1/secret/data/mcp-gateway/{sub}<br/>X-Vault-Token: hvs.xxx
-        V-->>A: {"data":{"data":{"github_pat":"ghp_xxx"}}}
+    Note over C,S2: 4b. Call Tool on server-a2 (per-user Vault credential)
 
-        Note over A: Authorization rule:<br/>Verify github_pat exists in Vault response
+    C->>E: POST /mcp<br/>{"method":"tools/call","params":{"name":"test_server_a2_headers"}}
 
-        Note over A: Response rule:<br/>Set Authorization: Bearer ghp_xxx<br/>Set x-mcp-api-key: ghp_xxx
+    E->>R: ext_proc: headers + body
+    Note over R: Strip prefix → "headers"<br/>:authority = test-server-a2.mcp.local<br/>x-mcp-toolname = headers
+    R-->>E: Modified headers + body
 
-        A-->>E: OK + injected headers
+    E->>A: CheckRequest<br/>(host=test-server-a2.mcp.local,<br/>x-mcp-toolname=headers, JWT)
 
-        E->>S: POST /mcp<br/>Authorization: Bearer ghp_xxx<br/>{"method":"tools/call","params":{"name":"get_me"}}
-        S-->>E: {"result":{"content":[{"text":"{\"login\":\"user\"}"}]}}
-        E-->>C: 200 OK + GitHub profile data
+    Note over A: server-a2 AuthPolicy:
 
-        alt No PAT in Vault for this user
-            V-->>A: 404 (no secret at path)
-            A-->>E: DENIED
-            E-->>C: 403 Forbidden<br/>{"error":"Forbidden","message":"No GitHub PAT found in Vault for this user."}
-        end
-    end
+    Note over A: Step 1: Validate JWT ✓
+
+    Note over A: Step 2: CEL authorization<br/>groups.exists(g, g == 'team-a-developers')<br/>&& 'headers' in ['hello_world', 'time', 'headers']<br/>→ ALLOWED ✓
+
+    Note over A: Step 3: Metadata — JWT → Vault token
+    A->>V: POST /v1/auth/jwt/login<br/>{"role":"authorino","jwt":"eyJ..."}
+    V-->>A: {"auth":{"client_token":"hvs.yyy"}}
+
+    Note over A: Step 4: Metadata — read per-user secret
+    A->>V: GET /v1/secret/data/mcp-gateway/users/{sub}<br/>X-Vault-Token: hvs.yyy
+    Note over V: Path uses JWT sub claim directly<br/>(Keycloak user UUID)
+    V-->>A: {"data":{"data":{"api_key":"dev1-personal-key"}}}
+
+    Note over A: Step 5: Response — inject credential header
+    A-->>E: OK + X-User-Credential: dev1-personal-key
+
+    E->>S2: POST /mcp<br/>X-User-Credential: dev1-personal-key<br/>{"method":"tools/call","params":{"name":"headers"}}
+    Note over S2: Server sees X-User-Credential<br/>header — can use it to call<br/>identity-bound APIs (e.g. Jira)<br/>on behalf of this specific user
+    S2-->>E: {"result":{"content":[...]}}
+    E-->>C: 200 OK + tool result
+
+    Note over C,S2: 5. Denied Request (wrong group for tool)
+
+    C->>E: POST /mcp<br/>{"method":"tools/call","params":{"name":"test_server_a1_add_tool"}}
+
+    E->>R: ext_proc: headers + body
+    Note over R: Strip prefix → "add_tool"<br/>:authority = test-server-a1.mcp.local<br/>x-mcp-toolname = add_tool
+    R-->>E: Modified headers + body
+
+    E->>A: CheckRequest<br/>(x-mcp-toolname=add_tool, JWT)
+
+    Note over A: server-a1 AuthPolicy:<br/>CEL: developers && 'add_tool'<br/>   in ['greet', 'time', 'headers']<br/>→ DENIED ✗<br/><br/>Vault metadata evaluators<br/>are never reached — authorization<br/>fails first.
+
+    A-->>E: DENIED
+    E-->>C: 403 Forbidden<br/>{"error":"Forbidden",<br/>"message":"You do not have access to this tool."}

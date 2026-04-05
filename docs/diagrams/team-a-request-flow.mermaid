@@ -1,0 +1,104 @@
+%%{ init: { 'theme': 'base', 'themeVariables': { 'primaryColor': '#e8f4fd', 'primaryBorderColor': '#2196F3', 'secondaryColor': '#fff3e0', 'tertiaryColor': '#e8f5e9' } } }%%
+
+graph LR
+    %% ── External ──
+    client["AI Engineer<br/>(Bearer JWT)"]
+
+    subgraph keycloak-ns["Keycloak"]
+        kc["OIDC Provider<br/>groups claim in JWT"]
+    end
+
+    subgraph team-a["team-a namespace"]
+
+        subgraph envoy["Envoy Gateway"]
+            direction TB
+            filter1["1. ext_proc<br/>(Router)"]
+            filter2["2. Wasm plugin<br/>(Authorino)"]
+            route["3. envoy.router"]
+            filter1 --> filter2 --> route
+        end
+
+        subgraph gw-auth["Gateway AuthPolicy"]
+            jwt-gw["Validate JWT"]
+            vs-inject["Inject X-Mcp-Virtualserver<br/>based on group:<br/>leads → lead-tools<br/>ops → ops-tools<br/>dev → dev-tools"]
+            jwt-gw --> vs-inject
+        end
+
+        subgraph broker["Broker / Router"]
+            direction TB
+            agg["tools/list:<br/>filter by VirtualMCPServer"]
+            strip["tools/call:<br/>strip prefix, set<br/>x-mcp-toolname,<br/>x-mcp-servername,<br/>rewrite :authority"]
+        end
+
+        subgraph route-auth-a1["AuthPolicy (server-a1)<br/>team-level credential"]
+            direction TB
+            jwt-a1["Validate JWT"]
+            authz-a1["CEL predicate:<br/>group ∈ allowed tools?"]
+            vault-tok-a1["Metadata 1: JWT → Vault token<br/>POST /v1/auth/jwt/login"]
+            vault-sec-a1["Metadata 2: read team secret<br/>GET /v1/secret/data/.../teams/{group}"]
+            inject-a1["Response: inject<br/>X-Team-Credential header"]
+            jwt-a1 --> authz-a1 --> vault-tok-a1 --> vault-sec-a1 --> inject-a1
+        end
+
+        subgraph route-auth-a2["AuthPolicy (server-a2)<br/>per-user credential"]
+            direction TB
+            jwt-a2["Validate JWT"]
+            authz-a2["CEL predicate:<br/>group ∈ allowed tools?"]
+            vault-tok-a2["Metadata 1: JWT → Vault token<br/>POST /v1/auth/jwt/login"]
+            vault-sec-a2["Metadata 2: read user secret<br/>GET /v1/secret/data/.../users/{sub}"]
+            inject-a2["Response: inject<br/>X-User-Credential header"]
+            jwt-a2 --> authz-a2 --> vault-tok-a2 --> vault-sec-a2 --> inject-a2
+        end
+
+        server-a1["test-server-a1<br/>sees: X-Team-Credential<br/>(shared group key)"]
+        server-a2["test-server-a2<br/>sees: X-User-Credential<br/>(personal user key)"]
+    end
+
+    subgraph vault-ns["Vault"]
+        vault-jwt["JWT Auth<br/>(Keycloak JWKS)"]
+        vault-team["KV: teams/{group}<br/>api_key per group"]
+        vault-user["KV: users/{sub}<br/>api_key per user"]
+    end
+
+    %% ── Request path ──
+    client -->|"1. authenticate"| kc
+    kc -->|"JWT with groups"| client
+    client -->|"2. POST /mcp<br/>Authorization: Bearer"| envoy
+
+    %% tools/list path
+    filter2 -.->|"tools/list"| gw-auth
+    gw-auth -.-> broker
+    broker -.->|"filtered tools"| client
+
+    %% tools/call path (server-a1)
+    filter1 -->|"tools/call:<br/>rewrite to server-a1"| filter2
+    filter2 -->|"server-a1 route"| route-auth-a1
+    vault-tok-a1 -.->|"JWT login"| vault-jwt
+    vault-sec-a1 -.->|"read secret"| vault-team
+    inject-a1 -->|"request +<br/>X-Team-Credential"| server-a1
+
+    %% tools/call path (server-a2)
+    filter2 -->|"server-a2 route"| route-auth-a2
+    vault-tok-a2 -.->|"JWT login"| vault-jwt
+    vault-sec-a2 -.->|"read secret"| vault-user
+    inject-a2 -->|"request +<br/>X-User-Credential"| server-a2
+
+    %% ── Deny paths ──
+    authz-a1 -.-x|"403 Forbidden"| client
+    authz-a2 -.-x|"403 Forbidden"| client
+
+    %% ── Styles ──
+    classDef external fill:#f3e5f5,stroke:#9C27B0,stroke-width:2px
+    classDef gateway fill:#e8f4fd,stroke:#2196F3,stroke-width:1px
+    classDef auth fill:#fff9c4,stroke:#FBC02D,stroke-width:1px
+    classDef vault fill:#fce4ec,stroke:#E91E63,stroke-width:1px
+    classDef server fill:#e8f5e9,stroke:#4CAF50,stroke-width:1px
+    classDef oidc fill:#fff3e0,stroke:#FF9800,stroke-width:1px
+
+    class client external
+    class filter1,filter2,route,envoy gateway
+    class jwt-gw,vs-inject,gw-auth,jwt-a1,authz-a1,inject-a1,jwt-a2,authz-a2,inject-a2,route-auth-a1,route-auth-a2 auth
+    class vault-jwt,vault-team,vault-user,vault-tok-a1,vault-sec-a1,vault-tok-a2,vault-sec-a2 vault
+    class server-a1,server-a2 server
+    class kc,keycloak-ns oidc
+    class broker,agg,strip gateway

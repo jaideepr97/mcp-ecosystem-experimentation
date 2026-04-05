@@ -13,6 +13,7 @@
 #   3. Keycloak Groups + Users (team-a-developers, team-a-ops, team-a-leads)
 #   4. VirtualMCPServers + AuthPolicies (per-group tool filtering + authorization)
 #   5. Config Secret Patch (Finding 48 workaround for VirtualMCPServer)
+#   6. Vault Credential Storage (team-level + per-user secrets)
 #
 # Usage:
 #   ./scripts/guided-setup.sh              # Start from the beginning
@@ -43,7 +44,7 @@ CERT_MANAGER_VERSION="v1.17.2"
 # URLs
 KEYCLOAK_EXTERNAL="http://keycloak.127-0-0-1.sslip.io:8002"
 
-TOTAL_PHASES=5
+TOTAL_PHASES=6
 
 # --- Argument parsing ---
 
@@ -609,6 +610,8 @@ if confirm_phase 3; then
       -H "Content-Type: application/json" \
       -d "{
         \"username\": \"${username}\",
+        \"firstName\": \"${username}\",
+        \"lastName\": \"User\",
         \"email\": \"${username}@example.com\",
         \"emailVerified\": true,
         \"enabled\": true,
@@ -825,6 +828,107 @@ fi
 fi # phase 5
 
 ########################################
+# Phase 6: Vault Credential Storage
+########################################
+
+if [ "$START_PHASE" -le 6 ]; then
+
+show_phase 6 "Vault Credential Storage" "
+## What this does
+
+Stores **team-level** and **per-user** credentials in Vault that AuthPolicy metadata
+evaluators will retrieve and inject into upstream MCP server requests.
+
+## Two credential patterns
+
+### Pattern 1: Team-level (server-a1)
+
+Shared API keys stored at \`secret/mcp-gateway/teams/{group-name}\`:
+- \`team-a-developers\` → shared developer key
+- \`team-a-ops\` → shared ops key
+- \`team-a-leads\` → shared lead key
+
+The AuthPolicy on server-a1's HTTPRoute uses a CEL ternary in \`urlExpression\` to
+select the correct team secret based on the user's group membership. The credential
+is injected as the \`X-Team-Credential\` response header.
+
+**Use case**: shared service accounts (CI/CD tokens, monitoring API keys).
+
+### Pattern 2: Per-user (server-a2)
+
+Personal API keys stored at \`secret/mcp-gateway/users/{keycloak-sub}\`:
+- Each user gets their own secret keyed by their Keycloak UUID
+
+The AuthPolicy on server-a2's HTTPRoute uses \`auth.identity.sub\` in \`urlExpression\`
+to read the specific user's secret. The credential is injected as the
+\`X-User-Credential\` response header.
+
+**Use case**: identity-bound services (Jira, GitHub, Slack) where actions must
+trace back to an individual user.
+
+## How it works at request time
+
+1. User's JWT arrives at the per-HTTPRoute AuthPolicy
+2. **Metadata evaluator stage 1**: JWT is sent to Vault's \`/v1/auth/jwt/login\` endpoint
+   to exchange it for a short-lived Vault client token
+3. **Metadata evaluator stage 2**: The Vault token is used to read the appropriate secret
+   (team or user path)
+4. **Response rule**: The secret value is injected as a header before the request
+   reaches the MCP server
+
+The upstream MCP server sees only the credential — never the user's JWT or Vault token.
+
+## What gets created
+
+- 3 team-level Vault secrets (\`secret/mcp-gateway/teams/team-a-{developers,ops,leads}\`)
+- 5 per-user Vault secrets (\`secret/mcp-gateway/users/{sub}\` for each user)
+"
+
+if confirm_phase 6; then
+  VAULT_NS="vault"
+  VAULT_CMD="VAULT_ADDR=http://127.0.0.1:8200 VAULT_TOKEN=root"
+
+  # Team-level secrets
+  run_cmd "Storing team-a-developers secret..." \
+    kubectl exec -n "$VAULT_NS" deploy/vault -- sh -c \
+      "${VAULT_CMD} vault kv put secret/mcp-gateway/teams/team-a-developers api_key=team-dev-shared-key-001"
+  run_cmd "Storing team-a-ops secret..." \
+    kubectl exec -n "$VAULT_NS" deploy/vault -- sh -c \
+      "${VAULT_CMD} vault kv put secret/mcp-gateway/teams/team-a-ops api_key=team-ops-shared-key-002"
+  run_cmd "Storing team-a-leads secret..." \
+    kubectl exec -n "$VAULT_NS" deploy/vault -- sh -c \
+      "${VAULT_CMD} vault kv put secret/mcp-gateway/teams/team-a-leads api_key=team-leads-shared-key-003"
+
+  # Per-user secrets (need Keycloak sub claims)
+  KEYCLOAK_ADMIN_URL="${KEYCLOAK_EXTERNAL}/admin/realms/mcp"
+
+  get_admin_token() {
+    curl -s -X POST "${KEYCLOAK_EXTERNAL}/realms/master/protocol/openid-connect/token" \
+      -d "grant_type=password" \
+      -d "client_id=admin-cli" \
+      -d "username=admin" \
+      -d "password=admin" | python3 -c "import sys,json; print(json.load(sys.stdin)['access_token'])"
+  }
+
+  ADMIN_TOKEN=$(get_admin_token)
+
+  for username in dev1 dev2 ops1 ops2 lead1; do
+    USER_SUB=$(curl -s "${KEYCLOAK_ADMIN_URL}/users?username=${username}&exact=true" \
+      -H "Authorization: Bearer ${ADMIN_TOKEN}" | \
+      python3 -c "import sys,json; users=json.load(sys.stdin); print(users[0]['id'] if users else '')")
+    if [ -n "$USER_SUB" ]; then
+      run_cmd "Storing ${username} personal secret (${USER_SUB:0:8}...)..." \
+        kubectl exec -n "$VAULT_NS" deploy/vault -- sh -c \
+          "${VAULT_CMD} vault kv put secret/mcp-gateway/users/${USER_SUB} api_key=${username}-personal-key"
+    fi
+  done
+
+  phase_done 6
+fi
+
+fi # phase 6
+
+########################################
 # Complete
 ########################################
 
@@ -837,8 +941,8 @@ else
     "" \
     "Multi-tenant MCP ecosystem deployed successfully." \
     "" \
-    "Shared control plane + team-a namespace with isolated" \
-    "gateway (HTTP+HTTPS), 2 servers, 3 groups, per-tool auth."
+    "Shared control plane + team-a namespace with isolated gateway," \
+    "2 servers, 3 groups, per-tool auth, Vault credential injection."
 fi
 
 echo ""
@@ -852,10 +956,10 @@ Shared Control Plane          team-a Namespace
 ─────────────────────         ──────────────────────
 mcp-system (controller)       Gateway (HTTP+HTTPS)
 keycloak (OIDC)               MCPGatewayExtension (broker/router)
-kuadrant (Authorino)          test-server-a1 (5 tools)
-vault (credentials)           test-server-a2 (7 tools)
+kuadrant (Authorino)          test-server-a1 (5 tools, team credential)
+vault (credentials)           test-server-a2 (7 tools, per-user credential)
 catalog + launcher            3 VirtualMCPServers + TLSPolicy
-cert-manager (TLS)            3 AuthPolicies
+cert-manager (TLS)            3 AuthPolicies + Vault credential injection
 ```
 
 ## Endpoints

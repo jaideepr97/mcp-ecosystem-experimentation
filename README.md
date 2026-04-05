@@ -12,7 +12,7 @@ This repo has three branches at increasing levels of complexity:
 |--------|--------|----------------|
 | [`basic`](../../tree/basic) | 1-10 | Core pipeline: Kind + Istio + mcp-gateway + lifecycle operator + catalog + mini-oidc authentication |
 | [`intermediate`](../../tree/intermediate) | 1-16 | Adds Keycloak, Kuadrant/Authorino, per-tool authorization, TLS, Vault credential exchange, GitHub MCP server |
-| [`main`](../../tree/main) | 1-16+ | Active development — multi-tenancy patterns, namespace-isolated gateways |
+| [`main`](../../tree/main) | 1-18+ | Active development — multi-tenancy, VirtualMCPServers, AuthPolicies, Vault credential injection |
 
 Start with `basic` to understand the fundamentals, then move to `intermediate` for the full auth and security stack.
 
@@ -40,21 +40,26 @@ MCP Gateway          — "route requests securely to the server"
   (one gateway per team namespace for isolation)
 ```
 
-## Current State (Phase 16+)
+## Current State (Phase 18)
 
-The experiment has transitioned from a shared-gateway model (Phases 1-15) to a **gateway-per-namespace multi-tenancy model**:
+The experiment has progressed through namespace-isolated multi-tenancy (Phase 16), per-group VirtualMCPServers and AuthPolicies (Phase 17), and Vault credential injection patterns (Phase 18):
 
-- The `mcp-test` namespace and its test servers have been removed
-- The shared gateway in `gateway-system` has been removed
-- `team-a` is the first team namespace, with its own gateway, MCP gateway extension, and test servers
+- `team-a` has its own Gateway, MCP gateway extension, 2 test servers (12 tools total), and 3 VirtualMCPServers
+- 5 Keycloak users across 3 groups (`team-a-developers`, `team-a-ops`, `team-a-leads`)
+- Gateway AuthPolicy injects `X-Mcp-Virtualserver` header based on group — clients never select their virtual server
+- Per-HTTPRoute AuthPolicies enforce tool-level authorization via CEL predicates and inject Vault credentials:
+  - **Server-a1**: team-level credential (`X-Team-Credential`) keyed by group membership
+  - **Server-a2**: per-user credential (`X-User-Credential`) keyed by JWT `sub` claim
 - Each team namespace is fully isolated: its own Gateway, its own MCP servers, its own routes
 
 See [docs/experimentation.md](docs/experimentation.md) for the full chronological narrative.
 
 ## Documentation
 
-- [docs/experimentation.md](docs/experimentation.md) — Full chronological narrative of the experiment (Phases 1-16+), from initial project analysis through deployment, request tracing, authentication, catalog integration, gateway automation, per-tool authorization, TLS, Vault credential exchange, and multi-tenancy refactoring
-- [docs/changes-tracker.md](docs/changes-tracker.md) — Structured changelog of every code modification and integration friction point discovered
+- [docs/experimentation.md](docs/experimentation.md) — Full chronological narrative of the experiment (Phases 1-18), from initial project analysis through deployment, request tracing, authentication, catalog integration, gateway automation, per-tool authorization, TLS, Vault credential exchange, multi-tenancy, VirtualMCPServers, and credential injection patterns
+- [docs/persona-flows.md](docs/persona-flows.md) — End-to-end walkthrough of the two RHAISTRAT-1149 personas: Platform Engineer (infrastructure provisioning) and AI Engineer (tool discovery and usage)
+- [docs/friction-points.md](docs/friction-points.md) — Upstream limitations requiring workarounds, organized by project with severity and durability assessment
+- [docs/changes-tracker.md](docs/changes-tracker.md) — Structured changelog of every code modification and deployment artifact
 - [docs/diagrams/](docs/diagrams/) — Mermaid diagrams of the architecture, request flow, pipeline, and operator reconciliation logic
 
 ## Prerequisites
@@ -95,9 +100,7 @@ For a non-interactive setup that runs all phases without prompts:
 ./scripts/setup.sh
 ```
 
-> **Note:** The setup scripts currently deploy the Phases 1-15 layout (shared gateway in `gateway-system`, test servers in `mcp-test`). The multi-tenancy model (gateway-per-namespace, `team-a`) was set up manually during Phase 16. Setup scripts are being updated to support the new model.
-
-This takes approximately 10 minutes and sets up: Kind cluster, Istio (as Gateway API controller), MetalLB, cert-manager, Envoy gateway, mcp-gateway (broker/router/controller), lifecycle operator, catalog system, Keycloak, Kuadrant (Authorino), and optionally a GitHub MCP server.
+This takes approximately 10 minutes and sets up: Kind cluster, Istio (as Gateway API controller), MetalLB, cert-manager, Envoy gateway, mcp-gateway (broker/router/controller), lifecycle operator, catalog system, Keycloak, Kuadrant (Authorino), Vault, team-a namespace with gateway + servers + VirtualMCPServers + AuthPolicies + Vault credential injection.
 
 To reuse an existing Kind cluster:
 
@@ -119,32 +122,37 @@ Run the automated pipeline test:
 ./scripts/test-pipeline.sh
 ```
 
-> **Note:** The test pipeline currently validates the Phases 1-15 layout (shared gateway, `mcp-test` servers, per-tool authorization matrix). Tests are being updated for the multi-tenancy model with `team-a` namespace.
+This verifies the full pipeline end-to-end across 10 phases:
+1. **Shared infrastructure** — namespaces, controllers, operators running
+2. **Catalog API** — lists available servers with OCI artifact URIs
+3. **team-a namespace** — gateway, broker, servers deployed and ready
+4. **Authentication** — Keycloak issues tokens for all users, unauthenticated requests rejected with 401
+5. **VirtualMCPServer filtering** — per-group tool visibility (dev1 sees 6, ops1 sees 6, lead1 sees 12)
+6. **Authorization matrix** — per-group tool access enforcement across both servers
+7. **TLS** — cert-manager, TLSPolicy, HTTPS endpoints
+8. **Launcher** — catalog UI accessible
+9. **Tool delisting** — VirtualMCPServer filtering-only behavior (removed tool hidden but still callable)
+10. **Vault credential injection** — team-level and per-user credentials injected via AuthPolicy metadata evaluators
 
-This verifies the full pipeline end-to-end across 8 phases (63 checks):
-1. **Catalog API** — lists available servers with OCI artifact URIs
-2. **Operator resources** — MCPServer CRs triggered Deployment + Service creation for both servers
-3. **Gateway integration** — operator created HTTPRoute + MCPServerRegistration + AuthPolicies
-4. **Authentication** — Keycloak issues tokens for all users, unauthenticated requests are rejected with 401
-5. **Gateway tool access** — MCP sessions initialize, tools from both servers are federated, tool calls return results
-6. **Authorization matrix** — 15 allow/deny cases across 3 users x 5 tools
-7. **TLS** — cert-manager, TLSPolicy, HTTPS endpoints for MCP gateway and Keycloak
-8. **Vault credential exchange** — Vault JWT login with Keycloak token, per-user secret read via JWT-derived policy, GitHub MCPServerRegistration + AuthPolicy
+### Authorization Matrix (team-a — Phases 17-18)
 
-### Authorization Matrix (Historical — Phases 1-15)
+Per-tool, per-group access control across two servers with Vault credential injection:
 
-The following authorization matrix was used with the shared gateway and `mcp-test` namespace. It validated per-tool, per-group access control across two test servers:
+**test-server-a1** (5 tools, team-level credential via `X-Team-Credential`):
 
-| | greet | add_tool | hello_world | auth1234 | set_time |
+| | greet | time | headers | add_tool | slow |
 |---|---|---|---|---|---|
-| **Policy** | dev-only | ops-only | *no group* | ops-only | shared |
-| Alice (developers) | allow | deny | deny | deny | allow |
-| Bob (ops) | deny | allow | deny | allow | allow |
-| Carol (both) | allow | allow | deny | allow | allow |
+| developers (dev1, dev2) | allow | allow | allow | deny | deny |
+| ops (ops1, ops2) | deny | deny | deny | allow | allow |
+| leads (lead1) | allow | allow | allow | allow | allow |
 
-- **server1** (greet, time, slow, headers, add_tool): `developers` can call greet, `ops` can call add_tool
-- **server2** (hello_world, time, headers, auth1234, slow, set_time): `developers` can call set_time, `ops` can call auth1234 + set_time
-- **hello_world** is not in any policy — tests that tool existence does not imply access
+**test-server-a2** (7 tools, per-user credential via `X-User-Credential`):
+
+| | hello_world | time | headers | auth1234 | set_time | slow | pour_chocolate_into_mold |
+|---|---|---|---|---|---|---|---|
+| developers | allow | allow | allow | deny | deny | deny | deny |
+| ops | deny | deny | deny | allow | allow | allow | allow |
+| leads | allow | allow | allow | allow | allow | allow | allow |
 
 ### Interactive Client
 
@@ -152,32 +160,35 @@ The following authorization matrix was used with the shared gateway and `mcp-tes
 ./scripts/mcp-client.sh
 ```
 
-> **Note:** The interactive client is configured for the Phases 1-15 shared gateway. It needs updating to target the `team-a` namespace gateway (via port-forward).
-
-Authenticates against Keycloak via browser-based device flow, then drops into a tool-calling REPL. Log in as any user (alice/alice, bob/bob, carol/carol). Use `/login` to switch users, `/tools` to list tools, `/whoami` to check identity.
+Authenticates against Keycloak via browser-based device flow, then drops into a tool-calling REPL. Log in as any team-a user (dev1/dev1, ops1/ops1, lead1/lead1). Use `/login` to switch users, `/tools` to list tools, `/whoami` to check identity.
 
 ### Quick Test (curl)
 
-> **Note:** The URLs below reference the Phases 1-15 shared gateway (NodePort on port 8001). For the current `team-a` namespace, use `kubectl port-forward` to the team-a gateway and adjust URLs accordingly.
-
 ```bash
-# Get a token (direct access grant)
-TOKEN=$(curl -s -X POST http://keycloak.127-0-0-1.sslip.io:8002/realms/mcp/protocol/openid-connect/token \
-  -d 'grant_type=password&client_id=mcp-cli&username=alice&password=alice&scope=openid groups' \
-  | python3 -c "import sys,json; print(json.load(sys.stdin)['access_token'])")
+# Get a token (direct access grant — scope=openid groups is required)
+TOKEN=$(curl -s http://keycloak.127-0-0-1.sslip.io:8002/realms/mcp/protocol/openid-connect/token \
+  -d 'grant_type=password&client_id=mcp-cli&username=dev1&password=dev1&scope=openid groups' \
+  | jq -r .access_token)
 
-# Initialize an MCP session (adjust URL for team-a port-forward)
+# Initialize an MCP session
 SESSION=$(curl -si -H "Authorization: Bearer $TOKEN" \
   -H "Content-Type: application/json" \
   -d '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-03-26","capabilities":{},"clientInfo":{"name":"test","version":"1.0"}}}' \
-  http://mcp.127-0-0-1.sslip.io:8001/mcp | grep -i mcp-session-id | awk '{print $2}' | tr -d '\r')
+  http://team-a.mcp.127-0-0-1.sslip.io:8001/mcp | grep -i mcp-session-id | awk '{print $2}' | tr -d '\r')
 
-# List tools through the gateway
+# List tools (dev1 sees 6 tools filtered by VirtualMCPServer)
 curl -s -H "Authorization: Bearer $TOKEN" \
   -H "Mcp-Session-Id: $SESSION" \
   -H "Content-Type: application/json" \
   -d '{"jsonrpc":"2.0","id":2,"method":"tools/list"}' \
-  http://mcp.127-0-0-1.sslip.io:8001/mcp
+  http://team-a.mcp.127-0-0-1.sslip.io:8001/mcp
+
+# Call a tool (Vault credential injected transparently)
+curl -s -H "Authorization: Bearer $TOKEN" \
+  -H "Mcp-Session-Id: $SESSION" \
+  -H "Content-Type: application/json" \
+  -d '{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"test_server_a1_headers","arguments":{}}}' \
+  http://team-a.mcp.127-0-0-1.sslip.io:8001/mcp
 ```
 
 ## Accessing Services
@@ -194,21 +205,29 @@ curl -s -H "Authorization: Bearer $TOKEN" \
 
 All passwords match the username.
 
-| User | Password | Groups |
-|------|----------|--------|
-| alice | alice | developers |
-| bob | bob | ops |
-| carol | carol | developers, ops |
+### team-a namespace (Phases 16-18)
+
+| User | Password | Group | VirtualMCPServer | Tools visible |
+|------|----------|-------|-----------------|---------------|
+| dev1 | dev1 | team-a-developers | team-a-dev-tools | 6 |
+| dev2 | dev2 | team-a-developers | team-a-dev-tools | 6 |
+| ops1 | ops1 | team-a-ops | team-a-ops-tools | 6 |
+| ops2 | ops2 | team-a-ops | team-a-ops-tools | 6 |
+| lead1 | lead1 | team-a-leads | team-a-lead-tools | 12 |
 
 ## Repository Structure
 
 ```
 ├── docs/
-│   ├── experimentation.md                      # Full experiment narrative (Phases 1-16+)
-│   ├── changes-tracker.md                      # Code changes + friction points
+│   ├── experimentation.md                      # Full experiment narrative (Phases 1-18)
+│   ├── persona-flows.md                        # Platform Engineer + AI Engineer end-to-end flows
+│   ├── friction-points.md                      # Upstream limitations + workarounds
+│   ├── changes-tracker.md                      # Code changes + deployment artifacts
 │   └── diagrams/
 │       ├── component-architecture.mermaid      # Cluster component map
-│       ├── request-flow.mermaid                # Authenticated MCP request sequence (HTTP + HTTPS)
+│       ├── multi-tenancy-architecture.mermaid  # Namespace isolation + control plane
+│       ├── request-flow.mermaid                # Authenticated MCP request sequence
+│       ├── team-a-request-flow.mermaid         # team-a request flow with credential injection
 │       ├── tls-architecture.mermaid            # TLS certificate chain + termination flow
 │       ├── catalog-to-gateway-pipeline.mermaid # End-to-end pipeline flow
 │       └── operator-reconciliation.mermaid     # Operator reconciler logic
@@ -247,26 +266,4 @@ Pre-built images are available on quay.io:
 | `quay.io/jrao/mcp-lifecycle-operator:gateway-credential-ref` | Same fork, branch `gateway-credential-ref` — adds `credentialRef` annotation support for per-server credential secrets |
 | `quay.io/keycloak/keycloak:26.3` | Upstream Keycloak OIDC provider (no custom build) |
 
-## Key Findings
-
-The experiment surfaced several integration friction points documented in detail in [docs/changes-tracker.md](docs/changes-tracker.md). The most significant:
-
-1. **Per-tool authorization works at the gateway with no code changes** — Kuadrant AuthPolicy + CEL predicates enable per-group, per-tool, cross-server authorization. The Router sets `x-mcp-toolname` and `:authority` headers before the auth check runs, giving Authorino full visibility into tool and server identity.
-
-2. **Envoy filter chain order is critical** — ext_proc (Router) runs before the Kuadrant Wasm plugin (auth). This was initially assumed to be the opposite, which would have made per-tool authorization impossible at the gateway. Always verify filter chain order via the Envoy config dump.
-
-3. **`tools/list` is the authorization blind spot** — `tools/call` is fully enforced at the gateway, but `tools/list` returns all tools to all users. The broker aggregates without identity-based filtering, requiring application-level changes for consistent UX.
-
-4. **Catalog metadata is insufficient for deployment** — `runtimeMetadata` covers port and path but not container command, arguments, or security context. Each MCP server image is potentially a snowflake.
-
-5. **The annotation-based gateway integration pattern works well** — using `mcp.x-k8s.io/gateway-ref` annotations on MCPServer CRs avoids upstream spec changes while enabling automatic gateway registration.
-
-6. **TLS termination is transparent to the MCP protocol** — Kuadrant TLSPolicy + cert-manager adds HTTPS with zero application changes. TLS terminates at Envoy; backends stay plain HTTP. The only client-side change is URL scheme and CA certificate trust. cert-manager must be installed before Kuadrant — the TLSPolicy controller checks for it at startup and never re-checks.
-
-7. **Per-user credential exchange works entirely at the gateway** — Vault token exchange (Keycloak JWT → Vault JWT login → per-user secret read → inject upstream credential) is implemented purely in AuthPolicy metadata evaluators. No application code changes, no sidecars, no per-user MCP server deployments. The gateway swaps the user's JWT for their stored API token before forwarding to the upstream MCP server.
-
-8. **MCP servers that only read credentials from environment variables force per-user deployments** — the GitHub MCP server accepts `Authorization: Bearer` headers in HTTP mode, making per-user Vault credential injection possible. Servers that only read tokens from env vars (e.g., Slack MCP server) require a separate deployment per user — the gateway can't inject credentials into environment variables at request time.
-
-9. **Namespace-isolated gateways enable multi-tenancy** — moving from a shared gateway in `gateway-system` to a gateway-per-namespace model (Phase 16) provides team-level isolation. Each namespace gets its own Gateway, MCP gateway extension, and servers, avoiding cross-team routing conflicts and enabling independent lifecycle management.
-
-See [docs/experimentation.md](docs/experimentation.md) for the full narrative including the auth layer investigation (Istio 403 vs OAuth 401), the OIDC/PKCE flow, the Keycloak migration, the per-tool authorization evolution, the Vault credential exchange flow, and the multi-tenancy refactoring.
+Key findings and friction points are documented in [docs/friction-points.md](docs/friction-points.md). For the full experiment narrative, see [docs/experimentation.md](docs/experimentation.md). For end-to-end Platform Engineer and AI Engineer workflows, see [docs/persona-flows.md](docs/persona-flows.md).

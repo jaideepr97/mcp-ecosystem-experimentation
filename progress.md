@@ -1,27 +1,25 @@
 # Session Handoff — Current State
 
-**Date**: 2026-04-04
-**Last action**: Phase 17 complete — VirtualMCPServers + AuthPolicies + per-group tool filtering in team-a
+**Date**: 2026-04-05
+**Last action**: Phase 18 complete — Vault credential patterns (team-level + per-user) verified in team-a
 
 ---
 
 ## Current State Summary
 
-Phase 17 is complete. The `team-a` namespace now has full per-group authorization: 3 Keycloak groups with 5 users, 3 VirtualMCPServers for tool filtering, a gateway-level AuthPolicy injecting `X-Mcp-Virtualserver` headers based on group membership, and 2 per-HTTPRoute AuthPolicies enforcing `tools/call` authorization via CEL predicates. The full authorization matrix (14/14 checks) is verified, and tool delisting from VirtualMCPServers correctly removes tools from `tools/list` while they remain callable (confirming VirtualMCPServer is filtering-only, not enforcement). All prior infrastructure (Phases 1-16) remains active.
+Phase 18 is complete. Building on Phase 17's per-group authorization, Phase 18 added Vault credential injection via AuthPolicy metadata evaluators. Server-a1 demonstrates team-level credentials (group-keyed Vault secrets), server-a2 demonstrates per-user credentials (sub-keyed Vault secrets). Both patterns use a two-stage metadata evaluator chain: (1) exchange the user's JWT for a Vault token, (2) read the appropriate secret using that token. The credential is injected as a response header (`x-team-credential` or `x-user-credential`) visible to the upstream MCP server. All prior infrastructure (Phases 1-17) remains active.
 
 ### What was completed in this session
 
-1. **Keycloak groups and users** — Created 3 groups (`team-a-developers`, `team-a-ops`, `team-a-leads`) and 5 users distributed across them in Keycloak. Groups are included in JWT tokens via the `groups` claim.
+1. **Vault secret storage** — Stored team-level secrets (`secret/mcp-gateway/teams/{group}`) and per-user secrets (`secret/mcp-gateway/users/{sub}`) in Vault KV v2.
 
-2. **Gateway AuthPolicy** — Applied a gateway-level AuthPolicy that authenticates via Keycloak JWT and injects the `X-Mcp-Virtualserver` header based on the user's group membership, so clients never choose their virtual server directly.
+2. **AuthPolicy metadata evaluators** — Added two-stage metadata chains to both per-HTTPRoute AuthPolicies: JWT→Vault token exchange (stage 1), then Vault secret read (stage 2). Server-a1 uses group-keyed team secrets, server-a2 uses sub-keyed user secrets.
 
-3. **3 VirtualMCPServers** — Created `virtualserver-dev`, `virtualserver-ops`, and `virtualserver-leads`, each composing a different subset of tools from `test-server-a1` and `test-server-a2` to give each group a tailored tool view.
+3. **CRD field discovery** — Resolved three failed approaches for JWT extraction in metadata evaluator body expressions: `auth.identity.jwt` (doesn't exist), gjson `@extract` (wrong token), before finding CEL `request.headers.authorization.split(' ')[1]` works.
 
-4. **2 per-HTTPRoute AuthPolicies** — Applied `authpolicy-server-a1` and `authpolicy-server-a2` with CEL predicates matching Keycloak groups, enforcing which groups can call tools on each server.
+4. **Credential injection verified** — dev1 gets `team-dev-shared-key-001` (team) and `dev1-personal-key` (user). lead1 gets `team-leads-shared-key-003` (team) and `lead1-personal-key` (user). Credentials appear as response headers on the upstream server.
 
-5. **Authorization matrix verified (14/14)** — Every user tested against every tool category: correct tools visible via `tools/list`, correct `tools/call` allowed/denied per group. Full matrix passed.
-
-6. **Tool delisting test passed** — Removing a tool from a VirtualMCPServer correctly hides it from `tools/list` but the tool remains callable via `tools/call`, confirming VirtualMCPServer is filtering-only (Known Issue #5).
+5. **Setup script updated** — Added Vault secret storage, fixed Keycloak user creation to include firstName/lastName (prevents "Account not fully set up" error).
 
 ### Cluster State
 
@@ -105,12 +103,12 @@ A design discussion driven by RHAISTRAT-1149 narrowed scope and uncovered key fi
 - Authorization matrix verified: 14/14 checks passing
 - Tool delisting test passed: VirtualMCPServer filtering confirmed as presentation-only (Known Issue #5)
 
-### Phase 18: Vault Credential Patterns
-- Server 1: team-level Vault credential (keyed off group claim) — shared service account
-- Server 2: per-user Vault credentials (keyed off `sub` claim) — Jira stand-in for identity-bound services
-- K8s Secrets for broker discovery on both servers (read-only service account credentials)
-- AuthPolicies updated with Vault metadata evaluators (team-level vs per-user URL expressions)
-- Test: verify correct credential reaches upstream per user/team
+### Phase 18: Vault Credential Patterns (completed)
+- Server-a1: team-level Vault credential (group-keyed CEL ternary in `urlExpression`) — `x-team-credential` header
+- Server-a2: per-user Vault credential (sub-keyed `urlExpression`) — `x-user-credential` header
+- Both AuthPolicies use two-stage metadata evaluators: JWT→Vault token, then Vault secret read
+- CEL `request.headers.authorization.split(' ')[1]` extracts raw JWT from Bearer header
+- Verified: correct credential injected per group (dev1→team-dev-shared-key-001, lead1→team-leads-shared-key-003) and per user (dev1→dev1-personal-key, lead1→lead1-personal-key)
 
 ### Phase 19: Multi-Namespace Expansion
 - Replicate `team-a` pattern to `team-b` and `team-c`

@@ -11,6 +11,7 @@
 #   Phase 7: TLS (HTTPS termination, cert-manager, TLSPolicy)
 #   Phase 8: Launcher (catalog UI accessible via NodePort)
 #   Phase 9: Tool delisting (VirtualMCPServer config change)
+#   Phase 10: Vault credential injection (team-level + per-user)
 #
 # Usage: ./scripts/test-pipeline.sh
 
@@ -543,6 +544,68 @@ if [ -n "$BROKER_DEPLOY" ]; then
   kubectl rollout restart deployment "${BROKER_DEPLOY}" -n team-a
   kubectl rollout status deployment "${BROKER_DEPLOY}" -n team-a --timeout=60s
 fi
+
+########################################
+# Phase 10: Vault credential injection
+########################################
+echo ""
+echo "--- Phase 10: Vault credential injection ---"
+
+# Helper to extract a specific header value from the headers tool response
+extract_header_value() {
+  local json="$1"
+  local header_name="$2"
+  echo "$json" | python3 -c "
+import sys,json
+data = json.load(sys.stdin)
+content = data.get('result',{}).get('content',[])
+for item in content:
+    text = item.get('text','')
+    if text.startswith('${header_name}:'):
+        # Format is 'Header-Name: [value]'
+        val = text.split('[',1)[-1].rstrip(']')
+        print(val)
+        break
+" 2>/dev/null
+}
+
+# Test team-level credential on server-a1 with dev1
+echo "  Testing team-level credential (dev1 → team-a-developers on server-a1)..."
+DEV1_TOKEN=$(get_token dev1 dev1)
+DEV1_SESSION=$(init_session "$DEV1_TOKEN")
+
+DEV1_A1_HEADERS=$(rpc_call "$DEV1_TOKEN" "$DEV1_SESSION" "tools/call" '{"name":"test_server_a1_headers","arguments":{}}')
+DEV1_TEAM_CRED=$(extract_header_value "$DEV1_A1_HEADERS" "X-Team-Credential")
+check "dev1 gets team-dev credential on server-a1" "$([ "$DEV1_TEAM_CRED" = "team-dev-shared-key-001" ] && echo true || echo false)" "got: $DEV1_TEAM_CRED"
+
+# Test team-level credential on server-a1 with lead1
+echo "  Testing team-level credential (lead1 → team-a-leads on server-a1)..."
+LEAD1_TOKEN=$(get_token lead1 lead1)
+LEAD1_SESSION=$(init_session "$LEAD1_TOKEN")
+
+LEAD1_A1_HEADERS=$(rpc_call "$LEAD1_TOKEN" "$LEAD1_SESSION" "tools/call" '{"name":"test_server_a1_headers","arguments":{}}')
+LEAD1_TEAM_CRED=$(extract_header_value "$LEAD1_A1_HEADERS" "X-Team-Credential")
+check "lead1 gets team-leads credential on server-a1" "$([ "$LEAD1_TEAM_CRED" = "team-leads-shared-key-003" ] && echo true || echo false)" "got: $LEAD1_TEAM_CRED"
+
+# Test per-user credential on server-a2 with dev1
+echo "  Testing per-user credential (dev1 on server-a2)..."
+DEV1_A2_HEADERS=$(rpc_call "$DEV1_TOKEN" "$DEV1_SESSION" "tools/call" '{"name":"test_server_a2_headers","arguments":{}}')
+DEV1_USER_CRED=$(extract_header_value "$DEV1_A2_HEADERS" "X-User-Credential")
+check "dev1 gets personal credential on server-a2" "$([ "$DEV1_USER_CRED" = "dev1-personal-key" ] && echo true || echo false)" "got: $DEV1_USER_CRED"
+
+# Test per-user credential on server-a2 with lead1
+echo "  Testing per-user credential (lead1 on server-a2)..."
+LEAD1_A2_HEADERS=$(rpc_call "$LEAD1_TOKEN" "$LEAD1_SESSION" "tools/call" '{"name":"test_server_a2_headers","arguments":{}}')
+LEAD1_USER_CRED=$(extract_header_value "$LEAD1_A2_HEADERS" "X-User-Credential")
+check "lead1 gets personal credential on server-a2" "$([ "$LEAD1_USER_CRED" = "lead1-personal-key" ] && echo true || echo false)" "got: $LEAD1_USER_CRED"
+
+# Verify server-a1 does NOT inject per-user credential
+DEV1_A1_USER_CRED=$(extract_header_value "$DEV1_A1_HEADERS" "X-User-Credential")
+check "server-a1 does NOT inject X-User-Credential" "$([ -z "$DEV1_A1_USER_CRED" ] && echo true || echo false)" "got: $DEV1_A1_USER_CRED"
+
+# Verify server-a2 does NOT inject team credential
+DEV1_A2_TEAM_CRED=$(extract_header_value "$DEV1_A2_HEADERS" "X-Team-Credential")
+check "server-a2 does NOT inject X-Team-Credential" "$([ -z "$DEV1_A2_TEAM_CRED" ] && echo true || echo false)" "got: $DEV1_A2_TEAM_CRED"
 
 ########################################
 # Summary

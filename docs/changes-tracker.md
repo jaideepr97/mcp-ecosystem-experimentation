@@ -230,3 +230,15 @@ The 500 is a presentation issue in the broker — it doesn't distinguish "server
 - MCPServer `github` in `mcp-test` (with `gateway-credential-ref` annotation)
 - Secret `github-broker-credential` in `mcp-test` (label: `mcp.kuadrant.io/secret: "true"`)
 - AuthPolicy `github-auth-policy` in `mcp-test` (Vault token exchange flow)
+- `team-a` namespace + Gateway + MCPGatewayExtension + NodePort (Phase 16)
+- `test-server-a1` MCPServer + Deployment + Service in `team-a` (5 tools)
+- `test-server-a2` MCPServer + Deployment + Service in `team-a` (7 tools)
+- `keycloak-auth` Service in `keycloak` (in-cluster access for Authorino JWKS)
+- Keycloak groups: `team-a-developers`, `team-a-ops`, `team-a-leads` (Phase 17)
+- Keycloak users: dev1, dev2, ops1, ops2, lead1 assigned to groups
+- VirtualMCPServer `virtualserver-dev`, `virtualserver-ops`, `virtualserver-leads` in `team-a`
+- AuthPolicy `team-a-gateway-auth` in `team-a` (gateway-level JWT + X-Mcp-Virtualserver injection)
+- AuthPolicy `team-a-auth-server-a1` in `team-a` (per-HTTPRoute CEL group predicates + Vault team credential)
+- AuthPolicy `team-a-auth-server-a2` in `team-a` (per-HTTPRoute CEL group predicates + Vault per-user credential)
+- Vault team-level secrets: `secret/mcp-gateway/teams/{group}` (Phase 18)
+- Vault per-user secrets: `secret/mcp-gateway/users/{sub}` (Phase 18)

@@ -1866,6 +1866,97 @@ Each uses CEL predicates matching group membership to allowed tool names — a w
 
 ---
 
+## Phase 18: Vault Credential Patterns — Team-Level and Per-User Injection
+
+Phase 17 established who can call which tools. Phase 18 answers the next question: how do MCP servers get the credentials they need to call downstream APIs on behalf of the user?
+
+Two patterns were implemented, one per upstream server:
+- **Server-a1**: team-level credentials (shared API key per group)
+- **Server-a2**: per-user credentials (personal API key per Keycloak user)
+
+Both use AuthPolicy metadata evaluators to exchange the user's JWT for a Vault token, then read the appropriate secret, and inject the credential as a response header to the upstream server.
+
+### Vault secret storage
+
+Secrets were stored in Vault's KV v2 engine under `secret/mcp-gateway/`:
+
+**Team-level** (`teams/{group-name}`):
+- `teams/team-a-developers` → `api_key=team-dev-shared-key-001`
+- `teams/team-a-ops` → `api_key=team-ops-shared-key-002`
+- `teams/team-a-leads` → `api_key=team-leads-shared-key-003`
+
+**Per-user** (`users/{keycloak-sub}`):
+- `users/{dev1-sub}` → `api_key=dev1-personal-key`
+- `users/{dev2-sub}` → `api_key=dev2-personal-key`
+- (same pattern for ops1, ops2, lead1)
+
+### AuthPolicy metadata evaluators
+
+Each per-HTTPRoute AuthPolicy gained two metadata evaluators chained by priority:
+
+**Stage 1 (priority 0): `vault_token`** — exchanges the user's JWT for a Vault client token:
+```yaml
+vault_token:
+  http:
+    url: http://vault.vault.svc.cluster.local:8200/v1/auth/jwt/login
+    method: POST
+    body:
+      expression: |
+        '{"role":"authorino","jwt":"' + request.headers.authorization.split(' ')[1] + '"}'
+    contentType: application/json
+```
+
+**Stage 2 (priority 1): `vault_team_secret` or `vault_user_secret`** — reads the credential from Vault using the token from stage 1.
+
+For server-a1 (team-level), the URL uses a CEL ternary to select the group path:
+```yaml
+urlExpression: |
+  'http://vault.vault.svc.cluster.local:8200/v1/secret/data/mcp-gateway/teams/'
+  + (auth.identity.groups.exists(g, g == 'team-a-leads') ? 'team-a-leads'
+  : auth.identity.groups.exists(g, g == 'team-a-ops') ? 'team-a-ops'
+  : 'team-a-developers')
+```
+
+For server-a2 (per-user), the URL uses the JWT `sub` claim:
+```yaml
+urlExpression: |
+  'http://vault.vault.svc.cluster.local:8200/v1/secret/data/mcp-gateway/users/' + auth.identity.sub
+```
+
+### CRD field discovery: three failed approaches before success
+
+Extracting the raw JWT from the `Authorization: Bearer <token>` header proved unexpectedly difficult:
+
+1. **`auth.identity.jwt`** — this key doesn't exist in Authorino's CEL context. The identity object contains decoded claims only.
+2. **gjson `@extract` selector** — `{context.request.http.headers.authorization.@extract:{"sep":" ","pos":1}}` extracted "Bearer" (position 0) rather than the token (position 1). The gjson extract syntax is poorly documented for Authorino's context.
+3. **CEL `request.headers.authorization.split(' ')[1]`** — works. CEL string functions are available in metadata evaluator body expressions.
+
+A related discovery: `url` and `urlExpression` are separate top-level fields in the CRD — not `url.expression` as a nested field. And metadata key names with hyphens (e.g., `vault-token`) cause CEL parse errors when referenced as `auth.metadata.vault-token` because the hyphen is interpreted as a minus operator. Fixed by using underscored names (`vault_token`).
+
+### Response header injection
+
+Each AuthPolicy's response section injects the Vault secret as a header:
+
+- Server-a1: `x-team-credential` → `auth.metadata.vault_team_secret.data.data.api_key`
+- Server-a2: `x-user-credential` → `auth.metadata.vault_user_secret.data.data.api_key`
+
+The double `.data.data` traversal reflects Vault's KV v2 response envelope: `{data: {data: {api_key: "..."}}}`.
+
+### Test results
+
+| User | Group | Server-a1 `x-team-credential` | Server-a2 `x-user-credential` |
+|------|-------|------------------------------|------------------------------|
+| dev1 | team-a-developers | `team-dev-shared-key-001` ✓ | `dev1-personal-key` ✓ |
+| lead1 | team-a-leads | `team-leads-shared-key-003` ✓ | `lead1-personal-key` ✓ |
+
+The `headers` tool on each server confirms the injected credential header. The upstream MCP server sees only the credential — it never sees the user's JWT or Vault token.
+
+### Key insight: scope parameter is critical
+
+Token requests to Keycloak must include `scope=openid groups` for the `groups` claim to appear in the JWT. Without it, AuthPolicy CEL predicates referencing `auth.identity.groups` fail with "no such key: groups". The test pipeline and client scripts already used this scope, but it's a common gotcha for manual testing.
+
+---
+
 ## Key Learnings
 
 1. **Istio is not a service mesh here** — only istiod is used, purely as a Gateway API controller that programs Envoy. No sidecars, no ambient mode.

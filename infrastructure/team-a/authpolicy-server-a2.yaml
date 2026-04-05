@@ -13,6 +13,24 @@ spec:
       keycloak:
         jwt:
           issuerUrl: http://keycloak.127-0-0-1.sslip.io:8002/realms/mcp
+    metadata:
+      vault_token:
+        http:
+          url: http://vault.vault.svc.cluster.local:8200/v1/auth/jwt/login
+          method: POST
+          body:
+            expression: |
+              '{"role":"authorino","jwt":"' + request.headers.authorization.split(' ')[1] + '"}'
+          contentType: application/json
+        priority: 0
+      vault_user_secret:
+        http:
+          urlExpression: |
+            'http://vault.vault.svc.cluster.local:8200/v1/secret/data/mcp-gateway/users/' + auth.identity.sub
+          headers:
+            X-Vault-Token:
+              expression: auth.metadata.vault_token.auth.client_token
+        priority: 1
     authorization:
       group-tool-access:
         patternMatching:
@@ -25,6 +43,11 @@ spec:
                 || (auth.identity.groups.exists(g, g == 'team-a-leads')
                 && request.headers['x-mcp-toolname'] in ['auth1234', 'headers', 'hello_world', 'pour_chocolate_into_mold', 'set_time', 'slow', 'time'])
     response:
+      success:
+        headers:
+          x-user-credential:
+            plain:
+              expression: auth.metadata.vault_user_secret.data.data.api_key
       unauthenticated:
         body:
           value: |

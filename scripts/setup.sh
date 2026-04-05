@@ -342,6 +342,8 @@ create_user_with_group() {
     -H "Content-Type: application/json" \
     -d "{
       \"username\": \"${username}\",
+      \"firstName\": \"${username}\",
+      \"lastName\": \"User\",
       \"email\": \"${username}@example.com\",
       \"emailVerified\": true,
       \"enabled\": true,
@@ -378,6 +380,39 @@ create_user_with_group "ops2" "$OPS_GROUP_ID" "team-a-ops"
 
 ADMIN_TOKEN=$(get_admin_token)
 create_user_with_group "lead1" "$LEADS_GROUP_ID" "team-a-leads"
+
+########################################
+# Phase 18: Vault credential storage
+# Store team-level and per-user secrets in Vault for credential injection.
+# AuthPolicy metadata evaluators exchange JWT for Vault token, then read secrets.
+########################################
+info "Phase 18: Storing Vault credentials for team-a..."
+
+VAULT_NS="vault"
+VAULT_CMD="VAULT_ADDR=http://127.0.0.1:8200 VAULT_TOKEN=root"
+
+# Team-level secrets (shared by group)
+info "  Storing team-level secrets..."
+kubectl exec -n "$VAULT_NS" deploy/vault -- sh -c \
+  "${VAULT_CMD} vault kv put secret/mcp-gateway/teams/team-a-developers api_key=team-dev-shared-key-001"
+kubectl exec -n "$VAULT_NS" deploy/vault -- sh -c \
+  "${VAULT_CMD} vault kv put secret/mcp-gateway/teams/team-a-ops api_key=team-ops-shared-key-002"
+kubectl exec -n "$VAULT_NS" deploy/vault -- sh -c \
+  "${VAULT_CMD} vault kv put secret/mcp-gateway/teams/team-a-leads api_key=team-leads-shared-key-003"
+
+# Per-user secrets (keyed by Keycloak sub claim)
+info "  Storing per-user secrets..."
+ADMIN_TOKEN=$(get_admin_token)
+for username in dev1 dev2 ops1 ops2 lead1; do
+  USER_SUB=$(curl -s "${KEYCLOAK_ADMIN_URL}/users?username=${username}&exact=true" \
+    -H "Authorization: Bearer ${ADMIN_TOKEN}" | \
+    python3 -c "import sys,json; users=json.load(sys.stdin); print(users[0]['id'] if users else '')")
+  if [ -n "$USER_SUB" ]; then
+    kubectl exec -n "$VAULT_NS" deploy/vault -- sh -c \
+      "${VAULT_CMD} vault kv put secret/mcp-gateway/users/${USER_SUB} api_key=${username}-personal-key"
+    info "  User ${username} (${USER_SUB}) → personal key stored"
+  fi
+done
 
 ########################################
 # Phase 14: VirtualMCPServers + AuthPolicies

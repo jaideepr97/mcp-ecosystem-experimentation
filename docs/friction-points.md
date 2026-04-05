@@ -1,6 +1,6 @@
 # MCP Ecosystem Friction Points
 
-Upstream limitations discovered during the MCP ecosystem experimentation (Phases 1-17) that required workarounds, custom code, or manual intervention. Each entry identifies the upstream project, the specific limitation, the workaround applied, and whether the workaround is temporary or permanent.
+Upstream limitations discovered during the MCP ecosystem experimentation (Phases 1-18) that required workarounds, custom code, or manual intervention. Each entry identifies the upstream project, the specific limitation, the workaround applied, and whether the workaround is temporary or permanent.
 
 Excludes Kind-specific infrastructure issues (MetalLB, CoreDNS, NodePort mappings) that do not apply to OpenShift AI deployments. Excludes helper/toy projects (mcp-launcher, mini-oidc) that were experiment scaffolding.
 
@@ -70,6 +70,17 @@ These three are symptoms of a deeper issue: **OCI images are opaque, and catalog
 
 ---
 
+## Kuadrant / Authorino Metadata Evaluators
+
+| # | Limitation | Workaround | Severity | Durability |
+|---|-----------|-----------|----------|------------|
+| 20 | **`auth.identity.jwt` does not exist in CEL context** — the identity object contains only decoded JWT claims. There is no built-in way to access the raw JWT token string from within a metadata evaluator's CEL expression. | Use `request.headers.authorization.split(' ')[1]` to extract the raw JWT from the `Authorization: Bearer <token>` header. Two other approaches failed first: gjson `@extract` selector extracted "Bearer" (wrong position), and `auth.identity.jwt` threw a key-not-found error. | Moderate | Until Authorino exposes the raw token in CEL context or documents the correct approach |
+| 21 | **Hyphenated metadata key names cause CEL parse errors** — metadata keys like `vault-token` are treated as minus operators when referenced in CEL expressions (`auth.metadata.vault-token` → `vault minus token`). | Use underscored key names (`vault_token`) for all metadata evaluator keys. Applies to any key referenced in subsequent CEL expressions (other metadata evaluators, authorization predicates, response rules). | Minor | Permanent — CEL language design, not a bug |
+| 22 | **`urlExpression` and `url` are separate top-level fields, not nested** — attempting `url: { expression: ... }` or `url.expression` fails with CRD validation errors. The two fields serve different purposes: `url` accepts a static string with optional gjson selectors, `urlExpression` accepts a CEL string. | Use the top-level `urlExpression:` field for dynamic URLs. Discovered through CRD validation errors — the CRD schema is correct but the distinction is not obvious from examples. | Minor | Permanent — CRD schema documentation gap |
+| 23 | **`groups` claim requires explicit scope in token request** — AuthPolicy CEL predicates referencing `auth.identity.groups` fail silently with "no such key: groups" if the Keycloak token was issued without `scope=openid groups`. The error message gives no hint about the missing scope. | Include `scope=openid groups` in all token requests (password grant, device flow, etc.). Ensure Keycloak's client has `groups` in its default scopes. | Moderate | Permanent — Keycloak/OIDC design; Authorino could improve the error message |
+
+---
+
 ## Env-Var Credential Servers (Cross-Cutting)
 
 | # | Limitation | Workaround | Severity | Durability |
@@ -86,7 +97,7 @@ These three are symptoms of a deeper issue: **OCI images are opaque, and catalog
 | **Critical upstream gaps** | 2 | mcp-gateway: VirtualMCPServer namespace, EnvoyFilter HTTPS |
 | **Architectural gaps** | 6 | Catalog schema (3), CEL scaling, env-var credentials, operator-catalog integration |
 | **Accepted limitations** | 3 | `tools/list` filtering, 500 vs 403, env-var servers |
-| **Operational gotchas** | 6 | Keycloak (3), TLSPolicy, credential label, VirtualMCPServer header format |
+| **Operational gotchas** | 10 | Keycloak (3), TLSPolicy, credential label, VirtualMCPServer header format, metadata evaluator CEL (4) |
 
 **Single custom image carried**: `quay.io/jrao/mcp-lifecycle-operator:gateway-credential-ref` — addresses both forked items (#1 and #2). This is the only image that would need upstreaming or maintaining for an OpenShift AI migration.
 
