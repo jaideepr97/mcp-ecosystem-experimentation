@@ -293,3 +293,145 @@ The platform engineer's declarative configuration creates a self-service experie
 | Namespace + Gateway + MCPGatewayExtension | "I have one URL to connect to" |
 
 The platform engineer's work is entirely in Kubernetes manifests and API calls. The AI engineer's experience is entirely MCP protocol. The gateway layer bridges the two.
+
+---
+
+## Deployment Patterns: Responsibility Distribution
+
+The flows above describe one specific distribution of responsibilities — the **Platform-Managed** pattern, where the platform engineer owns everything and the AI engineer is a pure consumer. This is not the only option. Different organizational contexts call for different splits.
+
+The table below summarizes six patterns. Each shifts the boundary between platform engineer and AI engineer ownership. The right choice depends on team maturity, regulatory requirements, and how many AI engineers the platform team needs to support.
+
+### Pattern 1: Platform-Managed (current experiment)
+
+**When to use:** Regulated environments (SOC2, HIPAA, FedRAMP), early adoption where AI teams are new to MCP, or any situation where centralized control over tool access and credentials is required.
+
+**Why:** The platform engineer controls the full blast radius — what servers are deployed, who can see which tools, and how credentials are injected. The AI engineer cannot introduce new tools, escalate access, or misconfigure auth. This is the safest starting point.
+
+| Resource / Action | Platform Engineer | AI Engineer |
+|-------------------|:-:|:-:|
+| Namespace + Gateway + MCPGatewayExtension | Owns | — |
+| MCPServer CRs (deploy servers) | Owns | — |
+| Keycloak groups + users | Owns | — |
+| Vault credential secrets | Owns | — |
+| VirtualMCPServers (tool curation) | Owns | — |
+| AuthPolicies (authorization + credential injection) | Owns | — |
+| Authenticate + get token | — | Owns |
+| tools/list, tools/call | — | Owns |
+
+### Pattern 2: Self-Service Server Registration
+
+**When to use:** Platform team + mature AI/ML teams that build or operate their own MCP servers. The AI team knows what tools they need and can write MCPServer CRs, but shouldn't manage auth or networking.
+
+**Why:** Shifts server lifecycle to the team closest to the problem. The platform engineer provides guardrails (namespace quotas, network policy, default auth), and the AI engineer deploys servers within those boundaries. This is the standard OpenShift model — platform team provides the cluster, app teams own their workloads.
+
+| Resource / Action | Platform Engineer | AI Engineer |
+|-------------------|:-:|:-:|
+| Namespace + Gateway + MCPGatewayExtension | Owns | — |
+| MCPServer CRs (deploy servers) | — | Owns |
+| Keycloak groups + users | Owns | — |
+| Vault credential secrets | Owns | — |
+| VirtualMCPServers (tool curation) | Owns (or shared) | May request changes |
+| AuthPolicies (authorization + credential injection) | Owns | — |
+| Authenticate + get token | — | Owns |
+| tools/list, tools/call | — | Owns |
+
+**Key difference from Pattern 1:** The AI engineer creates MCPServer CRs in their namespace. The lifecycle operator handles downstream resources (Deployment, HTTPRoute, MCPServerRegistration). The platform engineer still controls who can call what via AuthPolicies — so a new server's tools are not accessible until the platform engineer adds them to the relevant AuthPolicy and VirtualMCPServer.
+
+### Pattern 3: AI Engineer Manages Tool Curation
+
+**When to use:** When AI engineers have diverse tool needs and the platform engineer shouldn't be a bottleneck for "which tools do I see." Individual AI engineers or teams want to customize their tool views without waiting for platform changes.
+
+**Why:** VirtualMCPServers are presentation-only (they don't enforce authorization), so letting AI engineers manage them carries no security risk. The AuthPolicy remains the enforcement boundary, owned by the platform engineer.
+
+| Resource / Action | Platform Engineer | AI Engineer |
+|-------------------|:-:|:-:|
+| Namespace + Gateway + MCPGatewayExtension | Owns | — |
+| MCPServer CRs (deploy servers) | Owns | — |
+| Keycloak groups + users | Owns | — |
+| Vault credential secrets | Owns | — |
+| VirtualMCPServers (tool curation) | — | Owns |
+| AuthPolicies (authorization + credential injection) | Owns | — |
+| Authenticate + get token | — | Owns |
+| tools/list, tools/call | — | Owns |
+
+**Key difference:** The AI engineer creates/modifies VirtualMCPServers to curate their own tool views. The gateway-level AuthPolicy would need to be adapted to allow user-specified or default VirtualMCPServer selection rather than the current group-based CEL ternary.
+
+**Caveat:** If a VirtualMCPServer lists tools the user's group can't call, the user sees tools they'll get 403 on. The platform engineer must communicate the available tool list or provide tooling to prevent this mismatch.
+
+### Pattern 4: AI Engineer as Namespace Admin
+
+**When to use:** Large, autonomous AI/ML platform teams that have Kubernetes expertise and want full control over their MCP environment. The central platform team acts as SRE/infrastructure, not application owners.
+
+**Why:** Maximum autonomy for the AI team. They own the entire namespace — gateway, servers, auth, credentials. The platform engineer provides the shared control plane (operators, Keycloak realm, Vault cluster, cert-manager, Kuadrant) and namespace provisioning. This mirrors the "namespace-as-a-service" model.
+
+| Resource / Action | Platform Engineer | AI Engineer |
+|-------------------|:-:|:-:|
+| Shared control plane (operators, Keycloak, Vault, cert-manager, Kuadrant) | Owns | — |
+| Namespace provisioning + resource quotas | Owns | — |
+| Gateway + MCPGatewayExtension | — | Owns |
+| MCPServer CRs (deploy servers) | — | Owns |
+| Keycloak groups + users (within their scope) | — | Owns |
+| Vault credential secrets (within their path) | — | Owns |
+| VirtualMCPServers (tool curation) | — | Owns |
+| AuthPolicies (authorization + credential injection) | — | Owns |
+| Authenticate + get token | — | Owns |
+| tools/list, tools/call | — | Owns |
+
+**Key difference:** The platform engineer's scope shrinks to shared infrastructure and namespace provisioning. The AI team must understand AuthPolicies, Vault integration, and VirtualMCPServers. Higher autonomy, higher required expertise. The platform engineer may provide templates or Helm charts to reduce boilerplate.
+
+### Pattern 5: Catalog-Driven Provisioning
+
+**When to use:** Large organizations with many casual AI tool users (data scientists, analysts, prompt engineers) who should not need to understand Kubernetes. The platform engineer curates a menu of approved MCP servers.
+
+**Why:** The AI engineer's interface is a catalog (web UI or CLI), not kubectl. The platform engineer controls what's available; the AI engineer controls what's deployed in their namespace. This is the internal marketplace model — similar to OperatorHub for cluster services.
+
+| Resource / Action | Platform Engineer | AI Engineer |
+|-------------------|:-:|:-:|
+| Namespace + Gateway + MCPGatewayExtension | Owns | — |
+| Catalog of approved MCP servers | Owns | — |
+| MCPServer CRs (provisioned via catalog) | Automated | Triggers (via catalog UI) |
+| Keycloak groups + users | Owns | — |
+| Vault credential secrets | Owns (or automated) | — |
+| VirtualMCPServers (auto-generated from catalog selections) | Automated | Selects tools |
+| AuthPolicies (authorization + credential injection) | Owns (template-based) | — |
+| Authenticate + get token | — | Owns |
+| tools/list, tools/call | — | Owns |
+
+**Key difference:** The AI engineer never writes YAML. Server deployment is triggered through a catalog UI (the launcher or similar). VirtualMCPServers and AuthPolicies may be auto-generated based on catalog selections and the user's group membership. Requires investment in catalog curation and automation.
+
+### Pattern 6: Shared Gateway, Policy-Isolated Teams
+
+**When to use:** Small organizations or early-stage adoption where per-namespace isolation is overkill. A single team or a handful of teams share one gateway, distinguished only by group-based policies.
+
+**Why:** Simplest infrastructure footprint — one namespace, one gateway, one broker. Multiple teams are separated by Keycloak groups, VirtualMCPServers, and AuthPolicy CEL predicates. No namespace-per-team overhead. Trade-off: weaker isolation (all servers visible to the broker, separation is policy-only, not physical).
+
+| Resource / Action | Platform Engineer | AI Engineer |
+|-------------------|:-:|:-:|
+| Single namespace + Gateway + MCPGatewayExtension | Owns | — |
+| MCPServer CRs (all teams' servers in one namespace) | Owns | — |
+| Keycloak groups + users | Owns | — |
+| Vault credential secrets | Owns | — |
+| VirtualMCPServers (one per group/team) | Owns | — |
+| AuthPolicies (authorization + credential injection) | Owns | — |
+| Authenticate + get token | — | Owns |
+| tools/list, tools/call | — | Owns |
+
+**Key difference:** No namespace isolation. All MCP servers live in a single namespace behind one gateway. VirtualMCPServers and AuthPolicies provide logical separation. The broker sees all servers — if a VirtualMCPServer or AuthPolicy is misconfigured, a user may see or call tools from another team. Appropriate only when the teams trust each other and the compliance bar is low.
+
+---
+
+### Recommended Progression
+
+Most organizations should start with **Pattern 1 (Platform-Managed)** and evolve as their AI teams mature:
+
+```
+Pattern 1 (Platform-Managed)
+  → Pattern 2 (Self-Service Servers)    — when AI teams start building their own MCP servers
+  → Pattern 4 (Namespace Admin)         — when AI teams have full Kubernetes expertise
+  → Pattern 5 (Catalog-Driven)          — when scaling to many non-technical AI users
+```
+
+Pattern 6 (Shared Gateway) is a valid starting point for small teams that need to move fast, but should migrate to Pattern 1 once a second team is onboarded or compliance requirements appear.
+
+Pattern 3 (AI Engineer Manages Curation) can be layered on top of any other pattern — it's an incremental delegation of VirtualMCPServer ownership, not a standalone architecture.
