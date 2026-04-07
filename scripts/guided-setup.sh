@@ -139,12 +139,17 @@ phase_done() {
 }
 
 show_resources() {
-  # Show the actual resources created during a phase by running kubectl commands.
-  # Usage: show_resources "label: kubectl args" "label: kubectl args" ...
-  # Each argument is "LABEL: kubectl get args..." — the label is shown as a header.
-
   local output=""
   for entry in "$@"; do
+    # Section headers start with #
+    if [[ "$entry" == \#* ]]; then
+      local header="${entry#\#}"
+      if [ -n "$output" ]; then
+        output="${output}\n"
+      fi
+      output="${output}── ${header} ──\n"
+      continue
+    fi
     local label="${entry%%:*}"
     local cmd="${entry#*: }"
     local items
@@ -318,6 +323,7 @@ if confirm_phase 3; then
     kubectl -n istio-system wait --for=condition=Ready istio/default --timeout=300s
   phase_done 3
   show_resources \
+    "#Istio Control Plane" \
     "Deployments: deployments -n istio-system" \
     "Pods: pods -n istio-system" \
     "Istio: istio -n istio-system"
@@ -363,8 +369,10 @@ if confirm_phase 4; then
     bash -c "'${REPO_DIR}/infrastructure/metallb/ipaddresspool.sh' kind | kubectl apply -n metallb-system -f -"
   phase_done 4
   show_resources \
+    "#MetalLB Load Balancer" \
     "Deployments: deployments -n metallb-system" \
     "Pods: pods -n metallb-system" \
+    "#IP Address Configuration" \
     "IPAddressPools: ipaddresspool -n metallb-system" \
     "L2Advertisements: l2advertisement -n metallb-system"
 fi
@@ -424,8 +432,10 @@ if confirm_phase 5; then
     kubectl wait --for=condition=Ready certificate/mcp-ca-cert -n cert-manager --timeout=60s
   phase_done 5
   show_resources \
+    "#cert-manager" \
     "Deployments: deployments -n cert-manager" \
     "Pods: pods -n cert-manager" \
+    "#Certificate Chain" \
     "ClusterIssuers: clusterissuer" \
     "Certificates: certificate -n cert-manager"
 fi
@@ -474,6 +484,7 @@ if confirm_phase 6; then
     kubectl wait --for=condition=Programmed gateway/mcp-gateway -n gateway-system --timeout=300s
   phase_done 6
   show_resources \
+    "#Gateway Infrastructure" \
     "Gateways: gateway -n gateway-system" \
     "Services: services -n gateway-system" \
     "Pods: pods -n gateway-system" \
@@ -537,10 +548,12 @@ if confirm_phase 7; then
     kubectl wait --for=condition=Ready mcpgatewayextension/mcp-gateway-extension -n mcp-system --timeout=120s
   phase_done 7
   show_resources \
-    "MCP CRDs: crd mcpserverregistrations.mcp.kuadrant.io mcpvirtualservers.mcp.kuadrant.io mcpgatewayextensions.mcp.kuadrant.io" \
+    "#MCP CRDs" \
+    "CRDs: crd mcpserverregistrations.mcp.kuadrant.io mcpvirtualservers.mcp.kuadrant.io mcpgatewayextensions.mcp.kuadrant.io" \
+    "#MCP Controller" \
     "Deployments: deployments -n mcp-system" \
-    "Services: services -n mcp-system" \
     "Pods: pods -n mcp-system" \
+    "#MCPGatewayExtension (creates broker/router)" \
     "MCPGatewayExtensions: mcpgatewayextension -n mcp-system"
 fi
 
@@ -599,9 +612,11 @@ if confirm_phase 8; then
              kubectl apply -f '${REPO_DIR}/infrastructure/operator-gateway/gateway-role-binding.yaml'"
   phase_done 8
   show_resources \
+    "#Lifecycle Operator" \
     "Deployments: deployments -n mcp-lifecycle-operator-system" \
     "Pods: pods -n mcp-lifecycle-operator-system" \
-    "Operator CRDs: crd mcpservers.mcp.x-k8s.io"
+    "#MCPServer CRD" \
+    "CRD: crd mcpservers.mcp.x-k8s.io"
 fi
 
 fi # phase 8
@@ -650,9 +665,11 @@ if confirm_phase 9; then
     kubectl wait --for=condition=Ready pod -l app=mcp-catalog -n catalog-system --timeout=120s
   phase_done 9
   show_resources \
+    "#Catalog API" \
     "Deployments: deployments -n catalog-system" \
     "Pods: pods -n catalog-system" \
     "Services: services -n catalog-system" \
+    "#Catalog Storage" \
     "ConfigMaps: configmaps -n catalog-system" \
     "PVCs: pvc -n catalog-system"
 fi
@@ -708,6 +725,7 @@ if confirm_phase 10; then
     kubectl wait --for=condition=Ready pod -l app=keycloak -n keycloak --timeout=180s
   phase_done 10
   show_resources \
+    "#Keycloak OIDC Provider" \
     "Deployments: deployments -n keycloak" \
     "Pods: pods -n keycloak" \
     "Services: services -n keycloak" \
@@ -784,6 +802,7 @@ if confirm_phase 11; then
   fi
   phase_done 11
   show_resources \
+    "#Kuadrant Authorization Engine" \
     "Deployments: deployments -n kuadrant-system" \
     "Pods: pods -n kuadrant-system" \
     "Kuadrant: kuadrant -n kuadrant-system"
@@ -844,12 +863,24 @@ if confirm_phase 12; then
              kubectl rollout status deployment mcp-gateway -n mcp-system --timeout=120s 2>/dev/null || true"
   phase_done 12
   show_resources \
-    "MCPServers: mcpserver -n mcp-test" \
-    "Deployments: deployments -n mcp-test" \
-    "Services: services -n mcp-test" \
-    "Pods: pods -n mcp-test" \
-    "HTTPRoutes: httproute -n mcp-test" \
-    "MCPServerRegistrations: mcpserverregistration -n mcp-test"
+    "#test-server1 (greet, time, slow, headers, add_tool)" \
+    "MCPServer: mcpserver test-server1 -n mcp-test" \
+    "Deployment: deployment test-server1 -n mcp-test" \
+    "Pod: pods -l app=test-server1 -n mcp-test" \
+    "Service: service test-server1 -n mcp-test" \
+    "HTTPRoute: httproute test-server1 -n mcp-test" \
+    "MCPServerRegistration: mcpserverregistration test-server1 -n mcp-test" \
+    "#test-server2 (hello_world, time, headers, auth1234, slow, set_time)" \
+    "MCPServer: mcpserver test-server2 -n mcp-test" \
+    "Deployment: deployment test-server2 -n mcp-test" \
+    "Pod: pods -l app=test-server2 -n mcp-test" \
+    "Service: service test-server2 -n mcp-test" \
+    "HTTPRoute: httproute test-server2 -n mcp-test" \
+    "MCPServerRegistration: mcpserverregistration test-server2 -n mcp-test" \
+    "#MCP Launcher" \
+    "Deployment: deployment mcp-launcher -n mcp-test" \
+    "Pod: pods -l app=mcp-launcher -n mcp-test" \
+    "Service: service mcp-launcher -n mcp-test"
 fi
 
 fi # phase 12
