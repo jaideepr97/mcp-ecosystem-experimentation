@@ -154,6 +154,15 @@ phase_done() {
 show_resources() {
   local output=""
   for entry in "$@"; do
+    # Section headers start with #
+    if [[ "$entry" == \#* ]]; then
+      local header="${entry#\#}"
+      if [ -n "$output" ]; then
+        output="${output}\n"
+      fi
+      output="${output}── ${header} ──\n"
+      continue
+    fi
     local label="${entry%%:*}"
     local cmd="${entry#*: }"
     local items
@@ -391,12 +400,20 @@ if confirm_phase 1; then
 
   phase_done 1
   show_resources \
+    "#Cluster" \
     "Nodes: nodes" \
     "Namespaces: namespaces" \
-    "MCP Controller: deployments -n mcp-system" \
+    "#MCP Gateway Controller" \
+    "Controller: deployments -n mcp-system" \
+    "#Lifecycle Operator" \
+    "Operator: deployments -n mcp-lifecycle-operator-system" \
+    "#Identity & Auth" \
     "Keycloak: pods -n keycloak" \
+    "Authorino: pods -l app=authorino -n kuadrant-system" \
+    "#Credentials" \
     "Vault: pods -n vault" \
-    "Catalog: pods -n catalog-system"
+    "#Catalog & Launcher" \
+    "Pods: pods -n catalog-system"
 fi
 
 fi # phase 1
@@ -473,6 +490,21 @@ if confirm_phase 2; then
   # Wait for broker to discover servers
   sleep 5
 
+  # Workaround: race condition between MCPGatewayExtension and MCPServerRegistration
+  # controllers can leave the config secret empty. If no servers are present after
+  # registration, restart the controller to trigger a fresh reconciliation.
+  CONFIG_SERVERS=$(kubectl get secret mcp-gateway-config -n team-a -o jsonpath='{.data.config\.yaml}' 2>/dev/null | base64 -d 2>/dev/null)
+  if ! echo "$CONFIG_SERVERS" | grep -q "url:"; then
+    run_cmd "Config secret empty — restarting mcp-controller..." \
+      bash -c "kubectl rollout restart deploy/mcp-controller -n mcp-system && \
+               kubectl rollout status deploy/mcp-controller -n mcp-system --timeout=60s"
+    run_cmd "Waiting for config to populate..." \
+      bash -c "for i in \$(seq 1 24); do \
+        kubectl get secret mcp-gateway-config -n team-a -o jsonpath='{.data.config\.yaml}' 2>/dev/null | base64 -d 2>/dev/null | grep -q 'url:' && exit 0; \
+        sleep 5; \
+      done; echo 'Warning: config secret may still be empty'"
+  fi
+
   # --- TLS ---
   run_cmd "Applying TLSPolicy..." \
     kubectl apply -f "${REPO_DIR}/infrastructure/team-a/tls-policy.yaml"
@@ -514,15 +546,25 @@ if confirm_phase 2; then
 
   phase_done 2
   show_resources \
-    "Gateway: gateway -n team-a" \
-    "MCPGatewayExtension: mcpgatewayextension -n team-a" \
-    "MCPServers: mcpserver -n team-a" \
-    "Pods: pods -n team-a" \
-    "Services: services -n team-a" \
-    "HTTPRoutes: httproute -n team-a" \
-    "MCPServerRegistrations: mcpserverregistration -n team-a" \
-    "TLSPolicy: tlspolicy -n team-a" \
-    "Certificates: certificate -n team-a"
+    "#Gateway Infrastructure" \
+    "Gateway: gateway/team-a-gateway -n team-a" \
+    "TLSPolicy: tlspolicy/team-a-gateway-tls -n team-a" \
+    "Certificate: certificate -n team-a" \
+    "#Broker/Router (created by MCPGatewayExtension)" \
+    "MCPGatewayExtension: mcpgatewayextension/team-a-gateway-extension -n team-a" \
+    "Deployment: deploy -l app=mcp-gateway -n team-a" \
+    "Service: svc/mcp-gateway -n team-a" \
+    "HTTPRoute: httproute/mcp-gateway-route -n team-a" \
+    "#test-server-a1 (5 tools)" \
+    "MCPServer: mcpserver/test-server-a1 -n team-a" \
+    "Service: svc/test-server-a1 -n team-a" \
+    "HTTPRoute: httproute/test-server-a1 -n team-a" \
+    "MCPServerRegistration: mcpserverregistration/test-server-a1 -n team-a" \
+    "#test-server-a2 (7 tools)" \
+    "MCPServer: mcpserver/test-server-a2 -n team-a" \
+    "Service: svc/test-server-a2 -n team-a" \
+    "HTTPRoute: httproute/test-server-a2 -n team-a" \
+    "MCPServerRegistration: mcpserverregistration/test-server-a2 -n team-a"
 fi
 
 fi # phase 2
@@ -715,8 +757,12 @@ if confirm_phase 4; then
 
   phase_done 4
   show_resources \
+    "#Tool Filtering (presentation layer)" \
     "VirtualMCPServers: mcpvirtualserver -n team-a" \
-    "AuthPolicies: authpolicy -n team-a"
+    "#Authorization (enforcement layer)" \
+    "Gateway AuthPolicy: authpolicy/team-a-gateway-auth -n team-a" \
+    "server-a1 AuthPolicy: authpolicy/team-a-auth-server-a1 -n team-a" \
+    "server-a2 AuthPolicy: authpolicy/team-a-auth-server-a2 -n team-a"
 fi
 
 fi # phase 4

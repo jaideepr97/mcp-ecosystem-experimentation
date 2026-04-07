@@ -20,10 +20,14 @@ data:
         artifacts:
           - uri: oci://ghcr.io/kuadrant/mcp-gateway/test-server1:latest
         tools:
-          - name: hi
+          - name: greet
             description: Returns a greeting message
             accessType: read_only
-            parameters: []
+            parameters:
+              - name: name
+                type: string
+                description: Name to greet
+                required: true
           - name: time
             description: Returns the current server time
             accessType: read_only
