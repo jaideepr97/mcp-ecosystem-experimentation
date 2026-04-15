@@ -196,7 +196,7 @@ check "lifecycle-operator running" \
   "$([ "$(kubectl get deploy mcp-lifecycle-operator-controller-manager -n mcp-lifecycle-operator-system -o jsonpath='{.status.availableReplicas}' 2>/dev/null)" -gt 0 ] 2>/dev/null && echo true || echo false)"
 
 check "Authorino running" \
-  "$(kubectl get pod -l app=authorino -n kuadrant-system -o jsonpath='{.items[0].status.phase}' 2>/dev/null | grep -q Running && echo true || echo false)"
+  "$(kubectl get pod -l authorino-resource=authorino -n kuadrant-system -o jsonpath='{.items[0].status.phase}' 2>/dev/null | grep -q Running && echo true || echo false)"
 
 # Keycloak
 KC_PHASE=$(kubectl get pod -l app=keycloak -n keycloak -o jsonpath='{.items[0].status.phase}' 2>/dev/null)
@@ -244,7 +244,7 @@ EXT_READY=$(kubectl get mcpgatewayextension team-a-gateway-extension -n team-a -
 check "MCPGatewayExtension is Ready" "$([ "$EXT_READY" = "True" ] && echo true || echo false)"
 
 # Broker/router pod
-BROKER_PHASE=$(kubectl get pod -l app=mcp-gateway -n team-a -o jsonpath='{.items[0].status.phase}' 2>/dev/null)
+BROKER_PHASE=$(kubectl get pod -l app.kubernetes.io/name=mcp-gateway -n team-a -o jsonpath='{.items[0].status.phase}' 2>/dev/null)
 check "Broker/router pod running" "$([ "$BROKER_PHASE" = "Running" ] && echo true || echo false)" "status: $BROKER_PHASE"
 
 # MCP servers
@@ -485,7 +485,7 @@ echo "--- Phase 9: Tool delisting (filtering vs enforcement) ---"
 
 # Remove greet from dev-tools VirtualMCPServer config and verify it disappears from tools/list
 # but remains callable via tools/call (proving filtering-only, not enforcement)
-info "  Patching config Secret to remove test_server_a1_greet from dev-tools..."
+echo "  Patching config Secret to remove test_server_a1_greet from dev-tools..."
 CURRENT_CONFIG=$(kubectl get secret mcp-gateway-config -n team-a -o jsonpath='{.data.config\.yaml}' | base64 -d)
 
 # Remove test_server_a1_greet from the dev-tools virtualServer
@@ -512,14 +512,14 @@ kubectl create secret generic mcp-gateway-config -n team-a \
   --dry-run=client -o yaml | kubectl apply -f -
 
 # Restart broker to pick up config change
-BROKER_DEPLOY=$(kubectl get deploy -n team-a -l app=mcp-gateway -o jsonpath='{.items[0].metadata.name}' 2>/dev/null)
+BROKER_DEPLOY=$(kubectl get deploy -n team-a -l app.kubernetes.io/name=mcp-gateway -o jsonpath='{.items[0].metadata.name}' 2>/dev/null)
 if [ -n "$BROKER_DEPLOY" ]; then
   kubectl rollout restart deployment "${BROKER_DEPLOY}" -n team-a
   kubectl rollout status deployment "${BROKER_DEPLOY}" -n team-a --timeout=60s
 fi
 
-# Need a new session after broker restart
-sleep 3
+# Need a new session after broker restart — give broker time to reconnect to upstreams
+sleep 8
 DEV1_TOKEN=$(get_token dev1 dev1)
 DEV1_SESSION=$(init_session "$DEV1_TOKEN")
 
@@ -535,7 +535,7 @@ GREET_CODE=$(call_tool_http_code "$DEV1_TOKEN" "$DEV1_SESSION" "test_server_a1_g
 check "test_server_a1_greet still callable (200)" "$([ "$GREET_CODE" = "200" ] && echo true || echo false)" "got HTTP $GREET_CODE"
 
 # Restore the config
-info "  Restoring config Secret..."
+echo "  Restoring config Secret..."
 kubectl create secret generic mcp-gateway-config -n team-a \
   --from-literal="config.yaml=${CURRENT_CONFIG}" \
   --dry-run=client -o yaml | kubectl apply -f -
@@ -568,6 +568,9 @@ for item in content:
         break
 " 2>/dev/null
 }
+
+# Wait for broker to reconnect to upstreams after Phase 9 restarts
+sleep 8
 
 # Test team-level credential on server-a1 with dev1
 echo "  Testing team-level credential (dev1 → team-a-developers on server-a1)..."

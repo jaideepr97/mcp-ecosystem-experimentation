@@ -510,6 +510,8 @@ if confirm_phase 2; then
     kubectl apply -f "${REPO_DIR}/infrastructure/team-a/tls-policy.yaml"
   run_cmd "Deploying HTTPS NodePort..." \
     kubectl apply -f "${REPO_DIR}/infrastructure/team-a/nodeport-tls.yaml"
+  run_cmd "Creating HTTPS HTTPRoute for broker..." \
+    kubectl apply -f "${REPO_DIR}/infrastructure/team-a/httproute-tls.yaml"
 
   run_cmd "Waiting for TLSPolicy to be enforced..." \
     bash -c "for i in \$(seq 1 12); do \
@@ -554,7 +556,8 @@ if confirm_phase 2; then
     "MCPGatewayExtension: mcpgatewayextension/team-a-gateway-extension -n team-a" \
     "Deployment: deploy -l app=mcp-gateway -n team-a" \
     "Service: svc/mcp-gateway -n team-a" \
-    "HTTPRoute: httproute/mcp-gateway-route -n team-a" \
+    "HTTPRoute (HTTP): httproute/mcp-gateway-route -n team-a" \
+    "HTTPRoute (HTTPS): httproute/mcp-gateway-route-tls -n team-a" \
     "#test-server-a1 (5 tools)" \
     "MCPServer: mcpserver/test-server-a1 -n team-a" \
     "Service: svc/test-server-a1 -n team-a" \
