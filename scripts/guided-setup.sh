@@ -279,7 +279,7 @@ if confirm_phase 1; then
       --wait \
       --timeout=300s \
       "https://github.com/istio-ecosystem/sail-operator/releases/download/${SAIL_VERSION}/sail-operator-${SAIL_VERSION}.tgz"
-  kubectl apply -f "${REPO_DIR}/infrastructure/istio/istio.yaml" >/dev/null 2>&1
+  kubectl apply -f "${REPO_DIR}/infrastructure/kind/istio/istio.yaml" >/dev/null 2>&1
   run_cmd "Waiting for Istio..." \
     kubectl -n istio-system wait --for=condition=Ready istio/default --timeout=300s
 
@@ -291,7 +291,7 @@ if confirm_phase 1; then
   run_cmd "Waiting for MetalLB pods..." \
     kubectl -n metallb-system wait --for=condition=ready pod --selector=app=metallb --timeout=120s
   run_cmd "Configuring IP pool..." \
-    bash -c "'${REPO_DIR}/infrastructure/metallb/ipaddresspool.sh' kind | kubectl apply -n metallb-system -f -"
+    bash -c "'${REPO_DIR}/infrastructure/kind/metallb/ipaddresspool.sh' kind | kubectl apply -n metallb-system -f -"
 
   # --- cert-manager ---
   run_cmd "Adding Helm repos..." \
@@ -307,17 +307,17 @@ if confirm_phase 1; then
     bash -c "kubectl wait --for=condition=Available deployment/cert-manager -n cert-manager --timeout=120s && \
              kubectl wait --for=condition=Available deployment/cert-manager-webhook -n cert-manager --timeout=120s"
   run_cmd "Creating CA issuer chain..." \
-    kubectl apply -f "${REPO_DIR}/infrastructure/cert-manager/issuers.yaml"
+    kubectl apply -f "${REPO_DIR}/infrastructure/kind/cert-manager/issuers.yaml"
   run_cmd "Waiting for CA certificate..." \
     kubectl wait --for=condition=Ready certificate/mcp-ca-cert -n cert-manager --timeout=60s
 
   # --- mcp-gateway CRDs + controller ---
   run_cmd "Installing MCP CRDs..." \
-    bash -c "kubectl apply -f '${REPO_DIR}/infrastructure/mcp-gateway/mcp.kuadrant.io_mcpserverregistrations.yaml' && \
-             kubectl apply -f '${REPO_DIR}/infrastructure/mcp-gateway/mcp.kuadrant.io_mcpvirtualservers.yaml' && \
-             kubectl apply -f '${REPO_DIR}/infrastructure/mcp-gateway/mcp.kuadrant.io_mcpgatewayextensions.yaml'"
+    bash -c "kubectl apply -f '${REPO_DIR}/infrastructure/kind/mcp-gateway/mcp.kuadrant.io_mcpserverregistrations.yaml' && \
+             kubectl apply -f '${REPO_DIR}/infrastructure/kind/mcp-gateway/mcp.kuadrant.io_mcpvirtualservers.yaml' && \
+             kubectl apply -f '${REPO_DIR}/infrastructure/kind/mcp-gateway/mcp.kuadrant.io_mcpgatewayextensions.yaml'"
   run_cmd "Deploying mcp-gateway controller..." \
-    kubectl apply -f "${REPO_DIR}/infrastructure/mcp-gateway/deploy.yaml"
+    kubectl apply -f "${REPO_DIR}/infrastructure/kind/mcp-gateway/deploy.yaml"
   run_cmd "Waiting for mcp-controller..." \
     kubectl wait --for=condition=Available deployment/mcp-controller -n mcp-system --timeout=120s
 
@@ -329,38 +329,38 @@ if confirm_phase 1; then
   run_cmd "Loading image into Kind..." \
     bash -c "${CONTAINER_ENGINE} save '${OPERATOR_IMAGE}' -o '${TMP_TAR}' && kind load image-archive '${TMP_TAR}' --name '${KIND_CLUSTER_NAME}' && rm -f '${TMP_TAR}'"
   run_cmd "Deploying lifecycle operator..." \
-    kubectl apply -f "${REPO_DIR}/infrastructure/lifecycle-operator/deploy.yaml"
+    kubectl apply -f "${REPO_DIR}/infrastructure/kind/lifecycle-operator/deploy.yaml"
   run_cmd "Waiting for operator..." \
     kubectl wait --for=condition=Available deployment/mcp-lifecycle-operator-controller-manager \
       -n mcp-lifecycle-operator-system --timeout=120s
   run_cmd "Applying gateway RBAC..." \
-    bash -c "kubectl apply -f '${REPO_DIR}/infrastructure/operator-gateway/gateway-role.yaml' && \
-             kubectl apply -f '${REPO_DIR}/infrastructure/operator-gateway/gateway-role-binding.yaml'"
+    bash -c "kubectl apply -f '${REPO_DIR}/infrastructure/kind/operator-gateway/gateway-role.yaml' && \
+             kubectl apply -f '${REPO_DIR}/infrastructure/kind/operator-gateway/gateway-role-binding.yaml'"
 
   # --- Catalog ---
   kubectl create namespace catalog-system --dry-run=client -o yaml | kubectl apply -f - >/dev/null 2>&1
   run_cmd "Deploying catalog system..." \
-    bash -c "kubectl apply -f '${REPO_DIR}/infrastructure/catalog/postgres.yaml' && \
-             kubectl apply -f '${REPO_DIR}/infrastructure/catalog/catalog-sources.yaml' && \
-             kubectl apply -f '${REPO_DIR}/infrastructure/catalog/catalog.yaml'"
+    bash -c "kubectl apply -f '${REPO_DIR}/infrastructure/kind/catalog/postgres.yaml' && \
+             kubectl apply -f '${REPO_DIR}/infrastructure/kind/catalog/catalog-sources.yaml' && \
+             kubectl apply -f '${REPO_DIR}/infrastructure/kind/catalog/catalog.yaml'"
   run_cmd "Waiting for catalog pods..." \
     bash -c "kubectl wait --for=condition=Ready pod -l app=mcp-catalog-postgres -n catalog-system --timeout=120s && \
              kubectl wait --for=condition=Ready pod -l app=mcp-catalog -n catalog-system --timeout=120s"
 
   # --- Launcher ---
   run_cmd "Deploying MCP Launcher..." \
-    bash -c "kubectl apply -f '${REPO_DIR}/infrastructure/launcher/rbac.yaml' && \
-             kubectl apply -f '${REPO_DIR}/infrastructure/launcher/deployment.yaml'"
+    bash -c "kubectl apply -f '${REPO_DIR}/infrastructure/kind/launcher/rbac.yaml' && \
+             kubectl apply -f '${REPO_DIR}/infrastructure/kind/launcher/deployment.yaml'"
   run_cmd "Waiting for Launcher..." \
     bash -c "kubectl wait --for=condition=Ready pod -l app=mcp-launcher -n catalog-system --timeout=120s 2>/dev/null || true"
 
   # --- Keycloak ---
   kubectl create namespace keycloak --dry-run=client -o yaml | kubectl apply -f - >/dev/null 2>&1
   run_cmd "Deploying Keycloak..." \
-    bash -c "kubectl apply -f '${REPO_DIR}/infrastructure/keycloak/realm-import.yaml' && \
-             kubectl apply -f '${REPO_DIR}/infrastructure/keycloak/deployment.yaml' && \
-             kubectl apply -f '${REPO_DIR}/infrastructure/keycloak/keycloak-auth-service.yaml' && \
-             kubectl apply -f '${REPO_DIR}/infrastructure/keycloak/nodeport.yaml'"
+    bash -c "kubectl apply -f '${REPO_DIR}/infrastructure/kind/keycloak/realm-import.yaml' && \
+             kubectl apply -f '${REPO_DIR}/infrastructure/kind/keycloak/deployment.yaml' && \
+             kubectl apply -f '${REPO_DIR}/infrastructure/kind/keycloak/keycloak-auth-service.yaml' && \
+             kubectl apply -f '${REPO_DIR}/infrastructure/kind/keycloak/nodeport.yaml'"
   run_cmd "Waiting for Keycloak..." \
     kubectl wait --for=condition=Ready pod -l app=keycloak -n keycloak --timeout=180s
 
@@ -374,7 +374,7 @@ if confirm_phase 1; then
       --timeout=600s \
       --namespace kuadrant-system
   run_cmd "Creating Kuadrant instance..." \
-    kubectl apply -f "${REPO_DIR}/infrastructure/kuadrant/kuadrant.yaml"
+    kubectl apply -f "${REPO_DIR}/infrastructure/kind/kuadrant/kuadrant.yaml"
   run_cmd "Waiting for Authorino..." \
     bash -c "kubectl wait --for=condition=Ready pod -l app=authorino -n kuadrant-system --timeout=120s 2>/dev/null || \
              kubectl wait --for=condition=Ready pod -l authorino-resource -n kuadrant-system --timeout=120s 2>/dev/null || true"
@@ -391,12 +391,12 @@ if confirm_phase 1; then
 
   # --- Vault ---
   run_cmd "Deploying Vault..." \
-    bash -c "kubectl apply -f '${REPO_DIR}/infrastructure/vault/namespace.yaml' && \
-             kubectl apply -f '${REPO_DIR}/infrastructure/vault/deployment.yaml'"
+    bash -c "kubectl apply -f '${REPO_DIR}/infrastructure/kind/vault/namespace.yaml' && \
+             kubectl apply -f '${REPO_DIR}/infrastructure/kind/vault/deployment.yaml'"
   run_cmd "Waiting for Vault..." \
     kubectl wait --for=condition=Ready pod -l app=vault -n vault --timeout=120s
   run_cmd "Configuring Vault JWT auth..." \
-    "${REPO_DIR}/infrastructure/vault/configure.sh"
+    "${REPO_DIR}/infrastructure/kind/vault/configure.sh"
 
   phase_done 1
   show_resources \
@@ -466,23 +466,23 @@ This is where the multi-tenancy model comes alive. Each team gets:
 "
 
 if confirm_phase 2; then
-  kubectl apply -f "${REPO_DIR}/infrastructure/team-a/namespace.yaml" >/dev/null 2>&1
+  kubectl apply -f "${REPO_DIR}/infrastructure/kind/team-a/namespace.yaml" >/dev/null 2>&1
   run_cmd "Deploying team-a Gateway..." \
-    kubectl apply -f "${REPO_DIR}/infrastructure/team-a/gateway.yaml"
+    kubectl apply -f "${REPO_DIR}/infrastructure/kind/team-a/gateway.yaml"
   run_cmd "Waiting for Gateway to be programmed..." \
     kubectl wait --for=condition=Programmed gateway/team-a-gateway -n team-a --timeout=300s
 
   run_cmd "Deploying MCPGatewayExtension (creates broker/router)..." \
-    kubectl apply -f "${REPO_DIR}/infrastructure/team-a/mcpgatewayextension.yaml"
+    kubectl apply -f "${REPO_DIR}/infrastructure/kind/team-a/mcpgatewayextension.yaml"
   run_cmd "Waiting for MCPGatewayExtension..." \
     kubectl wait --for=condition=Ready mcpgatewayextension/team-a-gateway-extension -n team-a --timeout=120s
 
   run_cmd "Deploying NodePort service..." \
-    kubectl apply -f "${REPO_DIR}/infrastructure/team-a/nodeport.yaml"
+    kubectl apply -f "${REPO_DIR}/infrastructure/kind/team-a/nodeport.yaml"
 
   run_cmd "Deploying MCP servers..." \
-    bash -c "kubectl apply -f '${REPO_DIR}/infrastructure/team-a/test-server-a1.yaml' && \
-             kubectl apply -f '${REPO_DIR}/infrastructure/team-a/test-server-a2.yaml'"
+    bash -c "kubectl apply -f '${REPO_DIR}/infrastructure/kind/team-a/test-server-a1.yaml' && \
+             kubectl apply -f '${REPO_DIR}/infrastructure/kind/team-a/test-server-a2.yaml'"
   run_cmd "Waiting for MCP servers..." \
     bash -c "kubectl wait --for=condition=Ready mcpserver/test-server-a1 -n team-a --timeout=120s 2>/dev/null; \
              kubectl wait --for=condition=Ready mcpserver/test-server-a2 -n team-a --timeout=120s 2>/dev/null || true"
@@ -507,11 +507,11 @@ if confirm_phase 2; then
 
   # --- TLS ---
   run_cmd "Applying TLSPolicy..." \
-    kubectl apply -f "${REPO_DIR}/infrastructure/team-a/tls-policy.yaml"
+    kubectl apply -f "${REPO_DIR}/infrastructure/kind/team-a/tls-policy.yaml"
   run_cmd "Deploying HTTPS NodePort..." \
-    kubectl apply -f "${REPO_DIR}/infrastructure/team-a/nodeport-tls.yaml"
+    kubectl apply -f "${REPO_DIR}/infrastructure/kind/team-a/nodeport-tls.yaml"
   run_cmd "Creating HTTPS HTTPRoute for broker..." \
-    kubectl apply -f "${REPO_DIR}/infrastructure/team-a/httproute-tls.yaml"
+    kubectl apply -f "${REPO_DIR}/infrastructure/kind/team-a/httproute-tls.yaml"
 
   run_cmd "Waiting for TLSPolicy to be enforced..." \
     bash -c "for i in \$(seq 1 12); do \
@@ -746,17 +746,17 @@ Adding a new group requires editing the existing AuthPolicy, not applying a new 
 
 if confirm_phase 4; then
   run_cmd "Applying VirtualMCPServer CRs..." \
-    bash -c "kubectl apply -f '${REPO_DIR}/infrastructure/team-a/virtualserver-dev.yaml' && \
-             kubectl apply -f '${REPO_DIR}/infrastructure/team-a/virtualserver-ops.yaml' && \
-             kubectl apply -f '${REPO_DIR}/infrastructure/team-a/virtualserver-leads.yaml'"
+    bash -c "kubectl apply -f '${REPO_DIR}/infrastructure/kind/team-a/virtualserver-dev.yaml' && \
+             kubectl apply -f '${REPO_DIR}/infrastructure/kind/team-a/virtualserver-ops.yaml' && \
+             kubectl apply -f '${REPO_DIR}/infrastructure/kind/team-a/virtualserver-leads.yaml'"
 
   run_cmd "Applying gateway-level AuthPolicy..." \
-    kubectl apply -f "${REPO_DIR}/infrastructure/team-a/gateway-auth-policy.yaml"
+    kubectl apply -f "${REPO_DIR}/infrastructure/kind/team-a/gateway-auth-policy.yaml"
   sleep 5  # Allow gateway-level policy to settle
 
   run_cmd "Applying per-HTTPRoute AuthPolicies..." \
-    bash -c "kubectl apply -f '${REPO_DIR}/infrastructure/team-a/authpolicy-server-a1.yaml' && \
-             kubectl apply -f '${REPO_DIR}/infrastructure/team-a/authpolicy-server-a2.yaml'"
+    bash -c "kubectl apply -f '${REPO_DIR}/infrastructure/kind/team-a/authpolicy-server-a1.yaml' && \
+             kubectl apply -f '${REPO_DIR}/infrastructure/kind/team-a/authpolicy-server-a2.yaml'"
 
   phase_done 4
   show_resources \

@@ -99,7 +99,7 @@ helm upgrade --install sail-operator \
   --timeout=300s \
   "https://github.com/istio-ecosystem/sail-operator/releases/download/${SAIL_VERSION}/sail-operator-${SAIL_VERSION}.tgz"
 
-kubectl apply -f "${REPO_DIR}/infrastructure/istio/istio.yaml"
+kubectl apply -f "${REPO_DIR}/infrastructure/kind/istio/istio.yaml"
 wait_for "Istio to become ready..."
 kubectl -n istio-system wait --for=condition=Ready istio/default --timeout=300s
 
@@ -113,7 +113,7 @@ kubectl -n metallb-system wait --for=condition=Available deployments controller 
 kubectl -n metallb-system wait --for=condition=ready pod --selector=app=metallb --timeout=120s
 
 info "Configuring MetalLB IP pool..."
-"${REPO_DIR}/infrastructure/metallb/ipaddresspool.sh" kind | kubectl apply -n metallb-system -f -
+"${REPO_DIR}/infrastructure/kind/metallb/ipaddresspool.sh" kind | kubectl apply -n metallb-system -f -
 
 ########################################
 # Phase 5: cert-manager
@@ -133,7 +133,7 @@ kubectl wait --for=condition=Available deployment/cert-manager -n cert-manager -
 kubectl wait --for=condition=Available deployment/cert-manager-webhook -n cert-manager --timeout=120s
 
 info "Creating CA issuer chain..."
-kubectl apply -f "${REPO_DIR}/infrastructure/cert-manager/issuers.yaml"
+kubectl apply -f "${REPO_DIR}/infrastructure/kind/cert-manager/issuers.yaml"
 wait_for "CA certificate to be ready..."
 kubectl wait --for=condition=Ready certificate/mcp-ca-cert -n cert-manager --timeout=60s
 
@@ -141,10 +141,10 @@ kubectl wait --for=condition=Ready certificate/mcp-ca-cert -n cert-manager --tim
 # Phase 6: mcp-gateway CRDs + controller
 ########################################
 info "Phase 6: Installing mcp-gateway CRDs and controller..."
-kubectl apply -f "${REPO_DIR}/infrastructure/mcp-gateway/mcp.kuadrant.io_mcpserverregistrations.yaml"
-kubectl apply -f "${REPO_DIR}/infrastructure/mcp-gateway/mcp.kuadrant.io_mcpvirtualservers.yaml"
-kubectl apply -f "${REPO_DIR}/infrastructure/mcp-gateway/mcp.kuadrant.io_mcpgatewayextensions.yaml"
-kubectl apply -f "${REPO_DIR}/infrastructure/mcp-gateway/deploy.yaml"
+kubectl apply -f "${REPO_DIR}/infrastructure/kind/mcp-gateway/mcp.kuadrant.io_mcpserverregistrations.yaml"
+kubectl apply -f "${REPO_DIR}/infrastructure/kind/mcp-gateway/mcp.kuadrant.io_mcpvirtualservers.yaml"
+kubectl apply -f "${REPO_DIR}/infrastructure/kind/mcp-gateway/mcp.kuadrant.io_mcpgatewayextensions.yaml"
+kubectl apply -f "${REPO_DIR}/infrastructure/kind/mcp-gateway/deploy.yaml"
 wait_for "mcp-controller to be ready..."
 kubectl wait --for=condition=Available deployment/mcp-controller -n mcp-system --timeout=120s
 
@@ -159,30 +159,30 @@ ${CONTAINER_ENGINE} save "${OPERATOR_IMAGE}" -o "${TMP_TAR}"
 kind load image-archive "${TMP_TAR}" --name "${KIND_CLUSTER_NAME}"
 rm -f "${TMP_TAR}"
 
-kubectl apply -f "${REPO_DIR}/infrastructure/lifecycle-operator/deploy.yaml"
+kubectl apply -f "${REPO_DIR}/infrastructure/kind/lifecycle-operator/deploy.yaml"
 wait_for "Lifecycle operator to be ready..."
 kubectl wait --for=condition=Available deployment/mcp-lifecycle-operator-controller-manager \
   -n mcp-lifecycle-operator-system --timeout=120s
 
 info "Applying operator-gateway RBAC..."
-kubectl apply -f "${REPO_DIR}/infrastructure/operator-gateway/gateway-role.yaml"
-kubectl apply -f "${REPO_DIR}/infrastructure/operator-gateway/gateway-role-binding.yaml"
+kubectl apply -f "${REPO_DIR}/infrastructure/kind/operator-gateway/gateway-role.yaml"
+kubectl apply -f "${REPO_DIR}/infrastructure/kind/operator-gateway/gateway-role-binding.yaml"
 
 ########################################
 # Phase 8: Catalog
 ########################################
 info "Phase 8: Deploying catalog system and launcher..."
 kubectl create namespace catalog-system --dry-run=client -o yaml | kubectl apply -f -
-kubectl apply -f "${REPO_DIR}/infrastructure/catalog/postgres.yaml"
-kubectl apply -f "${REPO_DIR}/infrastructure/catalog/catalog-sources.yaml"
-kubectl apply -f "${REPO_DIR}/infrastructure/catalog/catalog.yaml"
+kubectl apply -f "${REPO_DIR}/infrastructure/kind/catalog/postgres.yaml"
+kubectl apply -f "${REPO_DIR}/infrastructure/kind/catalog/catalog-sources.yaml"
+kubectl apply -f "${REPO_DIR}/infrastructure/kind/catalog/catalog.yaml"
 wait_for "Catalog pods..."
 kubectl wait --for=condition=Ready pod -l app=mcp-catalog-postgres -n catalog-system --timeout=120s
 kubectl wait --for=condition=Ready pod -l app=mcp-catalog -n catalog-system --timeout=120s
 
 info "Deploying MCP Launcher..."
-kubectl apply -f "${REPO_DIR}/infrastructure/launcher/rbac.yaml"
-kubectl apply -f "${REPO_DIR}/infrastructure/launcher/deployment.yaml"
+kubectl apply -f "${REPO_DIR}/infrastructure/kind/launcher/rbac.yaml"
+kubectl apply -f "${REPO_DIR}/infrastructure/kind/launcher/deployment.yaml"
 wait_for "Launcher to be ready..."
 kubectl wait --for=condition=Ready pod -l app=mcp-launcher -n catalog-system --timeout=120s 2>/dev/null || \
   warn "Launcher not ready yet — continuing"
@@ -192,14 +192,14 @@ kubectl wait --for=condition=Ready pod -l app=mcp-launcher -n catalog-system --t
 ########################################
 info "Phase 9: Deploying Keycloak..."
 kubectl create namespace keycloak --dry-run=client -o yaml | kubectl apply -f -
-kubectl apply -f "${REPO_DIR}/infrastructure/keycloak/realm-import.yaml"
-kubectl apply -f "${REPO_DIR}/infrastructure/keycloak/deployment.yaml"
+kubectl apply -f "${REPO_DIR}/infrastructure/kind/keycloak/realm-import.yaml"
+kubectl apply -f "${REPO_DIR}/infrastructure/kind/keycloak/deployment.yaml"
 
 # Keycloak-auth service (port 8002 → 8080) for in-cluster access
-kubectl apply -f "${REPO_DIR}/infrastructure/keycloak/keycloak-auth-service.yaml"
+kubectl apply -f "${REPO_DIR}/infrastructure/kind/keycloak/keycloak-auth-service.yaml"
 
 # NodePort for external access (30089 → 8002 → 8080, mapped to host port 8002)
-kubectl apply -f "${REPO_DIR}/infrastructure/keycloak/nodeport.yaml"
+kubectl apply -f "${REPO_DIR}/infrastructure/kind/keycloak/nodeport.yaml"
 
 wait_for "Keycloak to be ready..."
 kubectl wait --for=condition=Ready pod -l app=keycloak -n keycloak --timeout=180s
@@ -219,7 +219,7 @@ helm upgrade --install kuadrant-operator kuadrant/kuadrant-operator \
   --namespace kuadrant-system
 
 info "Creating Kuadrant instance..."
-kubectl apply -f "${REPO_DIR}/infrastructure/kuadrant/kuadrant.yaml"
+kubectl apply -f "${REPO_DIR}/infrastructure/kind/kuadrant/kuadrant.yaml"
 wait_for "Authorino to be ready..."
 kubectl wait --for=condition=Ready pod -l app=authorino -n kuadrant-system --timeout=120s 2>/dev/null || \
   kubectl wait --for=condition=Ready pod -l authorino-resource -n kuadrant-system --timeout=120s 2>/dev/null || \
@@ -242,34 +242,34 @@ fi
 # Phase 11: Vault
 ########################################
 info "Phase 11: Deploying Vault..."
-kubectl apply -f "${REPO_DIR}/infrastructure/vault/namespace.yaml"
-kubectl apply -f "${REPO_DIR}/infrastructure/vault/deployment.yaml"
+kubectl apply -f "${REPO_DIR}/infrastructure/kind/vault/namespace.yaml"
+kubectl apply -f "${REPO_DIR}/infrastructure/kind/vault/deployment.yaml"
 wait_for "Vault to be ready..."
 kubectl wait --for=condition=Ready pod -l app=vault -n vault --timeout=120s
 
 info "Configuring Vault JWT auth..."
-"${REPO_DIR}/infrastructure/vault/configure.sh"
+"${REPO_DIR}/infrastructure/kind/vault/configure.sh"
 
 ########################################
 # Phase 12: team-a namespace
 ########################################
 info "Phase 12: Deploying team-a namespace..."
-kubectl apply -f "${REPO_DIR}/infrastructure/team-a/namespace.yaml"
-kubectl apply -f "${REPO_DIR}/infrastructure/team-a/gateway.yaml"
+kubectl apply -f "${REPO_DIR}/infrastructure/kind/team-a/namespace.yaml"
+kubectl apply -f "${REPO_DIR}/infrastructure/kind/team-a/gateway.yaml"
 wait_for "team-a Gateway to be programmed..."
 kubectl wait --for=condition=Programmed gateway/team-a-gateway -n team-a --timeout=300s
 
 info "Deploying MCPGatewayExtension (creates broker/router)..."
-kubectl apply -f "${REPO_DIR}/infrastructure/team-a/mcpgatewayextension.yaml"
+kubectl apply -f "${REPO_DIR}/infrastructure/kind/team-a/mcpgatewayextension.yaml"
 wait_for "MCPGatewayExtension to be ready..."
 kubectl wait --for=condition=Ready mcpgatewayextension/team-a-gateway-extension -n team-a --timeout=120s
 
 info "Deploying NodePort for team-a gateway..."
-kubectl apply -f "${REPO_DIR}/infrastructure/team-a/nodeport.yaml"
+kubectl apply -f "${REPO_DIR}/infrastructure/kind/team-a/nodeport.yaml"
 
 info "Deploying MCP servers in team-a..."
-kubectl apply -f "${REPO_DIR}/infrastructure/team-a/test-server-a1.yaml"
-kubectl apply -f "${REPO_DIR}/infrastructure/team-a/test-server-a2.yaml"
+kubectl apply -f "${REPO_DIR}/infrastructure/kind/team-a/test-server-a1.yaml"
+kubectl apply -f "${REPO_DIR}/infrastructure/kind/team-a/test-server-a2.yaml"
 
 wait_for "MCP servers to be ready..."
 kubectl wait --for=condition=Ready mcpserver/test-server-a1 -n team-a --timeout=120s 2>/dev/null || \
@@ -420,17 +420,17 @@ done
 info "Phase 14: Applying VirtualMCPServers and AuthPolicies..."
 
 # VirtualMCPServer CRs (filtering only — see Finding 48 workaround in Phase 15)
-kubectl apply -f "${REPO_DIR}/infrastructure/team-a/virtualserver-dev.yaml"
-kubectl apply -f "${REPO_DIR}/infrastructure/team-a/virtualserver-ops.yaml"
-kubectl apply -f "${REPO_DIR}/infrastructure/team-a/virtualserver-leads.yaml"
+kubectl apply -f "${REPO_DIR}/infrastructure/kind/team-a/virtualserver-dev.yaml"
+kubectl apply -f "${REPO_DIR}/infrastructure/kind/team-a/virtualserver-ops.yaml"
+kubectl apply -f "${REPO_DIR}/infrastructure/kind/team-a/virtualserver-leads.yaml"
 
 # Gateway-level AuthPolicy (JWT auth + x-mcp-virtualserver header injection)
-kubectl apply -f "${REPO_DIR}/infrastructure/team-a/gateway-auth-policy.yaml"
+kubectl apply -f "${REPO_DIR}/infrastructure/kind/team-a/gateway-auth-policy.yaml"
 sleep 5  # Allow gateway-level policy to settle
 
 # Per-HTTPRoute AuthPolicies (tool-level authorization)
-kubectl apply -f "${REPO_DIR}/infrastructure/team-a/authpolicy-server-a1.yaml"
-kubectl apply -f "${REPO_DIR}/infrastructure/team-a/authpolicy-server-a2.yaml"
+kubectl apply -f "${REPO_DIR}/infrastructure/kind/team-a/authpolicy-server-a1.yaml"
+kubectl apply -f "${REPO_DIR}/infrastructure/kind/team-a/authpolicy-server-a2.yaml"
 
 ########################################
 # Phase 15: Config Secret patch
@@ -510,10 +510,10 @@ fi
 info "Phase 16: Configuring TLS for team-a gateway..."
 
 # TLSPolicy references the mcp-ca-issuer ClusterIssuer from Phase 5
-kubectl apply -f "${REPO_DIR}/infrastructure/team-a/tls-policy.yaml"
+kubectl apply -f "${REPO_DIR}/infrastructure/kind/team-a/tls-policy.yaml"
 
 # HTTPS NodePort (30443 → 8443, mapped to host port 8443)
-kubectl apply -f "${REPO_DIR}/infrastructure/team-a/nodeport-tls.yaml"
+kubectl apply -f "${REPO_DIR}/infrastructure/kind/team-a/nodeport-tls.yaml"
 
 wait_for "TLSPolicy to be enforced..."
 for i in $(seq 1 12); do

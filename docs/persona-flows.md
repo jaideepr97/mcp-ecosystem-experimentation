@@ -13,9 +13,9 @@ The platform engineer provisions infrastructure so that AI engineers can discove
 ### Step 1: Create the team's namespace and gateway
 
 ```bash
-kubectl apply -f infrastructure/team-a/namespace.yaml
-kubectl apply -f infrastructure/team-a/gateway.yaml
-kubectl apply -f infrastructure/team-a/mcpgatewayextension.yaml
+kubectl apply -f infrastructure/kind/team-a/namespace.yaml
+kubectl apply -f infrastructure/kind/team-a/gateway.yaml
+kubectl apply -f infrastructure/kind/team-a/mcpgatewayextension.yaml
 ```
 
 - `namespace.yaml` — isolation boundary. Each team gets its own namespace.
@@ -27,8 +27,8 @@ After this, `team-a` has its own Envoy proxy and MCP broker, completely isolated
 ### Step 2: Deploy MCP servers
 
 ```bash
-kubectl apply -f infrastructure/team-a/test-server-a1.yaml
-kubectl apply -f infrastructure/team-a/test-server-a2.yaml
+kubectl apply -f infrastructure/kind/team-a/test-server-a1.yaml
+kubectl apply -f infrastructure/kind/team-a/test-server-a2.yaml
 ```
 
 Each is an MCPServer CR with a `gateway-ref` annotation pointing to `team-a/team-a-gateway`. The lifecycle operator automatically creates:
@@ -89,9 +89,9 @@ The `sub` claim is the Keycloak user ID (UUID). In practice, the platform engine
 ### Step 5: Define what each group sees (VirtualMCPServers)
 
 ```bash
-kubectl apply -f infrastructure/team-a/virtualserver-dev.yaml
-kubectl apply -f infrastructure/team-a/virtualserver-ops.yaml
-kubectl apply -f infrastructure/team-a/virtualserver-leads.yaml
+kubectl apply -f infrastructure/kind/team-a/virtualserver-dev.yaml
+kubectl apply -f infrastructure/kind/team-a/virtualserver-ops.yaml
+kubectl apply -f infrastructure/kind/team-a/virtualserver-leads.yaml
 ```
 
 Each VirtualMCPServer lists tool names (prefixed with server name) that should be visible to a group:
@@ -111,7 +111,7 @@ Three AuthPolicies, layered from gateway to route:
 #### Gateway-level AuthPolicy
 
 ```bash
-kubectl apply -f infrastructure/team-a/gateway-auth-policy.yaml
+kubectl apply -f infrastructure/kind/team-a/gateway-auth-policy.yaml
 ```
 
 Targets the Gateway CR with `defaults` strategy:
@@ -126,8 +126,8 @@ The client never selects a VirtualMCPServer — the gateway does it based on JWT
 #### Per-HTTPRoute AuthPolicies
 
 ```bash
-kubectl apply -f infrastructure/team-a/authpolicy-server-a1.yaml
-kubectl apply -f infrastructure/team-a/authpolicy-server-a2.yaml
+kubectl apply -f infrastructure/kind/team-a/authpolicy-server-a1.yaml
+kubectl apply -f infrastructure/kind/team-a/authpolicy-server-a2.yaml
 ```
 
 Each targets an HTTPRoute and has four layers:

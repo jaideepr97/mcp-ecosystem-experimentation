@@ -1754,7 +1754,7 @@ With the design scoping complete, Phase 16 implemented the first item from the c
 
 ### Infrastructure setup
 
-Six resources were created in `infrastructure/team-a/`:
+Six resources were created in `infrastructure/kind/team-a/`:
 
 - `namespace.yaml` — the `team-a` namespace
 - `gateway.yaml` — `team-a-gateway` using `gatewayClassName: istio`
@@ -1859,10 +1859,10 @@ Each uses CEL predicates matching group membership to allowed tool names — a w
 
 ### Infrastructure files created
 
-- `infrastructure/team-a/gateway-auth-policy.yaml`
-- `infrastructure/team-a/virtualserver-dev.yaml`, `virtualserver-ops.yaml`, `virtualserver-leads.yaml`
-- `infrastructure/team-a/authpolicy-server-a1.yaml`, `authpolicy-server-a2.yaml`
-- `infrastructure/keycloak/keycloak-auth-service.yaml` (new service on port 8002)
+- `infrastructure/kind/team-a/gateway-auth-policy.yaml`
+- `infrastructure/kind/team-a/virtualserver-dev.yaml`, `virtualserver-ops.yaml`, `virtualserver-leads.yaml`
+- `infrastructure/kind/team-a/authpolicy-server-a1.yaml`, `authpolicy-server-a2.yaml`
+- `infrastructure/kind/keycloak/keycloak-auth-service.yaml` (new service on port 8002)
 
 ---
 

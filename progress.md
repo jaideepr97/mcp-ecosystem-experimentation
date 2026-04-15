@@ -120,11 +120,11 @@ Scope is driven by [RHAISTRAT-1149](https://redhat.atlassian.net/browse/RHAISTRA
 | `docs/diagrams/request-flow.mermaid` | Request flow sequence diagram |
 | `docs/diagrams/component-architecture.mermaid` | Cluster component map |
 | `docs/diagrams/multi-tenancy-architecture.mermaid` | Namespace isolation + control plane |
-| `infrastructure/team-a/authpolicy-server-a1.yaml` | Per-HTTPRoute AuthPolicy (team-level Vault credential) |
-| `infrastructure/team-a/authpolicy-server-a2.yaml` | Per-HTTPRoute AuthPolicy (per-user Vault credential) |
-| `infrastructure/team-a/gateway-auth-policy.yaml` | Gateway AuthPolicy (JWT + VirtualMCPServer injection) |
-| `infrastructure/team-a/virtualserver-*.yaml` | 3 VirtualMCPServer CRs (dev, ops, leads) |
-| `infrastructure/vault/configure.sh` | Vault JWT auth + policy + role setup |
+| `infrastructure/kind/team-a/authpolicy-server-a1.yaml` | Per-HTTPRoute AuthPolicy (team-level Vault credential) |
+| `infrastructure/kind/team-a/authpolicy-server-a2.yaml` | Per-HTTPRoute AuthPolicy (per-user Vault credential) |
+| `infrastructure/kind/team-a/gateway-auth-policy.yaml` | Gateway AuthPolicy (JWT + VirtualMCPServer injection) |
+| `infrastructure/kind/team-a/virtualserver-*.yaml` | 3 VirtualMCPServer CRs (dev, ops, leads) |
+| `infrastructure/kind/vault/configure.sh` | Vault JWT auth + policy + role setup |
 
 ## Key Ports (host → Kind NodePort → gateway)
 

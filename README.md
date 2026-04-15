@@ -231,7 +231,7 @@ All passwords match the username.
 │       ├── tls-architecture.mermaid            # TLS certificate chain + termination flow
 │       ├── catalog-to-gateway-pipeline.mermaid # End-to-end pipeline flow
 │       └── operator-reconciliation.mermaid     # Operator reconciler logic
-├── infrastructure/
+├── infrastructure/kind/
 │   ├── kind/                                   # Kind cluster config (HTTP + HTTPS ports)
 │   ├── istio/                                  # Istio (Sail operator) config
 │   ├── metallb/                                # MetalLB IP pool script
