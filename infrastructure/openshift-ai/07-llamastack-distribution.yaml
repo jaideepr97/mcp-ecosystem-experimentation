@@ -1,0 +1,20 @@
+apiVersion: llamastack.io/v1alpha1
+kind: LlamaStackDistribution
+metadata:
+  name: llama-stack-mcp
+  namespace: test-jd
+spec:
+  network:
+    exposeRoute: true
+  replicas: 1
+  server:
+    containerSpec:
+      port: 8321
+    distribution:
+      image: docker.io/llamastack/distribution-starter:0.6.1
+    storage:
+      mountPath: /data
+      size: 5Gi
+    userConfig:
+      configMapName: llama-stack-mcp-config
+      configMapNamespace: test-jd

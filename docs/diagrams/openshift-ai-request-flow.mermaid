@@ -1,0 +1,70 @@
+%%{ init: { 'theme': 'base', 'sequence': { 'mirrorActors': false } } }%%
+
+sequenceDiagram
+    participant U as AI Engineer<br/>(Browser)
+    participant P as Gen AI Studio<br/>(Playground UI)
+    participant LS as Llama Stack<br/>(0.6.0.1+rhai0)
+    participant V as vLLM 20B<br/>(tool calling)
+    participant R as OpenShift Route<br/>(edge TLS)
+    participant E as Envoy Proxy<br/>(ext_proc + Wasm)
+    participant RT as Router<br/>(ext_proc)
+    participant AU as Authorino<br/>(Kuadrant)
+    participant B as Broker
+    participant KC as Keycloak<br/>(RHBK)
+    participant S as OpenShift<br/>MCP Server
+
+    Note over U,S: 1. User asks a question in the Playground
+
+    U->>P: "What pods are running<br/>in mcp-upstream-test?"
+
+    Note over U,S: 2. AI model decides to call a tool
+
+    P->>LS: POST /v1/chat/completions<br/>messages + available tools
+    LS->>V: POST /v1/chat/completions<br/>(tool definitions from MCP)
+    V-->>LS: tool_calls: [{name: "openshift_pods_list_in_namespace",<br/>arguments: {namespace: "mcp-upstream-test"}}]
+
+    Note over U,S: 3. Llama Stack executes the tool call through MCP Gateway
+
+    Note over LS: Initialize MCP session<br/>(if not cached)
+    LS->>R: POST /mcp<br/>Authorization: Bearer <user-token><br/>{"method":"initialize",...}
+    R->>E: TLS terminated, forwarded
+    E->>RT: ext_proc: method=initialize
+    RT-->>E: pass through (no rewrite)
+    E->>AU: CheckRequest (JWT)
+    Note over AU: Gateway AuthPolicy:<br/>Validate JWT via Keycloak JWKS ✓
+    AU-->>E: OK
+    E->>B: POST /mcp
+    B-->>E: Mcp-Session-Id: eyJ...
+    E-->>R: 200
+    R-->>LS: Session established
+
+    Note over U,S: 4. Tool call routed to OpenShift MCP Server
+
+    LS->>R: POST /mcp<br/>Mcp-Session-Id: eyJ...<br/>Authorization: Bearer <user-token><br/>{"method":"tools/call",<br/>"params":{"name":"openshift_pods_list_in_namespace",<br/>"arguments":{"namespace":"mcp-upstream-test"}}}
+
+    R->>E: forwarded
+    E->>RT: ext_proc: headers + body
+    Note over RT: 1. Parse tool name<br/>"openshift_pods_list_in_namespace"<br/>2. Strip prefix → "pods_list_in_namespace"<br/>3. Rewrite headers:<br/>   :authority = openshift-mcp-server.mcp.local<br/>   x-mcp-toolname = pods_list_in_namespace<br/>   x-mcp-servername = mcp-upstream-test/openshift-mcp-server
+    RT-->>E: Modified headers
+
+    Note over E: Wasm plugin calls Authorino<br/>(per-HTTPRoute AuthPolicy)
+    E->>AU: CheckRequest<br/>(host=openshift-mcp-server.mcp.local, JWT)
+    Note over AU: openshift-mcp-admin-only AuthPolicy:<br/>1. Validate JWT ✓<br/>2. Check realm_access.roles includes "mcp-admin" ✓
+    AU-->>E: OK
+
+    Note over E: HTTPRoute strips Authorization header<br/>(RequestHeaderModifier)
+    E->>S: POST /mcp<br/>(no Authorization header)<br/>{"method":"tools/call",<br/>"params":{"name":"pods_list_in_namespace",<br/>"arguments":{"namespace":"mcp-upstream-test"}}}
+
+    Note over S: Uses ServiceAccount token<br/>(view ClusterRole) to query<br/>Kubernetes API
+    S-->>E: {"result":{"content":[{<br/>"text":"NAME ... STATUS ...<br/>mcp-gateway-broker-... Running<br/>openshift-mcp-server-... Running<br/>..."}]}}
+
+    E-->>R: 200 + tool result
+    R-->>LS: Tool result
+
+    Note over U,S: 5. AI model formulates response
+
+    LS->>V: POST /v1/chat/completions<br/>tool_result + original messages
+    V-->>LS: "There are 5 pods running in<br/>mcp-upstream-test: ..."
+
+    LS-->>P: AI response with pod information
+    P-->>U: "There are 5 pods running in<br/>mcp-upstream-test: ..."

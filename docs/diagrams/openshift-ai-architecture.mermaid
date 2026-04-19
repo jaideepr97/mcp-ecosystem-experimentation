@@ -1,0 +1,122 @@
+%%{ init: { 'theme': 'base', 'themeVariables': { 'primaryColor': '#e8f4fd', 'primaryBorderColor': '#2196F3', 'secondaryColor': '#fff3e0', 'tertiaryColor': '#e8f5e9' } } }%%
+
+graph TB
+    subgraph cluster["OpenShift AI Cluster (ROSA 4.21.6, RHOAI 3.4.0)"]
+
+        subgraph gpt-oss["gpt-oss namespace (AI Stack)"]
+            vllm["vLLM 20B<br/>(tool calling enabled,<br/>openai parser)"]
+            llamastack["Llama Stack<br/>(0.6.0.1+rhai0)<br/>remote::model-context-protocol"]
+            playground["Gen AI Studio<br/>Playground UI"]
+
+            playground -->|"chat + tool calls"| llamastack
+            llamastack -->|"inference"| vllm
+        end
+
+        subgraph redhat-ods["redhat-ods-applications namespace"]
+            mcp-cm[/"ConfigMap<br/>gen-ai-aa-mcp-servers<br/>(points to gateway URL)"/]
+        end
+
+        subgraph mcp-system["mcp-system namespace"]
+            mcp-ctrl["MCP Gateway Controller<br/>(v0.6.0, OLM)<br/>cluster-scoped"]
+        end
+
+        subgraph mcp-upstream["mcp-upstream-test namespace"]
+            gw["Gateway CR<br/>(mcp-gateway)<br/>openshift-default class"]
+            envoy["Envoy Proxy<br/>(auto-created by Istio)"]
+            route["OpenShift Route<br/>(edge TLS)"]
+            gw-ext["MCPGatewayExtension"]
+            broker["MCP Broker / Router<br/>(v0.6.0)"]
+            config-secret["Config Secret<br/>(auto-managed)"]
+            envoy-filter["EnvoyFilter<br/>(ext_proc)"]
+
+            subgraph servers["MCP Servers"]
+                openshift-mcp["OpenShift MCP Server<br/>(14 tools: pods, resources,<br/>nodes, events, config)<br/>SA: mcp-viewer (view role)"]
+                test-mcp["Test MCP Server<br/>(5 tools: greet, time,<br/>headers, slow, add_tool)"]
+            end
+
+            subgraph registrations["Server Registrations"]
+                reg-openshift["MCPServerRegistration<br/>prefix: openshift_"]
+                reg-test["MCPServerRegistration<br/>prefix: test_"]
+            end
+
+            subgraph auth-policies["Auth Policies"]
+                ap-gateway["AuthPolicy<br/>(mcp-gateway-auth)<br/>JWT validation on mcp listener"]
+                ap-openshift["AuthPolicy<br/>(openshift-mcp-admin-only)<br/>mcp-admin role required"]
+            end
+
+            subgraph routes["HTTPRoutes"]
+                hr-openshift["HTTPRoute<br/>(openshift-mcp-server)<br/>host: openshift-mcp-server.mcp.local<br/>strips Authorization header"]
+                hr-test["HTTPRoute<br/>(test-mcp-server)<br/>host: test-mcp-server.mcp.local"]
+            end
+
+            route --> envoy
+            envoy -->|"ext_proc"| broker
+            envoy -->|"routes to"| openshift-mcp
+            envoy -->|"routes to"| test-mcp
+            broker -.- config-secret
+            ap-gateway -.->|"targets"| gw
+            ap-openshift -.->|"targets"| hr-openshift
+        end
+
+        subgraph keycloak-ns["keycloak namespace"]
+            keycloak["Keycloak (RHBK v26.4.11)<br/>Postgres PVC"]
+            kc-realm["Realm: mcp-gateway<br/>Clients: mcp-gateway, mcp-playground<br/>Roles: mcp-user, mcp-admin"]
+            keycloak --- kc-realm
+        end
+
+        subgraph openshift-operators["openshift-operators namespace"]
+            kuadrant["Kuadrant CR"]
+            authorino["Authorino<br/>(JWT validation + authz)"]
+            limitador["Limitador<br/>(rate limiting)"]
+            kuadrant -.-> authorino
+            kuadrant -.-> limitador
+        end
+
+        subgraph service-mesh["Service Mesh"]
+            istiod["istiod<br/>(Gateway API controller)"]
+        end
+
+        %% Control plane relationships
+        mcp-ctrl -.->|"reconciles"| gw-ext
+        mcp-ctrl -.->|"creates"| broker
+        mcp-ctrl -.->|"creates"| config-secret
+        mcp-ctrl -.->|"creates"| envoy-filter
+        mcp-ctrl -.->|"watches"| reg-openshift
+        mcp-ctrl -.->|"watches"| reg-test
+
+        istiod -.->|"programs Envoy"| envoy
+
+        %% Auth flow
+        envoy -.->|"Wasm plugin"| authorino
+        authorino -.->|"JWKS validation"| keycloak
+
+        %% Dashboard wiring
+        mcp-cm -.->|"auto-wires URL<br/>to Llama Stack"| llamastack
+        llamastack -->|"MCP protocol<br/>(tools/list, tools/call)"| route
+    end
+
+    %% External access
+    user["AI Engineer<br/>(browser)"]
+    user -->|"HTTPS"| playground
+    user -.->|"token acquisition"| keycloak
+
+    %% GatewayClass
+    gwclass["GatewayClass: openshift-default<br/>controller: openshift.io/gateway-controller/v1"]
+    gwclass -.-> gw
+
+    classDef ns fill:none,stroke:#666,stroke-width:2px,stroke-dasharray:5 5
+    classDef pod fill:#e8f4fd,stroke:#2196F3,stroke-width:1px
+    classDef svc fill:#fff3e0,stroke:#FF9800,stroke-width:1px
+    classDef cr fill:#e8f5e9,stroke:#4CAF50,stroke-width:1px
+    classDef storage fill:#fce4ec,stroke:#E91E63,stroke-width:1px
+    classDef external fill:#f3e5f5,stroke:#9C27B0,stroke-width:2px
+    classDef auth fill:#fff9c4,stroke:#FBC02D,stroke-width:1px
+    classDef ai fill:#e1f5fe,stroke:#0277BD,stroke-width:2px
+
+    class gpt-oss,mcp-system,mcp-upstream,keycloak-ns,openshift-operators,service-mesh,redhat-ods ns
+    class vllm,llamastack,playground ai
+    class envoy,broker,mcp-ctrl,openshift-mcp,test-mcp,keycloak,authorino,limitador,istiod pod
+    class route,gw,gw-ext,config-secret,envoy-filter,reg-openshift,reg-test,hr-openshift,hr-test,kuadrant,kc-realm,gwclass cr
+    class mcp-cm storage
+    class user external
+    class ap-gateway,ap-openshift auth

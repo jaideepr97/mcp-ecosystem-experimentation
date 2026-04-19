@@ -1,0 +1,72 @@
+%%{ init: { 'theme': 'base', 'sequence': { 'mirrorActors': false } } }%%
+
+sequenceDiagram
+    participant U as User
+    participant KC as Keycloak<br/>(RHBK v26.4.11)
+    participant E as Envoy Proxy
+    participant AU as Authorino<br/>(Wasm plugin)
+    participant B as Broker
+    participant S1 as Test MCP Server<br/>(no auth required)
+    participant S2 as OpenShift MCP Server<br/>(mcp-admin required)
+
+    Note over U,S2: Scenario 1: mcp-admin1 (roles: mcp-user + mcp-admin)
+
+    U->>KC: POST /realms/mcp-gateway/protocol/openid-connect/token<br/>grant_type=password<br/>client_id=mcp-playground<br/>username=mcp-admin1&password=admin1pass
+    KC-->>U: {"access_token": "eyJ...",<br/>realm_access: {roles: ["mcp-user", "mcp-admin"]}}
+
+    Note over U: Token claims include:<br/>sub: <uuid><br/>realm_access.roles: [mcp-user, mcp-admin]
+
+    U->>E: POST /mcp → tools/call openshift_pods_list<br/>Authorization: Bearer eyJ...
+
+    E->>AU: CheckRequest
+
+    Note over AU: Layer 1 — Gateway AuthPolicy (mcp-gateway-auth):<br/>JWT validation via Keycloak JWKS endpoint<br/>Issuer: .../realms/mcp-gateway ✓<br/>Signature: valid ✓<br/>Expiry: not expired ✓
+    Note over AU: ✅ Authentication passed
+
+    Note over AU: Layer 2 — HTTPRoute AuthPolicy (openshift-mcp-admin-only):<br/>patternMatching:<br/>  selector: auth.identity.realm_access.roles<br/>  operator: incl<br/>  value: mcp-admin<br/><br/>roles = ["mcp-user", "mcp-admin"]<br/>"mcp-admin" ∈ roles → ✅ Authorized
+
+    AU-->>E: OK (request allowed)
+    E->>S2: POST /mcp → pods_list
+    S2-->>E: Pod list result
+    E-->>U: 200 OK + tool result
+
+    Note over U,S2: Scenario 2: mcp-user1 (roles: mcp-user only)
+
+    U->>KC: POST /token<br/>username=mcp-user1&password=user1pass
+    KC-->>U: {"access_token": "eyJ...",<br/>realm_access: {roles: ["mcp-user"]}}
+
+    rect rgb(255, 240, 240)
+        Note over U,S2: Attempt to call OpenShift tool → BLOCKED
+
+        U->>E: POST /mcp → tools/call openshift_pods_list<br/>Authorization: Bearer eyJ...
+
+        E->>AU: CheckRequest
+
+        Note over AU: Layer 1 — Gateway AuthPolicy:<br/>JWT validation ✓
+
+        Note over AU: Layer 2 — HTTPRoute AuthPolicy:<br/>selector: auth.identity.realm_access.roles<br/>operator: incl<br/>value: mcp-admin<br/><br/>roles = ["mcp-user"]<br/>"mcp-admin" ∉ roles → ❌ Denied
+
+        AU-->>E: DENIED (403)
+        E-->>U: 403 Forbidden
+    end
+
+    rect rgb(240, 255, 240)
+        Note over U,S2: Call test tool → ALLOWED (no per-route AuthPolicy)
+
+        U->>E: POST /mcp → tools/call test_greet<br/>Authorization: Bearer eyJ...
+
+        E->>AU: CheckRequest
+
+        Note over AU: Layer 1 — Gateway AuthPolicy:<br/>JWT validation ✓
+
+        Note over AU: No HTTPRoute-level AuthPolicy<br/>on test-mcp-server route<br/>→ gateway defaults apply<br/>→ ✅ Authorized (authenticated is sufficient)
+
+        AU-->>E: OK
+        E->>S1: POST /mcp → greet
+        S1-->>E: "Hi!"
+        E-->>U: 200 OK + tool result
+    end
+
+    Note over U,S2: Summary: Layered Authorization
+
+    Note over AU: Gateway AuthPolicy = "must be authenticated"<br/>(applies to ALL requests)<br/><br/>HTTPRoute AuthPolicy = "must have specific role"<br/>(applies to specific server routes)<br/><br/>No HTTPRoute policy = gateway defaults apply<br/>(authenticated is sufficient)

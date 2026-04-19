@@ -1,0 +1,70 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: test-mcp-server
+  namespace: test-jd
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: test-mcp-server
+  template:
+    metadata:
+      labels:
+        app: test-mcp-server
+    spec:
+      containers:
+      - name: mcp-server
+        image: ghcr.io/kuadrant/mcp-gateway/test-server1:latest
+        command: ["/mcp-test-server"]
+        args: ["--http", "0.0.0.0:9090"]
+        ports:
+        - name: http
+          containerPort: 9090
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: test-mcp-server
+  namespace: test-jd
+spec:
+  selector:
+    app: test-mcp-server
+  ports:
+  - name: http
+    port: 9090
+    targetPort: 9090
+---
+# HTTPRoute MUST use a *.mcp.local hostname (mcps listener), NOT the public
+# hostname. The ext_proc router hair-pins tools/call requests through Envoy.
+# If the backend uses the same hostname as the public listener, the ext_proc
+# processes the hair-pinned request again and fails to match the un-prefixed
+# tool name.
+apiVersion: gateway.networking.k8s.io/v1
+kind: HTTPRoute
+metadata:
+  name: test-mcp-server
+  namespace: test-jd
+spec:
+  hostnames:
+  - test-mcp-server.mcp.local
+  parentRefs:
+  - name: mcp-gateway
+    namespace: test-jd
+    sectionName: mcps
+  rules:
+  - backendRefs:
+    - name: test-mcp-server
+      port: 9090
+---
+apiVersion: mcp.kagenti.com/v1alpha1
+kind: MCPServerRegistration
+metadata:
+  name: test-mcp-server
+  namespace: test-jd
+spec:
+  toolPrefix: test_
+  targetRef:
+    group: gateway.networking.k8s.io
+    kind: HTTPRoute
+    name: test-mcp-server

@@ -1,0 +1,18 @@
+apiVersion: route.openshift.io/v1
+kind: Route
+metadata:
+  name: llama-stack-mcp
+  namespace: test-jd
+  labels:
+    app.kubernetes.io/managed-by: llama-stack-operator
+    app.kubernetes.io/part-of: llama-stack
+spec:
+  host: llama-stack-mcp-test-jd.apps.rosa.agentic-mcp.jolf.p3.openshiftapps.com
+  port:
+    targetPort: 8321
+  tls:
+    termination: edge
+  to:
+    kind: Service
+    name: llama-stack-mcp-service
+    weight: 100

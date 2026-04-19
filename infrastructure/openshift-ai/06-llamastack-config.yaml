@@ -1,0 +1,90 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: llama-stack-mcp-config
+  namespace: test-jd
+data:
+  config.yaml: |
+    version: 2
+    distro_name: starter
+    apis:
+    - agents
+    - inference
+    - tool_runtime
+    - vector_io
+    - files
+    - file_processors
+    providers:
+      inference:
+      - provider_id: vllm
+        provider_type: remote::vllm
+        config:
+          base_url: https://vllm-20b-gpt-oss.apps.rosa.agentic-mcp.jolf.p3.openshiftapps.com/v1
+          max_tokens: 4096
+          api_token: fake
+          network:
+            tls:
+              verify: false
+      vector_io:
+      - provider_id: faiss
+        provider_type: inline::faiss
+        config:
+          persistence:
+            namespace: vector_io::faiss
+            backend: kv_default
+      files:
+      - provider_id: meta-reference-files
+        provider_type: inline::localfs
+        config:
+          storage_dir: /data/files
+          metadata_store:
+            table_name: files_metadata
+            backend: sql_default
+      file_processors:
+      - provider_id: pypdf
+        provider_type: inline::pypdf
+      agents:
+      - provider_id: meta-reference
+        provider_type: inline::meta-reference
+        config:
+          persistence:
+            agent_state:
+              namespace: agents
+              backend: kv_default
+            responses:
+              table_name: responses
+              backend: sql_default
+      tool_runtime:
+      - provider_id: rag-runtime
+        provider_type: inline::rag-runtime
+      - provider_id: mcp
+        provider_type: remote::model-context-protocol
+        config: {}
+    storage:
+      backends:
+        kv_default:
+          type: kv_sqlite
+          db_path: /data/sqlite/kv.db
+        sql_default:
+          type: sql_sqlite
+          db_path: /data/sqlite/sql.db
+      stores:
+        metadata:
+          namespace: registry
+          backend: kv_default
+        inference:
+          table_name: inference_store
+          backend: sql_default
+        conversations:
+          table_name: openai_conversations
+          backend: sql_default
+        prompts:
+          namespace: prompts
+          backend: kv_default
+        connectors:
+          namespace: connectors
+          backend: kv_default
+    server:
+      port: 8321
+    vector_stores:
+      default_provider_id: faiss
