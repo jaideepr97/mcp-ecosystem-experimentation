@@ -1,0 +1,186 @@
+# Keycloak stack: PostgreSQL DB + Keycloak CR + realm import
+# Prerequisites:
+#   - keycloak namespace exists: oc new-project keycloak
+#   - RHBK operator installed (see operator subscriptions/rhbk-operator.yaml)
+#
+# Apply order: PVC → Secret → DB Deployment → DB Service → Keycloak CR → RealmImport
+# Then run keycloak-groups.sh to create groups and assign users.
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: keycloak-db-data
+  namespace: keycloak
+spec:
+  accessModes:
+    - ReadWriteOnce
+  resources:
+    requests:
+      storage: 5Gi
+  storageClassName: gp3-csi
+---
+apiVersion: v1
+kind: Secret
+metadata:
+  name: keycloak-db-secret
+  namespace: keycloak
+type: Opaque
+stringData:
+  username: keycloak
+  password: keycloak-db-pass
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: keycloak-db
+  namespace: keycloak
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: keycloak-db
+  template:
+    metadata:
+      labels:
+        app: keycloak-db
+    spec:
+      containers:
+        - name: postgres
+          image: registry.redhat.io/rhel9/postgresql-16:latest
+          ports:
+            - containerPort: 5432
+          env:
+            - name: POSTGRESQL_USER
+              value: keycloak
+            - name: POSTGRESQL_PASSWORD
+              value: keycloak-db-pass
+            - name: POSTGRESQL_DATABASE
+              value: keycloak
+          volumeMounts:
+            - name: data
+              mountPath: /var/lib/pgsql/data
+      volumes:
+        - name: data
+          persistentVolumeClaim:
+            claimName: keycloak-db-data
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: keycloak-db
+  namespace: keycloak
+spec:
+  ports:
+    - port: 5432
+      targetPort: 5432
+  selector:
+    app: keycloak-db
+---
+# Keycloak CR — the RHBK operator creates the StatefulSet, Services, and Ingress
+apiVersion: k8s.keycloak.org/v2alpha1
+kind: Keycloak
+metadata:
+  name: keycloak
+  namespace: keycloak
+spec:
+  instances: 1
+  db:
+    vendor: postgres
+    host: keycloak-db
+    usernameSecret:
+      name: keycloak-db-secret
+      key: username
+    passwordSecret:
+      name: keycloak-db-secret
+      key: password
+  hostname:
+    hostname: keycloak.apps.rosa.agentic-mcp.jolf.p3.openshiftapps.com
+  http:
+    httpEnabled: true
+  proxy:
+    headers: xforwarded
+---
+# Realm import: mcp-gateway realm with two clients, roles, and seed users
+apiVersion: k8s.keycloak.org/v2alpha1
+kind: KeycloakRealmImport
+metadata:
+  name: mcp-gateway-realm
+  namespace: keycloak
+spec:
+  keycloakCRName: keycloak
+  realm:
+    realm: mcp-gateway
+    enabled: true
+    roles:
+      realm:
+        - name: mcp-user
+          description: Basic MCP gateway access
+        - name: mcp-admin
+          description: Full MCP gateway access
+    users:
+      - username: mcp-user1
+        firstName: MCP
+        lastName: User
+        email: user1@example.com
+        enabled: true
+        credentials:
+          - type: password
+            value: user1pass
+            temporary: false
+        realmRoles:
+          - mcp-user
+      - username: mcp-admin1
+        firstName: MCP
+        lastName: Admin
+        email: admin1@example.com
+        enabled: true
+        credentials:
+          - type: password
+            value: admin1pass
+            temporary: false
+        realmRoles:
+          - mcp-user
+          - mcp-admin
+    clients:
+      - clientId: mcp-gateway
+        enabled: true
+        protocol: openid-connect
+        publicClient: false
+        secret: mcp-gateway-client-secret
+        redirectUris: ["*"]
+        standardFlowEnabled: true
+        directAccessGrantsEnabled: true
+        serviceAccountsEnabled: true
+        defaultClientScopes: [openid, profile, email, roles]
+      - clientId: mcp-playground
+        enabled: true
+        protocol: openid-connect
+        publicClient: true
+        redirectUris: ["*"]
+        standardFlowEnabled: true
+        directAccessGrantsEnabled: true
+        defaultClientScopes: [openid, profile, email, roles]
+    clientScopes:
+      - name: roles
+        protocol: openid-connect
+        protocolMappers:
+          - name: realm-roles
+            protocol: openid-connect
+            protocolMapper: oidc-usermodel-realm-role-mapper
+            config:
+              access.token.claim: "true"
+              claim.name: realm_access.roles
+              id.token.claim: "true"
+              jsonType.label: String
+              multivalued: "true"
+              userinfo.token.claim: "true"
+          - name: client-roles
+            protocol: openid-connect
+            protocolMapper: oidc-usermodel-client-role-mapper
+            config:
+              access.token.claim: "true"
+              claim.name: "resource_access.${client_id}.roles"
+              id.token.claim: "true"
+              jsonType.label: String
+              multivalued: "true"
+              userinfo.token.claim: "true"

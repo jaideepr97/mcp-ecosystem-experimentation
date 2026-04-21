@@ -1,0 +1,125 @@
+# GitHub MCP Server with Vault per-user credential injection
+# Prerequisites:
+#   - MCP Gateway deployed (MCPGatewayExtension + broker in team-a)
+#   - Keycloak realm with sub + preferred_username claims (22-keycloak-vault-claims.sh)
+#   - Vault configured with JWT auth + per-user secrets (21-vault-configure.sh)
+#   - Store user PATs: vault kv put mcp/users/<username>/github token=ghp_<PAT>
+#
+# The GitHub MCP server requires a PAT in GITHUB_PERSONAL_ACCESS_TOKEN env var to start.
+# This is used by the broker for tool discovery. At request time, per-user PATs from
+# Vault replace the Authorization header via the AuthPolicy metadata evaluators.
+---
+# 1. MCPServer CR — deploys the GitHub MCP server pod + service
+apiVersion: mcp.x-k8s.io/v1alpha1
+kind: MCPServer
+metadata:
+  name: github-mcp-server
+  namespace: team-a
+spec:
+  source:
+    type: ContainerImage
+    containerImage:
+      ref: ghcr.io/github/github-mcp-server:latest
+  config:
+    port: 8080
+    arguments: ["http", "--port", "8080", "--toolsets", "all", "--read-only"]
+    env:
+      - name: GITHUB_PERSONAL_ACCESS_TOKEN
+        value: "REPLACE_WITH_SERVICE_ACCOUNT_PAT"
+  runtime:
+    replicas: 1
+---
+# 2. Credential secret for broker tool discovery
+#    The broker needs a valid GitHub PAT to connect and list tools.
+#    Label mcp.kuadrant.io/secret=true is required (not /credential=true).
+apiVersion: v1
+kind: Secret
+metadata:
+  name: github-mcp-credential
+  namespace: team-a
+  labels:
+    mcp.kuadrant.io/secret: "true"
+type: Opaque
+stringData:
+  token: "Bearer REPLACE_WITH_SERVICE_ACCOUNT_PAT"
+---
+# 3. HTTPRoute — backend route for hair-pin routing via *.mcp.local
+apiVersion: gateway.networking.k8s.io/v1
+kind: HTTPRoute
+metadata:
+  name: github-mcp-server
+  namespace: team-a
+spec:
+  hostnames:
+    - github-mcp-server.mcp.local
+  parentRefs:
+    - name: team-a-gateway
+      sectionName: mcps
+  rules:
+    - matches:
+        - path:
+            type: PathPrefix
+            value: /mcp
+      backendRefs:
+        - name: github-mcp-server
+          port: 8080
+---
+# 4. MCPServerRegistration — registers with the gateway broker
+apiVersion: mcp.kuadrant.io/v1alpha1
+kind: MCPServerRegistration
+metadata:
+  name: github-mcp-server
+  namespace: team-a
+spec:
+  toolPrefix: github_
+  targetRef:
+    group: gateway.networking.k8s.io
+    kind: HTTPRoute
+    name: github-mcp-server
+  credentialRef:
+    name: github-mcp-credential
+    key: token
+---
+# 5. AuthPolicy — Vault credential injection via metadata evaluators
+#    Stage 0: Exchange Keycloak JWT for Vault token
+#    Stage 1: Read per-user GitHub PAT from Vault
+#    Response: Replace Authorization header with user's PAT
+apiVersion: kuadrant.io/v1
+kind: AuthPolicy
+metadata:
+  name: github-mcp-vault-auth
+  namespace: team-a
+spec:
+  targetRef:
+    group: gateway.networking.k8s.io
+    kind: HTTPRoute
+    name: github-mcp-server
+  rules:
+    authentication:
+      keycloak-jwt:
+        jwt:
+          issuerUrl: https://keycloak.apps.rosa.agentic-mcp.jolf.p3.openshiftapps.com/realms/mcp-gateway
+    metadata:
+      vault_token:
+        http:
+          url: http://vault.openshift-operators.svc.cluster.local:8200/v1/auth/jwt/login
+          method: POST
+          body:
+            expression: |
+              '{"role":"mcp-user","jwt":"' + request.headers.authorization.split(' ')[1] + '"}'
+          contentType: application/json
+        priority: 0
+      vault_user_secret:
+        http:
+          urlExpression: |
+            'http://vault.openshift-operators.svc.cluster.local:8200/v1/mcp/data/users/' + auth.identity.preferred_username + '/github'
+          headers:
+            X-Vault-Token:
+              expression: auth.metadata.vault_token.auth.client_token
+        priority: 1
+    response:
+      success:
+        headers:
+          authorization:
+            plain:
+              expression: "'Bearer ' + auth.metadata.vault_user_secret.data.data.token"

@@ -1,0 +1,15 @@
+# RHOAI Dashboard MCP server registry
+# The dashboard reads this ConfigMap to populate the MCP servers list in the UI.
+# The Role + RoleBinding are managed by the Dashboard operator — we only create the ConfigMap.
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: gen-ai-aa-mcp-servers
+  namespace: redhat-ods-applications
+data:
+  Team-A-MCP-Gateway: |
+    {
+      "url": "https://team-a-mcp.apps.rosa.agentic-mcp.jolf.p3.openshiftapps.com/mcp",
+      "description": "Team-A MCP Gateway — OpenShift + test tools"
+    }

@@ -1,0 +1,142 @@
+# Custom catalog sources for the model-registry MCP catalog
+# Adds test-server-2 and github-mcp-server to the catalog's discovery index.
+# The model-catalog deployment must be configured to mount this ConfigMap.
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: mcp-catalog-sources
+  namespace: odh-model-registries
+data:
+  sources.yaml: |
+    mcp_catalogs:
+      - name: Custom MCP Servers
+        id: custom_mcp_servers
+        type: yaml
+        enabled: true
+        properties:
+          yamlCatalogPath: /data/user-mcp-sources/custom-mcp-servers.yaml
+        labels:
+          - Custom
+    labels:
+      - name: Custom
+        assetType: mcp_servers
+        displayName: Custom MCP servers
+        description: Team-curated MCP servers for demo and testing.
+  custom-mcp-servers.yaml: |
+    source: Custom MCP
+    mcp_servers:
+      - name: test-server-2
+        provider: Kuadrant
+        license: apache-2.0
+        license_link: https://www.apache.org/licenses/LICENSE-2.0
+        description: A test MCP server with miscellaneous tools including greeting, time, authorization checking, and chocolate molding.
+        version: latest
+        transports:
+          - http
+        repositoryUrl: https://github.com/Kuadrant/mcp-gateway
+        tools:
+          - name: hello_world
+            description: Say hello to someone
+            parameters:
+              - name: name
+                type: string
+                description: Name to greet
+                required: true
+          - name: time
+            description: Get the current time
+            parameters: []
+          - name: headers
+            description: Get HTTP headers
+            parameters: []
+          - name: auth1234
+            description: Check authorization header
+            parameters: []
+          - name: slow
+            description: Delay for N seconds
+            parameters:
+              - name: seconds
+                type: integer
+                description: Number of seconds to delay
+                required: true
+          - name: set_time
+            description: Set the clock
+            parameters:
+              - name: time
+                type: string
+                description: Time to set
+                required: true
+          - name: pour_chocolate_into_mold
+            description: Pour chocolate into mold
+            parameters:
+              - name: quantity
+                type: string
+                description: Quantity in milliliters
+                required: true
+        artifacts:
+          - uri: oci://ghcr.io/kuadrant/mcp-gateway/test-server2:latest
+        runtimeMetadata:
+          defaultPort: 9090
+          mcpPath: /mcp
+          defaultArgs:
+            - /mcp-test-server
+            - --http
+            - 0.0.0.0:9090
+      - name: github-mcp-server
+        provider: GitHub
+        license: mit
+        license_link: https://opensource.org/licenses/MIT
+        description: Official GitHub MCP server providing access to repositories, issues, pull requests, code search, and user information via the GitHub API.
+        version: latest
+        transports:
+          - http
+        repositoryUrl: https://github.com/github/github-mcp-server
+        tools:
+          - name: search_repositories
+            description: Search for GitHub repositories
+            parameters:
+              - name: query
+                type: string
+                description: Search query
+                required: true
+          - name: get_file_contents
+            description: Get contents of a file or directory from a repository
+            parameters:
+              - name: owner
+                type: string
+                description: Repository owner
+                required: true
+              - name: repo
+                type: string
+                description: Repository name
+                required: true
+              - name: path
+                type: string
+                description: File or directory path
+                required: true
+          - name: list_issues
+            description: List issues in a repository
+            parameters:
+              - name: owner
+                type: string
+                description: Repository owner
+                required: true
+              - name: repo
+                type: string
+                description: Repository name
+                required: true
+          - name: search_code
+            description: Search for code across GitHub repositories
+            parameters:
+              - name: query
+                type: string
+                description: Search query
+                required: true
+          - name: get_me
+            description: Get details of the authenticated GitHub user
+            parameters: []
+        artifacts:
+          - uri: oci://ghcr.io/github/github-mcp-server:latest
+        runtimeMetadata:
+          defaultPort: 8080
+          mcpPath: /mcp

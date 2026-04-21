@@ -1,7 +1,7 @@
 # Session Handoff — Current State
 
-**Date**: 2026-04-17
-**Last action**: Auth + OpenShift MCP server deployed. Full end-to-end: Playground UI → (Bearer JWT) → Llama Stack → MCP Gateway → (Authorino JWT validation + role-based authorization) → OpenShift MCP Server → Kubernetes API. Role-based access verified: `mcp-admin` can use OpenShift tools, `mcp-user` is restricted to test tools only.
+**Date**: 2026-04-20
+**Last action**: Vault credential injection chain verified. Full flow: Keycloak JWT (with `sub` + `preferred_username` claims) → Vault JWT auth (token exchange) → per-user secret read (policy-templated by `preferred_username`). GitHub MCP server demo preparation in progress.
 
 ---
 
@@ -30,6 +30,22 @@ Cluster: `agentic-mcp.jolf.p3.openshiftapps.com` (ROSA, OpenShift 4.21.6, RHOAI 
 ### What was completed (April 15-16, between sessions)
 
 8. **MCP Gateway v0.5.1 deployed in test-jd** (superseded) — Manual deployment of kagenti MCP Gateway with `data-science-gateway-class`. Worked but had routing issues (no OpenShift Route, exposed via raw AWS ELB only).
+
+### What was completed (April 20 session)
+
+22. **MCP catalog extended** — Added `test-server-2` to the MCP catalog via `mcp-catalog-sources` ConfigMap in `odh-model-registries`. Uses two-key format: `sources.yaml` (index) + `custom-mcp-servers.yaml` (catalog data with `type: yaml` and `yamlCatalogPath`).
+
+23. **test-server-2 deployed** — MCPServer CR with `config.env` for servers that use env vars instead of CLI flags (`MCP_TRANSPORT=http`, `PORT=9090`). Registered with gateway via HTTPRoute + MCPServerRegistration (`test2_` prefix). Gateway now serves 26 tools total (14 openshift + 5 test + 7 test2).
+
+24. **VirtualMCPServers updated** — Admin VirtualMCPServer: 26 tools. User VirtualMCPServer: 12 tools (test + test2 only).
+
+25. **Authorization header stripping** — Added `response.success.headers.authorization: {plain: {value: ""}}` to per-server AuthPolicies. Required because Playground→Llama Stack→MCP Gateway sends the JWT to the upstream MCP server, which rejects it ("cluster requires authentication"). Stripping after Authorino validation fixes the flow.
+
+26. **Keycloak JWT claims fixed** — Added `sub` (via `oidc-sub-mapper`) and `preferred_username` (via `oidc-usermodel-attribute-mapper`) protocol mappers to `mcp-playground` client. Required for Vault per-user secret paths.
+
+27. **Vault deployed and configured** — Vault (Helm) in `openshift-operators`, initialized (non-dev mode, file storage). JWT auth enabled with Keycloak JWKS. KV v2 at `mcp/`. Role `mcp-user` with `claim_mappings` for `sub` and `preferred_username`. Policy `mcp-user-secrets` templates path by `{{identity.entity.aliases.auth_jwt_a4ae6a1f.metadata.preferred_username}}`.
+
+28. **Vault credential injection verified** — Full chain: Keycloak JWT → `vault write auth/jwt/login` → Vault token with user metadata → `vault read mcp/data/users/mcp-admin1/github` → `ghp_PLACEHOLDER_REPLACE_WITH_REAL_PAT`. Policy correctly scopes each user to their own secret path.
 
 ### What was completed (April 17 session)
 
@@ -81,6 +97,7 @@ Cluster: `agentic-mcp.jolf.p3.openshiftapps.com` (ROSA, OpenShift 4.21.6, RHOAI 
 | AuthPolicy (mcp-gateway-auth) | mcp-upstream-test | Enforced — JWT validation on `mcp` listener |
 | AuthPolicy (openshift-mcp-admin-only) | mcp-upstream-test | Enforced — `mcp-admin` role required |
 | Keycloak (RHBK v26.4.11) | keycloak | Running, Postgres PVC, realm `mcp-gateway` |
+| Vault (Helm) | openshift-operators | Running, initialized, unsealed, JWT auth + KV v2 |
 | Kuadrant CR | openshift-operators | Authorino + Limitador running |
 
 ### Kind Cluster State (preserved on `advanced` branch)
@@ -131,9 +148,12 @@ Goal: **Playground UI → Llama Stack → MCP Gateway → MCP Servers**
 7. ~~**Set up Keycloak + auth**~~ — Done (RHBK + realm + AuthPolicies)
 8. ~~**Deploy OpenShift MCP server**~~ — Done (14 tools, admin-only access)
 9. ~~**Test auth end-to-end through Playground**~~ — Done (admin works, user blocked correctly)
-10. **Explore MCPVirtualServer for identity-based tool filtering** — Needed to fix tool visibility issue
-11. **Increase Keycloak token lifetime** — For dev/test usability
-12. **Upgrade RHOAI** — To a build that supports `mcpCatalog` feature flag
+10. ~~**Explore MCPVirtualServer for identity-based tool filtering**~~ — Done (admin: 26 tools, user: 12 tools)
+11. ~~**Deploy Vault + configure JWT auth**~~ — Done (JWT→Vault token exchange, per-user secrets)
+12. ~~**Fix Keycloak JWT claims**~~ — Done (sub + preferred_username mappers on mcp-playground)
+13. **Deploy GitHub MCP server with Vault credential injection** — AuthPolicy metadata evaluators for JWT→Vault→PAT injection
+14. **Increase Keycloak token lifetime** — For dev/test usability
+15. **Upgrade RHOAI** — To a build that supports `mcpCatalog` feature flag
 
 ### Kind Cluster Phases (on `advanced` branch, deferred)
 

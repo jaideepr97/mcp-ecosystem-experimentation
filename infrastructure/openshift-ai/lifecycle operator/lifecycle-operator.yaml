@@ -1,0 +1,154 @@
+# MCP Lifecycle Operator: manages MCPServer CRs → Deployment + Service
+# Image: quay.io/jrao/mcp-lifecycle-operator:release-0.1
+# CRD (mcpservers.mcp.x-k8s.io) must be installed separately from the operator repo.
+---
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: mcp-lifecycle-operator-system
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: mcp-lifecycle-operator-controller-manager
+  namespace: mcp-lifecycle-operator-system
+  labels:
+    app.kubernetes.io/managed-by: kustomize
+    app.kubernetes.io/name: mcp-lifecycle-operator
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: mcp-lifecycle-operator-manager-role
+rules:
+  - apiGroups: [""]
+    resources: [configmaps, secrets]
+    verbs: [get, list, watch]
+  - apiGroups: [""]
+    resources: [services]
+    verbs: [create, delete, get, list, patch, update, watch]
+  - apiGroups: [apps]
+    resources: [deployments]
+    verbs: [create, delete, get, list, patch, update, watch]
+  - apiGroups: [mcp.x-k8s.io]
+    resources: [mcpservers]
+    verbs: [create, delete, get, list, patch, update, watch]
+  - apiGroups: [mcp.x-k8s.io]
+    resources: [mcpservers/finalizers]
+    verbs: [update]
+  - apiGroups: [mcp.x-k8s.io]
+    resources: [mcpservers/status]
+    verbs: [get, patch, update]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: mcp-lifecycle-operator-manager-rolebinding
+  labels:
+    app.kubernetes.io/managed-by: kustomize
+    app.kubernetes.io/name: mcp-lifecycle-operator
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: mcp-lifecycle-operator-manager-role
+subjects:
+  - kind: ServiceAccount
+    name: mcp-lifecycle-operator-controller-manager
+    namespace: mcp-lifecycle-operator-system
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: mcp-lifecycle-operator-leader-election-role
+  namespace: mcp-lifecycle-operator-system
+  labels:
+    app.kubernetes.io/managed-by: kustomize
+    app.kubernetes.io/name: mcp-lifecycle-operator
+rules:
+  - apiGroups: [""]
+    resources: [configmaps]
+    verbs: [get, list, watch, create, update, patch, delete]
+  - apiGroups: [coordination.k8s.io]
+    resources: [leases]
+    verbs: [get, list, watch, create, update, patch, delete]
+  - apiGroups: [""]
+    resources: [events]
+    verbs: [create, patch]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: mcp-lifecycle-operator-leader-election-rolebinding
+  namespace: mcp-lifecycle-operator-system
+  labels:
+    app.kubernetes.io/managed-by: kustomize
+    app.kubernetes.io/name: mcp-lifecycle-operator
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: mcp-lifecycle-operator-leader-election-role
+subjects:
+  - kind: ServiceAccount
+    name: mcp-lifecycle-operator-controller-manager
+    namespace: mcp-lifecycle-operator-system
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: mcp-lifecycle-operator-controller-manager
+  namespace: mcp-lifecycle-operator-system
+  labels:
+    app.kubernetes.io/managed-by: kustomize
+    app.kubernetes.io/name: mcp-lifecycle-operator
+    control-plane: controller-manager
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: mcp-lifecycle-operator
+      control-plane: controller-manager
+  template:
+    metadata:
+      annotations:
+        kubectl.kubernetes.io/default-container: manager
+      labels:
+        app.kubernetes.io/name: mcp-lifecycle-operator
+        control-plane: controller-manager
+    spec:
+      serviceAccountName: mcp-lifecycle-operator-controller-manager
+      terminationGracePeriodSeconds: 10
+      containers:
+        - name: manager
+          image: quay.io/jrao/mcp-lifecycle-operator:release-0.1
+          command: ["/manager"]
+          args:
+            - --metrics-bind-address=:8443
+            - --leader-elect
+            - --health-probe-bind-address=:8081
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: 8081
+            initialDelaySeconds: 15
+            periodSeconds: 20
+          readinessProbe:
+            httpGet:
+              path: /readyz
+              port: 8081
+            initialDelaySeconds: 5
+            periodSeconds: 10
+          resources:
+            limits:
+              cpu: 500m
+              memory: 128Mi
+            requests:
+              cpu: 10m
+              memory: 64Mi
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop: [ALL]
+            readOnlyRootFilesystem: true
+            runAsNonRoot: true
+            seccompProfile:
+              type: RuntimeDefault

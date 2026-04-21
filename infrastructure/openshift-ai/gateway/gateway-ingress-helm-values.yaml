@@ -1,0 +1,13 @@
+# MCP Gateway Ingress Helm values — creates the OpenShift Route
+#
+# Install:
+#   helm install team-a-gateway-ingress oci://ghcr.io/kuadrant/mcp-gateway/charts/mcp-gateway-ingress \
+#     --version 0.1.0 -n team-a -f gateway-ingress-helm-values.yaml
+gateway:
+  class: openshift-default
+  name: team-a-gateway
+mcpGateway:
+  host: team-a-mcp.apps.rosa.agentic-mcp.jolf.p3.openshiftapps.com
+  namespace: team-a
+route:
+  create: true

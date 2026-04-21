@@ -1,0 +1,71 @@
+# Gateway-level AuthPolicy: JWT authentication + VirtualMCPServer routing + wristband tool filtering
+#
+# Two layers of tool filtering:
+#   1. VirtualMCPServer (x-mcp-virtualserver header) — coarse group-based curation
+#      Controls which tools appear in tools/list per user group.
+#   2. Wristband (x-authorized-tools header) — fine-grained per-user tool ACLs
+#      Uses Keycloak resource_access client roles to build a per-server tool map,
+#      signed as an ES256 JWT. The broker validates and filters tools/list to the
+#      intersection of both layers.
+#
+# Group routing:
+#   mcp-admins → team-a/admin-tools (OpenShift + test tools)
+#   mcp-github → team-a/github-tools (GitHub tools)
+#   default    → team-a/user-tools (test tools only)
+#
+# Prerequisites:
+#   - ECDSA key secrets created (see gateway/wristband-keys.sh, done in setup.sh Phase 5)
+#   - MCPGatewayExtension patched with trustedHeadersKey (done in setup.sh Phase 5)
+#   - Keycloak wristband clients + roles created per-server (done in usage.sh per phase)
+---
+apiVersion: kuadrant.io/v1
+kind: AuthPolicy
+metadata:
+  name: team-a-gateway-auth
+  namespace: team-a
+spec:
+  targetRef:
+    group: gateway.networking.k8s.io
+    kind: Gateway
+    name: team-a-gateway
+    sectionName: mcp
+  defaults:
+    strategy: atomic
+    rules:
+      authentication:
+        keycloak-jwt:
+          jwt:
+            issuerUrl: https://keycloak.apps.rosa.agentic-mcp.jolf.p3.openshiftapps.com/realms/mcp-gateway
+      authorization:
+        authorized-tools:
+          opa:
+            allValues: true
+            rego: |
+              allow = true
+              tools = { server: roles |
+                server := object.keys(input.auth.identity.resource_access)[_]
+                roles := object.get(input.auth.identity.resource_access, server, {}).roles
+              }
+      response:
+        success:
+          headers:
+            x-authorized-tools:
+              wristband:
+                issuer: authorino
+                signingKeyRefs:
+                  - name: trusted-headers-private-key
+                    algorithm: ES256
+                tokenDuration: 300
+                customClaims:
+                  allowed-tools:
+                    selector: auth.authorization.authorized-tools.tools.@tostr
+            x-mcp-virtualserver:
+              plain:
+                expression: |
+                  auth.identity.groups.exists(g, g == 'mcp-admins')
+                    ? 'team-a/admin-tools'
+                    : auth.identity.groups.exists(g, g == 'mcp-github')
+                      ? 'team-a/github-tools'
+                      : auth.identity.groups.exists(g, g == 'mcp-users')
+                        ? 'team-a/user-tools'
+                        : ''

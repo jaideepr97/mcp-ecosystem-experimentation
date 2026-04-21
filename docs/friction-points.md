@@ -32,7 +32,8 @@ These required forking upstream code and building custom images.
 | 11 | **`privateHost` default assumes Istio gateway class** — MCPGatewayExtension defaults `privateHost` to `<gateway>-istio.<ns>.svc.cluster.local:<port>`. Non-Istio gateway classes (e.g., `data-science-gateway-class`) create services with different naming patterns, causing `no such host` errors on `tools/call`. | Set `privateHost` explicitly in MCPGatewayExtension spec. | Significant | Until controller derives service name from Gateway status |
 | 12 | **Backend HTTPRoutes must use separate hostnames for hair-pin routing** — if a backend's HTTPRoute uses the same hostname as the public gateway listener, the ext_proc processes hair-pinned `tools/call` requests twice. On the second pass, the un-prefixed tool name has no match, and the request falls through to the broker which returns `tool not found`. | Backend HTTPRoutes must use `*.mcp.local` hostnames (via a separate gateway listener), not the public hostname. | Significant | Until ext_proc distinguishes hair-pinned requests |
 | 13a | **Broker returns 500 instead of 403 when entire server is denied** — when a user has no authorized tools on a server, the broker wraps the 403 from Authorino as "failed to create session" and returns 500. Per-tool denials correctly return 403. | Accepted limitation. Not worked around — documented as a presentation issue. | Moderate | Until broker distinguishes auth errors from transport errors |
-| 13b | **`tools/list` returns all tools regardless of permissions** — the broker aggregates tools from all servers and returns the full list. The gateway cannot selectively filter items within a JSON-RPC response body. Users see tools they'll get 403 on when calling. | Accepted limitation. Not a security issue (calls are denied), but confusing UX. Requires broker-side filtering based on JWT claims. | Moderate | Until broker implements identity-aware filtering (Auth Phase 2) |
+| 13b | **`tools/list` returns all tools regardless of permissions** — the broker aggregates tools from all servers and returns the full list. The gateway cannot selectively filter items within a JSON-RPC response body. Users see tools they'll get 403 on when calling. | VirtualMCPServers provide static role-based filtering (role → fixed tool list). Not a security issue (calls are still denied), but confusing UX when not using VirtualMCPServers. | Moderate | Partially addressed by VirtualMCPServers |
+| 13c | **No dynamic per-user tool filtering** — VirtualMCPServers are static: a role maps to a fixed tool list via a CEL expression in AuthPolicy. There is no way to dynamically compose a tool list based on per-user state (e.g., whether a user has a GitHub PAT in Vault). A user with credentials for an additional server sees the same tools as users without those credentials, unless a separate VirtualMCPServer and role are pre-created for every combination. This doesn't scale — N servers produce 2^N possible VirtualMCPServer combinations. | No workaround. Would require the broker to query a credential store (Vault) at `tools/list` time and dynamically filter based on which servers the authenticated user has credentials for. Alternatively, the VirtualMCPServer selection logic could be extended to support metadata evaluators (e.g., Authorino queries Vault, injects available-server list into headers, broker uses that instead of a static VirtualMCPServer). | Architectural | Until broker supports credential-aware dynamic tool filtering |
 
 ---
 
@@ -103,6 +104,15 @@ These three are symptoms of a deeper issue: **OCI images are opaque, and catalog
 
 ---
 
+## RHOAI Gen AI Studio / LlamaStack
+
+| # | Limitation | Workaround | Severity | Durability |
+|---|-----------|-----------|----------|------------|
+| 31 | **Playground registers model_id from InferenceService name, not vLLM's `--served-model-name`** — when creating a Playground, RHOAI uses the InferenceService metadata name (e.g., `vllm-120b`) as the LlamaStack `model_id`. If vLLM is configured with a different `--served-model-name` (e.g., `gpt-oss-120b`), inference requests fail because vLLM rejects the unknown model name. The LlamaStack operator owns the ConfigMap (`ownerReferences`) but does not continuously reconcile it — manual edits persist. | Two options: (a) edit the LlamaStack ConfigMap `model_id` to match `--served-model-name` and restart the LlamaStack pod (seconds), or (b) patch the ServingRuntime `--served-model-name` to match the InferenceService name (requires full model reload, ~7 min for 120B). Option (b) also requires adding `--enable-auto-tool-choice --tool-call-parser openai` for tool calling. | Significant | Until RHOAI reads `--served-model-name` from the ServingRuntime args or vLLM's `/v1/models` endpoint |
+| 32 | **Default `--max-model-len 8192` too small for MCP tool calling** — the Playground sends all registered MCP tools in every prompt, inflating it to ~20K tokens. With a 8192 context window, LlamaStack computes a negative `max_tokens` and vLLM rejects the request with `max_tokens must be at least 1`. Reasoning models (e.g., gpt-oss-120b) exacerbate this by consuming additional tokens for chain-of-thought. | Increase `--max-model-len` on the ServingRuntime (e.g., 32768). The model must support the larger context (gpt-oss-120b supports 131K). Requires a full vLLM pod restart and model reload. Also increase `VLLM_MAX_TOKENS` env var on the LlamaStackDistribution CR to match. | Significant | Until RHOAI sets appropriate defaults based on model capabilities |
+
+---
+
 ## Summary
 
 | Category | Count | Notes |
@@ -110,10 +120,10 @@ These three are symptoms of a deeper issue: **OCI images are opaque, and catalog
 | **Custom fork required** | 2 | Both in mcp-lifecycle-operator, single branch |
 | **Critical upstream gaps** | 5 | mcp-gateway: VirtualMCPServer namespace, EnvoyFilter HTTPS, HTTPRoute HTTPS (#725), Helm service selector; lifecycle operator PR #16 image/CRD mismatch |
 | **Significant upstream gaps** | 3 | mcp-gateway: MCPServerRegistration race, privateHost default, hair-pin hostname collision |
-| **Architectural gaps** | 6 | Catalog schema (3), CEL scaling, env-var credentials, operator-catalog integration |
-| **Accepted limitations** | 3 | `tools/list` filtering, 500 vs 403, env-var servers |
+| **Architectural gaps** | 7 | Catalog schema (3), CEL scaling, env-var credentials, operator-catalog integration, dynamic per-user tool filtering |
+| **Accepted limitations** | 3 | `tools/list` static filtering, 500 vs 403, env-var servers |
 | **Operational gotchas** | 10 | Keycloak (3), TLSPolicy, credential label, VirtualMCPServer header format, metadata evaluator CEL (4) |
-| **OpenShift AI integration** | 2 | Lifecycle operator image/CRD mismatch (#29), dashboard phase vs conditions (#30) |
+| **OpenShift AI integration** | 4 | Lifecycle operator image/CRD mismatch (#29), dashboard phase vs conditions (#30), Playground model_id mismatch (#31), context window too small for MCP (#32) |
 
 **Custom images carried**: `quay.io/jrao/mcp-lifecycle-operator:gateway-credential-ref` (Kind cluster, addresses #1 and #2) and `quay.io/jrao/mcp-lifecycle-operator:release-0.1` (OpenShift AI, addresses #29).
 

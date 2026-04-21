@@ -1,0 +1,9 @@
+# This CR activates the Kuadrant components (Authorino + Limitador).
+# Requires: Connectivity Link operator installed (see connectivity-link.yaml).
+---
+apiVersion: kuadrant.io/v1beta1
+kind: Kuadrant
+metadata:
+  name: kuadrant
+  namespace: openshift-operators
+spec: {}

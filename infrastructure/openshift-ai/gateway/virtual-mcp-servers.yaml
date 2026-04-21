@@ -1,0 +1,85 @@
+# VirtualMCPServers: tool-filtering views routed by the gateway AuthPolicy
+# Each VirtualMCPServer defines a subset of tools visible to a group.
+---
+apiVersion: mcp.kuadrant.io/v1alpha1
+kind: MCPVirtualServer
+metadata:
+  name: admin-tools
+  namespace: team-a
+spec:
+  description: All non-GitHub tools for mcp-admins group
+  tools:
+    - openshift_configuration_view
+    - openshift_events_list
+    - openshift_namespaces_list
+    - openshift_nodes_log
+    - openshift_nodes_stats_summary
+    - openshift_nodes_top
+    - openshift_pods_get
+    - openshift_pods_list
+    - openshift_pods_list_in_namespace
+    - openshift_pods_log
+    - openshift_pods_top
+    - openshift_projects_list
+    - openshift_resources_get
+    - openshift_resources_list
+    - test_add_tool
+    - test_greet
+    - test_headers
+    - test_slow
+    - test_time
+    - test2_hello_world
+    - test2_time
+    - test2_headers
+    - test2_auth1234
+    - test2_slow
+    - test2_set_time
+    - test2_pour_chocolate_into_mold
+---
+apiVersion: mcp.kuadrant.io/v1alpha1
+kind: MCPVirtualServer
+metadata:
+  name: github-tools
+  namespace: team-a
+spec:
+  description: GitHub tools for mcp-github group — repos, PRs, users, context
+  tools:
+    - github_get_commit
+    - github_get_file_contents
+    - github_get_latest_release
+    - github_get_me
+    - github_get_release_by_tag
+    - github_get_tag
+    - github_get_team_members
+    - github_get_teams
+    - github_list_branches
+    - github_list_commits
+    - github_list_pull_requests
+    - github_list_releases
+    - github_list_tags
+    - github_pull_request_read
+    - github_search_code
+    - github_search_pull_requests
+    - github_search_repositories
+    - github_search_users
+---
+apiVersion: mcp.kuadrant.io/v1alpha1
+kind: MCPVirtualServer
+metadata:
+  name: user-tools
+  namespace: team-a
+spec:
+  description: Test tools only for mcp-users group
+  tools:
+    - test_add_tool
+    - test_greet
+    - test_headers
+    - test_slow
+    - test_time
+    - test2_hello_world
+    - test2_time
+    - test2_headers
+    - test2_auth1234
+    - test2_slow
+    - test2_set_time
+    - test2_pour_chocolate_into_mold

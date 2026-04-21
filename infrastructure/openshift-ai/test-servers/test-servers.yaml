@@ -1,0 +1,104 @@
+# Test MCP servers: MCPServer CRs (lifecycle operator), HTTPRoutes, MCPServerRegistrations
+# The lifecycle operator creates Deployments + Services from these CRs.
+---
+# test-server-1: 5 tools (add, greet, headers, slow, time)
+apiVersion: mcp.x-k8s.io/v1alpha1
+kind: MCPServer
+metadata:
+  name: test-mcp-server
+  namespace: team-a
+spec:
+  source:
+    type: ContainerImage
+    containerImage:
+      ref: ghcr.io/kuadrant/mcp-gateway/test-server1:latest
+  config:
+    port: 9090
+    path: /mcp
+    arguments:
+      - /mcp-test-server
+      - --http
+      - 0.0.0.0:9090
+  runtime:
+    replicas: 1
+---
+apiVersion: gateway.networking.k8s.io/v1
+kind: HTTPRoute
+metadata:
+  name: test-mcp-server
+  namespace: team-a
+spec:
+  hostnames:
+    - test-mcp-server.mcp.local
+  parentRefs:
+    - name: team-a-gateway
+      sectionName: mcps
+  rules:
+    - backendRefs:
+        - name: test-mcp-server
+          port: 9090
+---
+apiVersion: mcp.kuadrant.io/v1alpha1
+kind: MCPServerRegistration
+metadata:
+  name: test-mcp-server
+  namespace: team-a
+spec:
+  toolPrefix: test_
+  targetRef:
+    group: gateway.networking.k8s.io
+    kind: HTTPRoute
+    name: test-mcp-server
+---
+# test-server-2: 7 tools (hello_world, time, headers, auth1234, slow, set_time, pour_chocolate_into_mold)
+apiVersion: mcp.x-k8s.io/v1alpha1
+kind: MCPServer
+metadata:
+  name: test-server-2
+  namespace: team-a
+  annotations:
+    mcp.opendatahub.io/catalog-server: test-server-2
+    mcp.opendatahub.io/display-name: test-server-2
+spec:
+  source:
+    type: ContainerImage
+    containerImage:
+      ref: ghcr.io/kuadrant/mcp-gateway/test-server2:latest
+  config:
+    port: 9090
+    path: /mcp
+    arguments:
+      - /mcp-test-server
+    env:
+      - name: MCP_TRANSPORT
+        value: http
+      - name: PORT
+        value: "9090"
+---
+apiVersion: gateway.networking.k8s.io/v1
+kind: HTTPRoute
+metadata:
+  name: test-server-2
+  namespace: team-a
+spec:
+  hostnames:
+    - test-server-2.mcp.local
+  parentRefs:
+    - name: team-a-gateway
+      sectionName: mcps
+  rules:
+    - backendRefs:
+        - name: test-server-2
+          port: 9090
+---
+apiVersion: mcp.kuadrant.io/v1alpha1
+kind: MCPServerRegistration
+metadata:
+  name: test-server-2
+  namespace: team-a
+spec:
+  toolPrefix: test2_
+  targetRef:
+    group: gateway.networking.k8s.io
+    kind: HTTPRoute
+    name: test-server-2

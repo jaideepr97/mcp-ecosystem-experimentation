@@ -1,0 +1,32 @@
+# Vault Helm values for OpenShift deployment
+# Install: helm install vault hashicorp/vault -n openshift-operators -f 20-vault-helm-values.yaml
+# Chart: hashicorp/vault v0.32.0
+# Image: registry.connect.redhat.com/hashicorp/vault:1.21.2-ubi
+global:
+  openshift: true
+
+server:
+  image:
+    repository: registry.connect.redhat.com/hashicorp/vault
+    tag: 1.21.2-ubi
+
+  standalone:
+    enabled: true
+    config: |
+      ui = true
+      listener "tcp" {
+        tls_disable = 1
+        address = "[::]:8200"
+        cluster_address = "[::]:8201"
+      }
+      storage "file" {
+        path = "/vault/data"
+      }
+      disable_mlock = true
+
+  dataStorage:
+    enabled: true
+    size: 1Gi
+
+ui:
+  enabled: false

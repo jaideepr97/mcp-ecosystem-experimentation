@@ -234,14 +234,100 @@ spec:
 
 #### Example: OpenShift MCP Server
 
-The OpenShift MCP Server provides read-only access to the Kubernetes API through MCP tools:
+The OpenShift MCP Server provides read-only access to the Kubernetes API through MCP tools. It authenticates to the Kubernetes API using a dedicated ServiceAccount — this is the [recommended production approach](https://github.com/openshift/openshift-mcp-server/blob/main/docs/getting-started-kubernetes.md). All tool calls execute with the ServiceAccount's RBAC permissions, regardless of which user initiated the request. Per-user authorization is enforced at the gateway layer (AuthPolicy), not at the Kubernetes API layer.
+
+The recommended deployment model is a **two-tier approach** with separate instances for platform engineers and AI engineers:
+
+##### Platform Engineer Instance (cluster-scoped)
+
+A single, centrally managed deployment with cluster-wide visibility for platform operations and triage:
+
+```yaml
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: openshift-mcp-server-platform
+  namespace: mcp-platform
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: openshift-mcp-server-platform
+  template:
+    metadata:
+      labels:
+        app: openshift-mcp-server-platform
+    spec:
+      serviceAccountName: mcp-platform-viewer
+      containers:
+        - name: server
+          image: registry.redhat.io/openshift-mcp-beta/openshift-mcp-server-rhel9:0.2
+          args: ["serve", "--config", "/config/config.toml"]
+          ports:
+            - containerPort: 8080
+          volumeMounts:
+            - name: config
+              mountPath: /config
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: 8080
+          readinessProbe:
+            httpGet:
+              path: /healthz
+              port: 8080
+          securityContext:
+            runAsNonRoot: true
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop: ["ALL"]
+      volumes:
+        - name: config
+          configMap:
+            name: openshift-mcp-server-platform-config
+```
+
+```toml
+# Platform engineer config — cluster-wide visibility, core + config toolsets
+[server]
+read_only = true
+stateless = true
+toolsets = ["core", "config"]
+
+[server.denied_resources]
+resources = ["Secret", "ServiceAccount"]
+api_groups = ["rbac.authorization.k8s.io"]
+```
+
+The ServiceAccount uses a **ClusterRoleBinding** to the `view` ClusterRole, giving it read access across all namespaces:
+
+```yaml
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: mcp-platform-viewer
+subjects:
+  - kind: ServiceAccount
+    name: mcp-platform-viewer
+    namespace: mcp-platform
+roleRef:
+  kind: ClusterRole
+  name: view
+  apiGroup: rbac.authorization.k8s.io
+```
+
+This instance should be protected by an AuthPolicy requiring the `mcp-admin` role — only platform engineers and SREs should have access to cluster-wide Kubernetes visibility.
+
+##### AI Engineer Instance (namespace-scoped)
+
+A lightweight, per-team deployment with visibility restricted to the team's namespace:
 
 ```yaml
 apiVersion: apps/v1
 kind: Deployment
 metadata:
   name: openshift-mcp-server
-  namespace: mcp-upstream-test
+  namespace: team-a
 spec:
   replicas: 1
   selector:
@@ -252,7 +338,7 @@ spec:
       labels:
         app: openshift-mcp-server
     spec:
-      serviceAccountName: openshift-mcp-server
+      serviceAccountName: mcp-team-viewer
       containers:
         - name: server
           image: registry.redhat.io/openshift-mcp-beta/openshift-mcp-server-rhel9:0.2
@@ -281,21 +367,80 @@ spec:
             name: openshift-mcp-server-config
 ```
 
-With a configuration that specifies read-only access and restricted toolsets:
-
 ```toml
+# AI engineer config — namespace-scoped, core toolset only
 [server]
 read_only = true
 stateless = true
-cluster_provider_strategy = "in-cluster"
-toolsets = ["core", "config"]
+toolsets = ["core"]
 
 [server.denied_resources]
 resources = ["Secret", "ServiceAccount"]
 api_groups = ["rbac.authorization.k8s.io"]
 ```
 
-The server's ServiceAccount should be bound to the `view` ClusterRole (or a more restrictive custom role) to limit Kubernetes API access.
+The ServiceAccount uses a namespace-scoped **RoleBinding** to the `view` Role, restricting visibility to only the team's namespace:
+
+```yaml
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: mcp-team-viewer
+  namespace: team-a
+subjects:
+  - kind: ServiceAccount
+    name: mcp-team-viewer
+    namespace: team-a
+roleRef:
+  kind: ClusterRole
+  name: view
+  apiGroup: rbac.authorization.k8s.io
+```
+
+When an AI engineer calls `openshift_pods_list`, the Kubernetes API only returns pods in `team-a` — the RBAC boundary does the scoping, not the gateway.
+
+##### Two-Tier Comparison
+
+| | Platform Engineer Instance | AI Engineer Instance |
+|---|---|---|
+| **Scope** | Cluster-wide | Single namespace |
+| **ServiceAccount binding** | `view` ClusterRole (ClusterRoleBinding) | `view` ClusterRole (namespace RoleBinding) |
+| **Toolsets** | `core` + `config` | `core` only |
+| **Denied resources** | Secrets, RBAC | Secrets, RBAC |
+| **Gateway AuthPolicy** | Requires `mcp-admin` role | Requires team membership (group claim) |
+| **Deployment location** | Shared namespace (e.g., `mcp-platform`) | Team namespace (e.g., `team-a`) |
+| **Kubernetes audit identity** | `system:serviceaccount:mcp-platform:mcp-platform-viewer` | `system:serviceaccount:team-a:mcp-team-viewer` |
+
+The `config` toolset (e.g., `openshift_configuration_view`) exposes cluster-level configuration that is not useful or appropriate for AI engineers. Restricting AI engineer instances to `core` only keeps the tool list focused and avoids leaking cluster configuration details. This restriction happens at the server level — the tools are never loaded, so they don't appear in the broker, can't be listed, and can't be called.
+
+##### Kubernetes Authentication Model
+
+The OpenShift MCP Server authenticates to the Kubernetes API using its pod's ServiceAccount token. This means:
+
+- **All tool calls execute with the same Kubernetes identity** — the ServiceAccount, not the individual user. Per-user Kubernetes RBAC is not applied.
+- **Per-user authorization is handled at the gateway layer** via AuthPolicies, not at the Kubernetes API layer.
+- **Kubernetes audit logs show the ServiceAccount identity** for all MCP tool calls, not individual users. For per-user audit trails, correlate gateway access logs (which contain JWT claims) with Kubernetes audit logs.
+- **The Authorization header must be stripped** on the HTTPRoute (`RequestHeaderModifier`) to prevent the user's Keycloak JWT from being forwarded to the server, where it would be used as Kubernetes credentials and fail.
+
+The upstream codebase contains experimental support for per-user token passthrough (`--require-oauth`), but this is not documented or recommended for production use. The ServiceAccount approach is the supported path.
+
+##### Layered Access Control Model
+
+Access to MCP tools is controlled at four independent layers. Each layer serves a distinct purpose:
+
+| Layer | What It Controls | Mechanism | Configured By |
+|-------|-----------------|-----------|---------------|
+| **Server config** (`toolsets`) | Which tools exist at all | MCP server only loads specified toolsets | Platform Engineer (config.toml) |
+| **Kubernetes RBAC** (ServiceAccount binding) | What data the tools can access | Kubernetes API returns only what the SA can see | Platform Engineer (RoleBinding/ClusterRoleBinding) |
+| **VirtualMCPServer** | Which loaded tools users see in `tools/list` | Gateway broker filters the list | Platform Engineer (MCPVirtualServer CR) |
+| **AuthPolicy** | Which tools users can call | Authorino enforces per-request | Platform Engineer (AuthPolicy CR) |
+
+These layers are independent and composable:
+
+- **Server config** is the coarsest filter — it determines the universe of available tools. An AI engineer instance with `toolsets = ["core"]` will never expose `config` tools regardless of any other layer.
+- **Kubernetes RBAC** scopes the data returned by tools. A namespace-scoped RoleBinding means `pods_list` only returns pods in that namespace. The tool exists and can be called, but the results are naturally bounded.
+- **VirtualMCPServer** is a UX layer — it controls what users see when they call `tools/list`, reducing noise and confusion. It does not enforce access.
+- **AuthPolicy** is the security enforcement layer — it blocks unauthorized `tools/call` requests before they reach the MCP server. This is the only layer that prevents a user from calling a tool they know the name of.
 
 ### Workflow 2: Registering MCP Servers with the Gateway
 
@@ -844,15 +989,21 @@ Organizations should choose a deployment pattern based on team maturity and comp
 
 ### Security Considerations
 
-1. **Restrict MCP server Kubernetes access.** Use the principle of least privilege for ServiceAccount RBAC. The OpenShift MCP Server should use a `view` ClusterRole (read-only) or a custom role that restricts access to specific resources. Deny access to Secrets, ServiceAccounts, and RBAC resources.
+1. **Deploy per-namespace OpenShift MCP Server instances for AI engineers.** Use namespace-scoped RoleBindings instead of ClusterRoleBindings to limit Kubernetes API visibility to the team's namespace. Reserve cluster-scoped instances for platform engineers behind an `mcp-admin` AuthPolicy. This limits blast radius — a compromised ServiceAccount token can only see one namespace, not the entire cluster.
 
-2. **Do not expose the MCP Gateway without authentication.** The gateway aggregates access to backend services. An unauthenticated gateway is equivalent to giving anonymous users access to all registered MCP server tools.
+2. **Restrict MCP server Kubernetes access.** Use the principle of least privilege for ServiceAccount RBAC. The OpenShift MCP Server should use a `view` ClusterRole (read-only) or a custom role that restricts access to specific resources. Deny access to Secrets, ServiceAccounts, and RBAC resources via `denied_resources` in the server config.
 
-3. **Review MCP server tool capabilities.** Before registering an MCP server with the gateway, review what tools it exposes and what actions they perform. An MCP server with write access to the Kubernetes API could create, modify, or delete resources.
+3. **Do not expose the MCP Gateway without authentication.** The gateway aggregates access to backend services. An unauthenticated gateway is equivalent to giving anonymous users access to all registered MCP server tools.
 
-4. **Use read-only mode for the OpenShift MCP Server.** Set `read_only = true` and `stateless = true` in the server configuration to prevent write operations against the Kubernetes API.
+4. **Review MCP server tool capabilities.** Before registering an MCP server with the gateway, review what tools it exposes and what actions they perform. An MCP server with write access to the Kubernetes API could create, modify, or delete resources.
 
-5. **Credential injection over credential embedding.** When MCP servers need credentials for downstream APIs, use the gateway's credential injection mechanism (Vault + Authorino metadata evaluators) rather than embedding credentials in environment variables or ConfigMaps. This keeps credentials out of the server's pod spec and enables per-user credential isolation.
+5. **Use read-only mode for the OpenShift MCP Server.** Set `read_only = true` and `stateless = true` in the server configuration to prevent write operations against the Kubernetes API.
+
+6. **Restrict toolsets to the minimum needed.** Use the `toolsets` config option to load only the toolsets appropriate for each persona. AI engineer instances should not load the `config` toolset — it exposes cluster-level configuration data. Tools that are not loaded cannot be called, regardless of gateway-level policies.
+
+7. **Credential injection over credential embedding.** When MCP servers need credentials for downstream APIs, use the gateway's credential injection mechanism (Vault + Authorino metadata evaluators) rather than embedding credentials in environment variables or ConfigMaps. This keeps credentials out of the server's pod spec and enables per-user credential isolation.
+
+8. **Correlate gateway and Kubernetes audit logs for per-user attribution.** Since the OpenShift MCP Server uses a ServiceAccount identity for all Kubernetes API calls, Kubernetes audit logs alone don't show which user initiated a tool call. Correlate MCP Gateway access logs (which contain JWT claims including `sub` and group membership) with Kubernetes audit log timestamps to attribute API calls to specific users.
 
 ### Observability
 
@@ -890,6 +1041,7 @@ The following capabilities are intentionally deferred from the Summit MVP. They 
 | **Registry and lifecycle management** | Automated MCP server lifecycle: versioning, update policies, health-based deregistration | Out of scope for MVP |
 | **Redis session store** | Broker HA with shared session state for multi-replica gateway deployments | Out of scope for MVP |
 | **Advanced aggregation** | Cross-server tool composition, tool aliasing, and response transformation | Out of scope for MVP |
+| **Per-user Kubernetes token passthrough** | Exchange user JWTs for Kubernetes-compatible tokens so the OpenShift MCP Server operates with per-user RBAC instead of a shared ServiceAccount. Enables per-user Kubernetes audit trails. | Experimental support exists in upstream codebase (`--require-oauth`), not yet recommended for production |
 | **Integrated SSO for Playground** | Automatic Keycloak integration for Playground MCP auth (no manual token paste) | Pending RHOAI dashboard integration |
 
 ### How the MVP Fits Into the Longer-Term Roadmap

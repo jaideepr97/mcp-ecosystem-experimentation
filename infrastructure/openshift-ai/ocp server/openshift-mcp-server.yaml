@@ -1,0 +1,131 @@
+# OpenShift MCP Server: ServiceAccount, RBAC, config, MCPServer CR, registration, routing, auth
+# The lifecycle operator creates the Deployment + Service from the MCPServer CR.
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: openshift-mcp-server
+  namespace: team-a
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: team-a-ocp-mcp-view
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: view
+subjects:
+  - kind: ServiceAccount
+    name: openshift-mcp-server
+    namespace: team-a
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: openshift-mcp-server-config
+  namespace: team-a
+data:
+  config.toml: |
+    port = "8080"
+    read_only = true
+    stateless = true
+    cluster_provider_strategy = "in-cluster"
+    toolsets = ["core", "config"]
+
+    denied_resources = [
+        {group = "", version = "v1", kind = "Secret"},
+        {group = "", version = "v1", kind = "ServiceAccount"},
+        {group = "rbac.authorization.k8s.io", version = "v1", kind = "Role"},
+        {group = "rbac.authorization.k8s.io", version = "v1", kind = "ClusterRole"},
+        {group = "rbac.authorization.k8s.io", version = "v1", kind = "RoleBinding"},
+        {group = "rbac.authorization.k8s.io", version = "v1", kind = "ClusterRoleBinding"}
+    ]
+---
+apiVersion: mcp.x-k8s.io/v1alpha1
+kind: MCPServer
+metadata:
+  name: openshift-mcp-server
+  namespace: team-a
+  annotations:
+    mcp.opendatahub.io/catalog-server: openshift-mcp-server
+    mcp.opendatahub.io/display-name: openshift-mcp-server
+spec:
+  source:
+    type: ContainerImage
+    containerImage:
+      ref: registry.redhat.io/openshift-mcp-beta/openshift-mcp-server-rhel9:0.2
+  config:
+    port: 8080
+    path: /mcp
+    arguments:
+      - --config
+      - /etc/mcp-config/config.toml
+    storage:
+      - path: /etc/mcp-config
+        permissions: ReadOnly
+        source:
+          type: ConfigMap
+          configMap:
+            name: openshift-mcp-server-config
+  runtime:
+    security:
+      serviceAccountName: openshift-mcp-server
+---
+apiVersion: gateway.networking.k8s.io/v1
+kind: HTTPRoute
+metadata:
+  name: openshift-mcp-server
+  namespace: team-a
+spec:
+  hostnames:
+    - openshift-mcp-server.mcp.local
+  parentRefs:
+    - name: team-a-gateway
+      sectionName: mcps
+  rules:
+    - backendRefs:
+        - name: openshift-mcp-server
+          port: 8080
+---
+apiVersion: mcp.kuadrant.io/v1alpha1
+kind: MCPServerRegistration
+metadata:
+  name: openshift-mcp-server
+  namespace: team-a
+spec:
+  toolPrefix: openshift_
+  targetRef:
+    group: gateway.networking.k8s.io
+    kind: HTTPRoute
+    name: openshift-mcp-server
+---
+# Per-HTTPRoute AuthPolicy: restricts OpenShift MCP to mcp-admins group only
+apiVersion: kuadrant.io/v1
+kind: AuthPolicy
+metadata:
+  name: openshift-mcp-admin-only
+  namespace: team-a
+spec:
+  targetRef:
+    group: gateway.networking.k8s.io
+    kind: HTTPRoute
+    name: openshift-mcp-server
+  rules:
+    authentication:
+      keycloak-jwt:
+        jwt:
+          issuerUrl: https://keycloak.apps.rosa.agentic-mcp.jolf.p3.openshiftapps.com/realms/mcp-gateway
+    authorization:
+      admin-only:
+        patternMatching:
+          patterns:
+            - selector: auth.identity.groups
+              operator: incl
+              value: mcp-admins
+    response:
+      success:
+        headers:
+          authorization:
+            plain:
+              value: ""
