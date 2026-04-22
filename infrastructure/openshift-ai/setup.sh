@@ -3,22 +3,19 @@
 # MCP Ecosystem — Setup
 # =============================================================================
 # Installs all shared infrastructure on an OpenShift cluster:
-#   Phase 1: Operator subscriptions (MCP Gateway, RHBK, Kuadrant)
+#   Phase 1: Operator subscriptions (MCP Gateway, RHBK)
 #   Phase 2: Keycloak (DB, realm, users, groups, claims)
 #   Phase 3: MCP Lifecycle Operator
 #   Phase 4: Vault (Helm, init, JWT auth, per-user policy)
-#   Phase 5: MCP Gateway instance in team-a (Helm + Route)
+#   Phase 5: Kuadrant CR + MCP Gateway instance in team-a (Helm + Route + config Secret + RHOAI registration)
 #   Phase 6: Playground (RHOAI Gen AI Studio + LlamaStack)
 #
-# Prerequisites:
-#   - oc / kubectl logged into the target cluster
-#   - helm v3 installed
-#   - RHOAI 3.4 installed with mcpCatalog + Gen AI Studio enabled
-#   - python3 available (for JSON parsing)
+# The script runs continuously, pausing between phases for the user to
+# review progress. Prerequisites are shown at the start.
 #
 # Usage:
-#   ./setup.sh                   # run all phases
-#   ./setup.sh --phase 3         # run from phase 3 onward
+#   ./setup.sh                   # guided run through all phases
+#   ./setup.sh --phase 3         # start from phase 3 onward
 #   ./setup.sh --phase 2 --only  # run only phase 2
 # =============================================================================
 set -euo pipefail
@@ -40,9 +37,10 @@ CLUSTER_DOMAIN="${CLUSTER_DOMAIN:-apps.rosa.agentic-mcp.jolf.p3.openshiftapps.co
 KEYCLOAK_HOST="keycloak.${CLUSTER_DOMAIN}"
 GATEWAY_HOST="team-a-mcp.${CLUSTER_DOMAIN}"
 
-header() { echo ""; echo "══════════════════════════════════════════════════════════════"; echo "  $1"; echo "══════════════════════════════════════════════════════════════"; }
-step()   { echo ""; echo "── $1"; }
-ok()     { echo "   ✓ $1"; }
+header()  { echo ""; echo "══════════════════════════════════════════════════════════════"; echo "  $1"; echo "══════════════════════════════════════════════════════════════"; }
+step()    { echo ""; echo "── $1"; }
+ok()      { echo "   ✓ $1"; }
+pause()   { echo ""; read -rp "   ⏎ Press Enter to continue... " < /dev/tty; }
 wait_for() {
   local what="$1" cmd="$2" timeout="${3:-120}"
   echo -n "   Waiting for $what..."
@@ -56,6 +54,27 @@ wait_for() {
 }
 
 should_run() { local phase=$1; [[ $phase -ge $START_PHASE ]] && { $ONLY_PHASE && [[ $phase -ne $START_PHASE ]] && return 1; return 0; }; }
+
+# =============================================================================
+# Prerequisites
+# =============================================================================
+header "Prerequisites"
+echo ""
+echo "  Verify the following are in place before proceeding:"
+echo ""
+echo "  1. oc / kubectl logged into the target cluster"
+echo "  2. helm v3 installed"
+echo "  3. python3 available"
+echo "  4. Red Hat Connectivity Link operator installed"
+echo "     (includes Kuadrant / Authorino / Limitador)"
+echo "  5. RHOAI 3.4 installed with mcpCatalog + Gen AI Studio enabled"
+echo "  6. A vLLM ServingRuntime + InferenceService deployed and running:"
+echo "     --served-model-name matching the InferenceService name"
+echo "     --enable-auto-tool-choice --tool-call-parser openai"
+echo "     label opendatahub.io/genai-asset=true on the InferenceService"
+echo ""
+echo "  Cluster: ${CLUSTER_DOMAIN}"
+pause
 
 # =============================================================================
 # Phase 1: Operator Subscriptions
@@ -79,29 +98,8 @@ if should_run 1; then
   wait_for "RHBK CSV" "oc get csv -n keycloak -o jsonpath='{.items[0].status.phase}' 2>/dev/null | grep -q Succeeded" 300
   ok "RHBK operator installed"
 
-  step "1.4 Red Hat Connectivity Link operator"
-  oc apply -f "${SCRIPT_DIR}/operator subscriptions/connectivity-link.yaml"
-  echo "   Waiting for install plan..."
-  sleep 10
-  INSTALL_PLAN=""
-  for i in $(seq 1 30); do
-    INSTALL_PLAN=$(oc get installplan -n openshift-operators -o jsonpath='{.items[?(@.spec.approved==false)].metadata.name}' 2>/dev/null || true)
-    [ -n "$INSTALL_PLAN" ] && break
-    sleep 5
-  done
-  if [ -n "$INSTALL_PLAN" ]; then
-    echo "   Approving install plan: $INSTALL_PLAN"
-    oc patch installplan "$INSTALL_PLAN" -n openshift-operators --type merge -p '{"spec":{"approved":true}}'
-    wait_for "Connectivity Link CSV" "oc get csv -n openshift-operators -o jsonpath='{.items[*].metadata.name}' 2>/dev/null | grep -q rhcl-operator" 300
-    ok "Connectivity Link operator installed"
-  else
-    echo "   ⚠ No pending install plan found — operator may already be installed"
-  fi
-
-  step "1.5 Kuadrant CR"
-  oc apply -f "${SCRIPT_DIR}/operator subscriptions/kuadrant.yaml"
-  wait_for "Kuadrant ready" "oc get kuadrant kuadrant -n openshift-operators -o jsonpath='{.status.conditions[?(@.type==\"Ready\")].status}' 2>/dev/null | grep -q True" 180
-  ok "Kuadrant ready (Authorino + Limitador deployed)"
+  ok "Phase 1 complete"
+  pause
 fi
 
 # =============================================================================
@@ -128,6 +126,9 @@ if should_run 2; then
   step "2.4 Add Vault-required claims to mcp-playground client"
   KEYCLOAK_HOST="$KEYCLOAK_HOST" bash "${SCRIPT_DIR}/vault/keycloak-vault-claims.sh"
   ok "Claims added: sub, preferred_username, mcp-playground audience"
+
+  ok "Phase 2 complete"
+  pause
 fi
 
 # =============================================================================
@@ -140,6 +141,9 @@ if should_run 3; then
   oc apply -f "${SCRIPT_DIR}/lifecycle operator/lifecycle-operator.yaml"
   wait_for "lifecycle operator" "oc get deployment mcp-lifecycle-operator-controller-manager -n mcp-lifecycle-operator-system -o jsonpath='{.status.availableReplicas}' 2>/dev/null | grep -q 1" 120
   ok "Lifecycle operator running (manages MCPServer CRs)"
+
+  ok "Phase 3 complete"
+  pause
 fi
 
 # =============================================================================
@@ -160,6 +164,9 @@ if should_run 4; then
   step "4.2 Initialize and configure Vault"
   KEYCLOAK_HOST="$KEYCLOAK_HOST" bash "${SCRIPT_DIR}/vault/vault-configure.sh"
   ok "Vault configured: KV v2 at mcp/, JWT auth with Keycloak JWKS, per-user policy"
+
+  ok "Phase 4 complete"
+  pause
 fi
 
 # =============================================================================
@@ -172,14 +179,19 @@ if should_run 5; then
   oc create namespace team-a --dry-run=client -o yaml | oc apply -f -
   ok "team-a namespace ready"
 
-  step "5.2 Install gateway via Helm"
+  step "5.2 Kuadrant CR"
+  oc apply -f "${SCRIPT_DIR}/operator subscriptions/kuadrant.yaml"
+  wait_for "Kuadrant ready" "oc get kuadrant kuadrant -n openshift-operators -o jsonpath='{.status.conditions[?(@.type==\"Ready\")].status}' 2>/dev/null | grep -q True" 180
+  ok "Kuadrant ready (Authorino + Limitador deployed)"
+
+  step "5.3 Install gateway via Helm"
   helm upgrade -i team-a-gateway oci://ghcr.io/kuadrant/charts/mcp-gateway \
     --version 0.6.0 --namespace team-a --skip-crds \
     -f "${SCRIPT_DIR}/gateway/gateway-helm-values.yaml"
   wait_for "Gateway programmed" "oc get gateway team-a-gateway -n team-a -o jsonpath='{.status.conditions[?(@.type==\"Programmed\")].status}' 2>/dev/null | grep -q True" 120
   ok "Gateway programmed"
 
-  step "5.3 Create OpenShift Route"
+  step "5.4 Create OpenShift Route"
   # The ingress chart is not in the OCI registry — install from local mcp-gateway repo clone if available
   MCP_GATEWAY_REPO="${MCP_GATEWAY_REPO:-/Users/jrao/projects/mcp-gateway}"
   if [ -d "$MCP_GATEWAY_REPO/config/openshift/charts/mcp-gateway-ingress" ]; then
@@ -196,10 +208,6 @@ if should_run 5; then
   wait_for "Route" "oc get route team-a-gateway -n team-a -o jsonpath='{.status.ingress[0].conditions[0].status}' 2>/dev/null | grep -q True" 60
   ok "Route: https://${GATEWAY_HOST}"
 
-  step "5.4 Verify MCPGatewayExtension"
-  wait_for "MCPGatewayExtension ready" "oc get mcpgatewayextension -n team-a -o jsonpath='{.items[0].status.conditions[?(@.type==\"Ready\")].status}' 2>/dev/null | grep -q True" 60
-  ok "MCPGatewayExtension ready (broker deployed)"
-
   step "5.5 Generate ECDSA keys for wristband tool filtering"
   bash "${SCRIPT_DIR}/gateway/wristband-keys.sh"
   ok "ECDSA key pair created (private in openshift-operators, public in team-a)"
@@ -208,8 +216,31 @@ if should_run 5; then
   MCPGW_EXT_NAME=$(oc get mcpgatewayextension -n team-a -o jsonpath='{.items[0].metadata.name}')
   oc patch mcpgatewayextension "$MCPGW_EXT_NAME" -n team-a --type merge \
     -p '{"spec":{"trustedHeadersKey":{"generate":"Disabled","secretName":"trusted-headers-public-key"}}}'
-  wait_for "MCPGatewayExtension reconcile" "oc get mcpgatewayextension $MCPGW_EXT_NAME -n team-a -o jsonpath='{.status.conditions[?(@.type==\"Ready\")].status}' 2>/dev/null | grep -q True" 60
-  ok "Broker configured to validate x-authorized-tools wristband JWTs"
+  wait_for "MCPGatewayExtension ready" "oc get mcpgatewayextension $MCPGW_EXT_NAME -n team-a -o jsonpath='{.status.conditions[?(@.type==\"Ready\")].status}' 2>/dev/null | grep -q True" 60
+  ok "MCPGatewayExtension ready (broker deployed, wristband verification configured)"
+
+  step "5.7 Wait for config Secret"
+  wait_for "mcp-gateway-config" "oc get secret mcp-gateway-config -n team-a" 60
+  ok "Config Secret exists in team-a (patched with VirtualMCPServers during usage)"
+
+  step "5.8 Register gateway in RHOAI Dashboard"
+  oc apply -f - <<EOF
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: gen-ai-aa-mcp-servers
+  namespace: redhat-ods-applications
+data:
+  Team-A-MCP-Gateway: |
+    {
+      "url": "https://${GATEWAY_HOST}/mcp",
+      "description": "Team-A MCP Gateway — OpenShift + test tools"
+    }
+EOF
+  ok "gen-ai-aa-mcp-servers ConfigMap applied"
+
+  ok "Phase 5 complete"
+  pause
 fi
 
 # =============================================================================
@@ -218,49 +249,7 @@ fi
 if should_run 6; then
   header "Phase 6: Playground (RHOAI Gen AI Studio + LlamaStack)"
 
-  echo ""
-  echo "  This phase requires manual steps in the RHOAI Dashboard."
-  echo "  Prerequisites:"
-  echo "    - RHOAI 3.4 installed with mcpCatalog + Gen AI Studio enabled"
-  echo "    - The LlamaStack operator installed"
-  echo "    - A vLLM model deployed in a Data Science Project namespace"
-  echo "    - The InferenceService labeled with opendatahub.io/genai-asset=true"
-  echo "      so it appears as an AI asset endpoint in Gen AI Studio"
-  echo ""
-
-  step "6.1 Ensure ServingRuntime has correct --served-model-name and tool-calling args"
-  echo "  The Playground registers models by InferenceService name, but vLLM uses"
-  echo "  --served-model-name. These MUST match or inference will fail with 404."
-  echo "  The ServingRuntime also needs --enable-auto-tool-choice --tool-call-parser openai."
-  echo ""
-  read -p "  Enter the namespace where vLLM is deployed [gpt-oss]: " VLLM_NS
-  VLLM_NS="${VLLM_NS:-gpt-oss}"
-  echo ""
-  echo "  Available ServingRuntimes in ${VLLM_NS}:"
-  oc get servingruntime -n "$VLLM_NS" -o custom-columns=NAME:.metadata.name,SERVED_MODEL_NAME:'.spec.containers[0].args' --no-headers 2>/dev/null | while read -r name args; do
-    served_name=$(echo "$args" | python3 -c "import sys,ast; a=ast.literal_eval(sys.stdin.read()); i=a.index('--served-model-name'); print(a[i+1])" 2>/dev/null || echo "NOT SET")
-    has_tool_choice=$(echo "$args" | grep -q 'enable-auto-tool-choice' && echo "yes" || echo "NO")
-    echo "    ${name}  →  served-model-name: ${served_name}, tool-calling: ${has_tool_choice}"
-  done
-  echo ""
-  echo "  Available InferenceServices in ${VLLM_NS}:"
-  oc get inferenceservice -n "$VLLM_NS" -o custom-columns=NAME:.metadata.name,RUNTIME:.spec.predictor.model.runtime,GENAI_ASSET:.metadata.labels.opendatahub\\.io/genai-asset --no-headers 2>/dev/null
-  echo ""
-  echo "  For each ServingRuntime, ensure:"
-  echo "    1. --served-model-name matches the InferenceService name"
-  echo "    2. --enable-auto-tool-choice and --tool-call-parser openai are present"
-  echo "    3. The InferenceService has label opendatahub.io/genai-asset=true"
-  echo ""
-  echo "  Example patch:"
-  echo "    oc patch servingruntime <runtime-name> -n ${VLLM_NS} --type json -p '[{\"op\":\"replace\",\"path\":\"/spec/containers/0/args\",\"value\":[...]}]'"
-  echo ""
-  read -p "  Press Enter once ServingRuntimes are configured (vLLM pods will restart)..."
-
-  step "6.2 Register MCP Gateway in RHOAI Dashboard"
-  oc apply -f "${SCRIPT_DIR}/playground/gen-ai-aa-mcp-servers.yaml"
-  ok "gen-ai-aa-mcp-servers ConfigMap applied to redhat-ods-applications"
-
-  step "6.3 Create Playground via RHOAI Dashboard"
+  step "6.1 Create Playground via RHOAI Dashboard"
   echo ""
   echo "  ┌─────────────────────────────────────────────────────────────┐"
   echo "  │  UI Steps                                                  │"
@@ -279,18 +268,18 @@ if should_run 6; then
   echo "    - SQLite storage for agent state"
   echo ""
 
-  read -p "  Press Enter after creating the Playground in the UI..."
+  pause
 
-  step "6.4 Validate LlamaStack"
+  step "6.2 Validate LlamaStack"
   echo "  Checking for LlamaStackDistribution CRs across the cluster..."
   LLAMA_NS=$(oc get llamastackdistribution --all-namespaces -o jsonpath='{.items[0].metadata.namespace}' 2>/dev/null || true)
   LLAMA_NAME=$(oc get llamastackdistribution --all-namespaces -o jsonpath='{.items[0].metadata.name}' 2>/dev/null || true)
   if [ -n "$LLAMA_NS" ] && [ -n "$LLAMA_NAME" ]; then
     ok "Found: $LLAMA_NAME in namespace $LLAMA_NS"
-    wait_for "LlamaStack pod" "oc get pod -n $LLAMA_NS -l app.kubernetes.io/part-of=llama-stack -o jsonpath='{.items[0].status.phase}' 2>/dev/null | grep -q Running" 180
+    wait_for "LlamaStack pod" "oc get pod -n $LLAMA_NS -l app.kubernetes.io/instance=$LLAMA_NAME -o jsonpath='{.items[0].status.phase}' 2>/dev/null | grep -q Running" 180
     ok "LlamaStack pod running"
 
-    LLAMA_ROUTE=$(oc get route -n "$LLAMA_NS" -l app.kubernetes.io/part-of=llama-stack -o jsonpath='{.items[0].spec.host}' 2>/dev/null || true)
+    LLAMA_ROUTE=$(oc get route -n "$LLAMA_NS" -l app.kubernetes.io/instance=$LLAMA_NAME -o jsonpath='{.items[0].spec.host}' 2>/dev/null || true)
     if [ -n "$LLAMA_ROUTE" ]; then
       ok "LlamaStack route: https://${LLAMA_ROUTE}"
     else
@@ -302,21 +291,28 @@ if should_run 6; then
 fi
 
 # =============================================================================
-# Summary
+# Summary (only when running all phases or the last phase)
 # =============================================================================
+if ! $ONLY_PHASE || [[ $START_PHASE -eq 6 ]]; then
 header "Setup Complete"
 echo ""
-echo "  Operators:"
+echo "  Operators (installed by this script):"
 echo "    MCP Gateway Controller  → mcp-system"
 echo "    RHBK (Keycloak)         → keycloak"
-echo "    Kuadrant + Authorino    → openshift-operators"
 echo "    MCP Lifecycle Operator  → mcp-lifecycle-operator-system"
+echo ""
+echo "  Prerequisites (installed before running this script):"
+echo "    Connectivity Link       → openshift-operators (includes Kuadrant/Authorino/Limitador)"
+echo "    RHOAI 3.4               → mcpCatalog + Gen AI Studio enabled"
+echo "    vLLM model              → ServingRuntime + InferenceService running"
 echo ""
 echo "  Infrastructure:"
 echo "    Keycloak    → https://${KEYCLOAK_HOST}"
 echo "    Vault       → vault.openshift-operators.svc.cluster.local:8200"
 echo "    Gateway     → https://${GATEWAY_HOST}"
 echo "    Wristband   → ECDSA keys + trustedHeadersKey configured"
+echo "    Config      → mcp-gateway-config Secret in team-a (ready for VirtualMCPServer patching)"
+echo "    RHOAI       → gen-ai-aa-mcp-servers ConfigMap registered"
 echo "    Playground  → RHOAI Gen AI Studio (LlamaStack + vLLM)"
 echo ""
 echo "  Keycloak users:"
@@ -325,3 +321,4 @@ echo "    mcp-user1  / user1pass   (groups: mcp-users)"
 echo ""
 echo "  Next: run ./usage.sh to walk through the demo phases"
 echo ""
+fi

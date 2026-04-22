@@ -1,5 +1,5 @@
 # Custom catalog sources for the model-registry MCP catalog
-# Adds test-server-2 and github-mcp-server to the catalog's discovery index.
+# Adds test-mcp-server and test-mcp-server2 to the catalog's discovery index.
 # The model-catalog deployment must be configured to mount this ConfigMap.
 ---
 apiVersion: v1
@@ -26,7 +26,57 @@ data:
   custom-mcp-servers.yaml: |
     source: Custom MCP
     mcp_servers:
-      - name: test-server-2
+      - name: test-mcp-server
+        provider: Kuadrant
+        license: apache-2.0
+        license_link: https://www.apache.org/licenses/LICENSE-2.0
+        description: A test MCP server with tools for greeting, time, headers, slow operations, and dynamic tool creation.
+        version: latest
+        transports:
+          - http
+        repositoryUrl: https://github.com/Kuadrant/mcp-gateway
+        tools:
+          - name: greet
+            description: Greet someone by name
+            parameters:
+              - name: name
+                type: string
+                description: Name to greet
+                required: true
+          - name: time
+            description: Get the current time
+            parameters: []
+          - name: headers
+            description: Get HTTP headers
+            parameters: []
+          - name: slow
+            description: Delay for N seconds
+            parameters:
+              - name: seconds
+                type: integer
+                description: Number of seconds to delay
+                required: true
+          - name: add_tool
+            description: Dynamically add a new tool
+            parameters:
+              - name: name
+                type: string
+                description: Tool name
+                required: true
+              - name: description
+                type: string
+                description: Tool description
+                required: true
+        artifacts:
+          - uri: oci://ghcr.io/kuadrant/mcp-gateway/test-server1:latest
+        runtimeMetadata:
+          defaultPort: 9090
+          mcpPath: /mcp
+          defaultArgs:
+            - /mcp-test-server
+            - --http
+            - 0.0.0.0:9090
+      - name: test-mcp-server2
         provider: Kuadrant
         license: apache-2.0
         license_link: https://www.apache.org/licenses/LICENSE-2.0
@@ -82,61 +132,3 @@ data:
             - /mcp-test-server
             - --http
             - 0.0.0.0:9090
-      - name: github-mcp-server
-        provider: GitHub
-        license: mit
-        license_link: https://opensource.org/licenses/MIT
-        description: Official GitHub MCP server providing access to repositories, issues, pull requests, code search, and user information via the GitHub API.
-        version: latest
-        transports:
-          - http
-        repositoryUrl: https://github.com/github/github-mcp-server
-        tools:
-          - name: search_repositories
-            description: Search for GitHub repositories
-            parameters:
-              - name: query
-                type: string
-                description: Search query
-                required: true
-          - name: get_file_contents
-            description: Get contents of a file or directory from a repository
-            parameters:
-              - name: owner
-                type: string
-                description: Repository owner
-                required: true
-              - name: repo
-                type: string
-                description: Repository name
-                required: true
-              - name: path
-                type: string
-                description: File or directory path
-                required: true
-          - name: list_issues
-            description: List issues in a repository
-            parameters:
-              - name: owner
-                type: string
-                description: Repository owner
-                required: true
-              - name: repo
-                type: string
-                description: Repository name
-                required: true
-          - name: search_code
-            description: Search for code across GitHub repositories
-            parameters:
-              - name: query
-                type: string
-                description: Search query
-                required: true
-          - name: get_me
-            description: Get details of the authenticated GitHub user
-            parameters: []
-        artifacts:
-          - uri: oci://ghcr.io/github/github-mcp-server:latest
-        runtimeMetadata:
-          defaultPort: 8080
-          mcpPath: /mcp

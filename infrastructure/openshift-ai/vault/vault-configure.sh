@@ -30,7 +30,8 @@ vault_exec() {
 }
 
 echo "=== Step 1: Initialize Vault ==="
-if oc exec -n "$VAULT_NS" "$VAULT_POD" -- vault status 2>&1 | grep -q "Initialized.*true"; then
+VAULT_STATUS=$(oc exec -n "$VAULT_NS" "$VAULT_POD" -- vault status -format=json 2>/dev/null || true)
+if echo "$VAULT_STATUS" | python3 -c "import sys,json; sys.exit(0 if json.load(sys.stdin).get('initialized') else 1)" 2>/dev/null; then
   echo "Already initialized. Reading credentials from $CREDS_FILE"
   UNSEAL_KEY=$(python3 -c "import json; print(json.load(open('$CREDS_FILE'))['unseal_keys_b64'][0])")
   VAULT_TOKEN=$(python3 -c "import json; print(json.load(open('$CREDS_FILE'))['root_token'])")
@@ -43,7 +44,8 @@ else
 fi
 
 echo "=== Step 2: Unseal Vault ==="
-if oc exec -n "$VAULT_NS" "$VAULT_POD" -- vault status 2>&1 | grep -q "Sealed.*true"; then
+VAULT_STATUS=$(oc exec -n "$VAULT_NS" "$VAULT_POD" -- vault status -format=json 2>/dev/null || true)
+if echo "$VAULT_STATUS" | python3 -c "import sys,json; sys.exit(0 if json.load(sys.stdin).get('sealed') else 1)" 2>/dev/null; then
   oc exec -n "$VAULT_NS" "$VAULT_POD" -- vault operator unseal "$UNSEAL_KEY"
   echo "Unsealed"
 else

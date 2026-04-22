@@ -53,6 +53,13 @@ step()     { echo ""; echo "── $1"; }
 ok()       { echo "   ✓ $1"; }
 pause()    { echo ""; read -rp "   ⏎ Press Enter to continue... " < /dev/tty; }
 ui_step()  { echo "   🖥  UI: $1"; }
+resources() {
+  echo "   ┌─ Resources ────────────────────────────────────────────────────┐"
+  for line in "$@"; do
+    printf "   │  %-62s │\n" "$line"
+  done
+  echo "   └────────────────────────────────────────────────────────────────┘"
+}
 should_run() { local phase=$1; [[ $phase -ge $START_PHASE ]] && { $ONLY_PHASE && [[ $phase -ne $START_PHASE ]] && return 1; return 0; }; }
 wait_for() {
   local what="$1" cmd="$2" timeout="${3:-120}"
@@ -100,6 +107,55 @@ mcp_tool_call() {
     -H "Mcp-Session-Id: $session" \
     -H "Content-Type: application/json" \
     -d "{\"jsonrpc\":\"2.0\",\"id\":3,\"method\":\"tools/call\",\"params\":{\"name\":\"$tool\",\"arguments\":$args}}"
+}
+
+# --- Config Secret patching for VirtualMCPServers ---
+# Workaround for Finding 48: the MCPVirtualServer controller writes to mcp-system
+# instead of the per-namespace config Secret. We read all MCPVirtualServer CRs
+# in the namespace and patch the config Secret so the broker can filter tools/list.
+patch_virtual_servers() {
+  local ns="${1:-team-a}"
+
+  VS_SECTION=$(oc get mcpvirtualserver -n "$ns" -o json 2>/dev/null | python3 -c "
+import sys, json
+data = json.load(sys.stdin)
+items = data.get('items', [])
+if not items:
+    sys.exit(0)
+print('virtualServers:')
+for item in sorted(items, key=lambda x: x['metadata']['name']):
+    name = item['metadata']['name']
+    ns = item['metadata']['namespace']
+    tools = item.get('spec', {}).get('tools', [])
+    desc = item.get('spec', {}).get('description', '')
+    print(f'  - name: {ns}/{name}')
+    if desc:
+        print(f'    description: {desc}')
+    print('    tools:')
+    for t in tools:
+        print(f'      - {t}')
+")
+
+  if [ -z "$VS_SECTION" ]; then
+    echo "   No VirtualMCPServer CRs found — skipping config patch"
+    return
+  fi
+
+  CURRENT=$(oc get secret mcp-gateway-config -n "$ns" -o jsonpath='{.data.config\.yaml}' | base64 -d)
+  BASE=$(echo "$CURRENT" | sed '/^virtualServers:/,$d')
+
+  PATCHED="${BASE}
+${VS_SECTION}"
+
+  oc create secret generic mcp-gateway-config -n "$ns" \
+    --from-literal="config.yaml=${PATCHED}" \
+    --dry-run=client -o yaml | oc apply -f -
+
+  BROKER=$(oc get deploy -n "$ns" -l app.kubernetes.io/name=mcp-gateway -o jsonpath='{.items[0].metadata.name}' 2>/dev/null)
+  if [ -n "$BROKER" ]; then
+    oc rollout restart deployment "$BROKER" -n "$ns"
+    oc rollout status deployment "$BROKER" -n "$ns" --timeout=60s
+  fi
 }
 
 # --- Keycloak helpers for wristband tool filtering ---
@@ -184,22 +240,19 @@ if should_run 1; then
   echo "  apply auth + tool curation, and use it from the Playground."
   echo "  User: mcp-admin1 (group: mcp-admins)"
 
-  # --- 1.1 Discover ---
-  step "1.1 Discover — browse the MCP Catalog"
-  ui_step "Open RHOAI Dashboard → MCP Catalog"
-  ui_step "Locate the OpenShift MCP Server (pre-populated in RHOAI 3.4)"
-  ui_step "View metadata: description, capabilities, container image"
-  pause
+  # --- 1.1 Prerequisites ---
+  step "1.1 Prerequisites — RBAC + config for OpenShift MCP Server"
+  resources \
+    "CREATE  ServiceAccount/mcp-viewer (team-a)" \
+    "CREATE  ClusterRoleBinding/team-a-ocp-mcp-view" \
+    "CREATE  ConfigMap/openshift-mcp-server-config (team-a)"
 
-  # --- 1.2 Deploy ---
-  step "1.2 Deploy — RBAC + config + MCPServer CR"
-
-  echo "   Creating ServiceAccount + ClusterRoleBinding (cluster read access)..."
+  echo "   Creating mcp-viewer ServiceAccount + ClusterRoleBinding (cluster read access)..."
   oc apply -f - <<'EOF'
 apiVersion: v1
 kind: ServiceAccount
 metadata:
-  name: openshift-mcp-server
+  name: mcp-viewer
   namespace: team-a
 ---
 apiVersion: rbac.authorization.k8s.io/v1
@@ -212,10 +265,10 @@ roleRef:
   name: view
 subjects:
   - kind: ServiceAccount
-    name: openshift-mcp-server
+    name: mcp-viewer
     namespace: team-a
 EOF
-  ok "RBAC created"
+  ok "mcp-viewer ServiceAccount + RBAC created"
 
   echo "   Creating config (read-only, core+config toolsets, denied RBAC resources)..."
   oc apply -f - <<'EOF'
@@ -242,6 +295,19 @@ data:
     ]
 EOF
   ok "ConfigMap created"
+
+  # --- 1.2 Discover ---
+  step "1.2 Discover — browse the MCP Catalog"
+  ui_step "Open RHOAI Dashboard → MCP Catalog"
+  ui_step "Locate the OpenShift MCP Server (pre-populated in RHOAI 3.4)"
+  ui_step "View metadata: description, capabilities, container image"
+  pause
+
+  # --- 1.3 Deploy ---
+  step "1.3 Deploy — MCPServer CR"
+  resources \
+    "CREATE  MCPServer/openshift-mcp-server (team-a)" \
+    "  -> lifecycle operator creates Deployment + Service"
 
   echo "   Deploying MCPServer CR (lifecycle operator creates Deployment + Service)..."
   oc apply -f - <<'EOF'
@@ -271,13 +337,17 @@ spec:
             name: openshift-mcp-server-config
   runtime:
     security:
-      serviceAccountName: openshift-mcp-server
+      serviceAccountName: mcp-viewer
 EOF
   wait_for "OpenShift MCP server" "oc get mcpserver openshift-mcp-server -n team-a -o jsonpath='{.status.phase}' 2>/dev/null | grep -q Running" 180
   ok "OpenShift MCP server running (14 tools)"
 
-  # --- 1.3 Register ---
-  step "1.3 Register — HTTPRoute + MCPServerRegistration"
+  # --- 1.4 Register ---
+  step "1.4 Register — HTTPRoute + MCPServerRegistration"
+  resources \
+    "CREATE  HTTPRoute/openshift-mcp-server (team-a)" \
+    "CREATE  MCPServerRegistration/openshift-mcp-server (team-a)" \
+    "  -> toolPrefix: openshift_"
   oc apply -f - <<'EOF'
 apiVersion: gateway.networking.k8s.io/v1
 kind: HTTPRoute
@@ -306,12 +376,20 @@ spec:
     kind: HTTPRoute
     name: openshift-mcp-server
 EOF
-  wait_for "registration" "oc get mcpserverregistration openshift-mcp-server -n team-a -o jsonpath='{.status.conditions[?(@.type==\"Ready\")].status}' 2>/dev/null | grep -q True" 60
+  wait_for "registration" "oc get mcpserverregistration openshift-mcp-server -n team-a -o jsonpath='{.status.conditions[?(@.type==\"Ready\")].status}' 2>/dev/null | grep -q True" 120
   TOOLS=$(oc get mcpserverregistration openshift-mcp-server -n team-a -o jsonpath='{.status.discoveredTools}')
   ok "Registered with gateway — ${TOOLS} tools with openshift_ prefix"
 
-  # --- 1.4 Auth + Curation ---
-  step "1.4 Auth + Curation — AuthPolicy + VirtualMCPServer + wristband"
+  # --- 1.5 Auth + Curation ---
+  step "1.5 Auth + Curation — AuthPolicy + VirtualMCPServer + wristband"
+  resources \
+    "CREATE  MCPVirtualServer/admin-tools (team-a) -- 14 tools" \
+    "CREATE  Keycloak client: team-a/openshift-mcp-server" \
+    "  -> 14 tool roles, 5 assigned to mcp-admin1" \
+    "CREATE  AuthPolicy/team-a-gateway-auth (team-a)" \
+    "  -> JWT + OPA wristband + VirtualMCPServer routing" \
+    "CREATE  AuthPolicy/openshift-mcp-admin-only (team-a)" \
+    "  -> group check: mcp-admins only"
 
   echo "   Creating admin-tools VirtualMCPServer (all OpenShift tools)..."
   oc apply -f - <<'EOF'
@@ -439,28 +517,22 @@ spec:
             plain:
               value: ""
 EOF
-  wait_for "AuthPolicies enforced" "oc get authpolicy team-a-gateway-auth -n team-a -o jsonpath='{.status.conditions[?(@.type==\"Enforced\")].status}' 2>/dev/null | grep -q True" 60
+  wait_for "AuthPolicies enforced" "oc get authpolicy team-a-gateway-auth -n team-a -o jsonpath='{.status.conditions[?(@.type==\"Enforced\")].status}' 2>/dev/null | grep -q True" 120
   ok "AuthPolicies enforced"
 
-  # --- 1.5 RHOAI ConfigMap ---
-  step "1.5 Add gateway to RHOAI ConfigMap"
-  oc apply -f - <<EOF
-apiVersion: v1
-kind: ConfigMap
-metadata:
-  name: gen-ai-aa-mcp-servers
-  namespace: redhat-ods-applications
-data:
-  Team-A-MCP-Gateway: |
-    {
-      "url": "https://${GATEWAY_HOST}/mcp",
-      "description": "Team-A MCP Gateway — OpenShift + test tools"
-    }
-EOF
-  ok "gen-ai-aa-mcp-servers ConfigMap updated"
+  # --- 1.6 Patch config Secret ---
+  step "1.6 Patch config Secret with VirtualMCPServer definitions"
+  resources \
+    "MODIFY  Secret/mcp-gateway-config (team-a)" \
+    "  -> append virtualServers section from MCPVirtualServer CRs" \
+    "RESTART Deployment/mcp-gateway (team-a)"
+  echo "   Reading MCPVirtualServer CRs and patching mcp-gateway-config..."
+  patch_virtual_servers team-a
+  ok "Config Secret patched + broker restarted"
+  sleep 5
 
-  # --- 1.6 Use ---
-  step "1.6 Use — verify as mcp-admin1"
+  # --- 1.7 Use ---
+  step "1.7 Use — verify as mcp-admin1"
   echo "   Getting admin token..."
   ADMIN_TOKEN=$(get_token "mcp-admin1" "admin1pass")
   ADMIN_SESSION=$(mcp_init "$ADMIN_TOKEN")
@@ -494,7 +566,7 @@ elif 'error' in r:
 " 2>/dev/null || echo "   → (check response manually)"
   ok "Phase 1 complete — OpenShift MCP server accessible to mcp-admin1"
 
-  step "1.7 Use in Playground"
+  step "1.8 Use in Playground"
   ui_step "Open Gen AI Studio → Playground"
   ui_step "Select Team-A MCP Gateway as tool source"
   ui_step "Paste an mcp-admin1 token (printed below) into the auth field"
@@ -517,15 +589,29 @@ if should_run 2; then
   echo "  User: mcp-user1 (group: mcp-users)"
 
   # --- 2.1 Catalog ---
-  step "2.1 Add test-server-2 to the MCP Catalog"
+  step "2.1 Add test servers to the MCP Catalog"
+  resources \
+    "APPLY   ConfigMap/mcp-catalog-sources (odh-model-registries)" \
+    "  -> adds test-mcp-server + test-mcp-server2 to catalog" \
+    "RESTART Deployment/model-catalog (odh-model-registries)"
   oc apply -f "${SCRIPT_DIR}/playground/mcp-catalog-sources.yaml"
-  ok "Catalog sources updated (test-server-2 + github-mcp-server added)"
+  oc rollout restart deployment model-catalog -n odh-model-registries
+  oc rollout status deployment model-catalog -n odh-model-registries --timeout=60s
+  ok "Catalog sources updated + model-catalog restarted"
 
-  ui_step "Open RHOAI Dashboard → MCP Catalog → see test-server-2"
+  CATALOG_URL="https://model-catalog.${CLUSTER_DOMAIN}"
+  CATALOG_TOKEN=$(oc create token model-catalog -n odh-model-registries)
+  wait_for "catalog to index custom servers" "curl -sk -H 'Authorization: Bearer ${CATALOG_TOKEN}' '${CATALOG_URL}/api/mcp_catalog/v1alpha1/mcp_servers?sourceLabel=Custom' | python3 -c \"import sys,json; items=json.load(sys.stdin).get('items',[]); sys.exit(0 if len(items)>=2 else 1)\"" 60
+
+  ui_step "Open RHOAI Dashboard → MCP Catalog → see test-mcp-server and test-mcp-server2"
   pause
 
   # --- 2.2 Deploy ---
   step "2.2 Deploy test servers via MCPServer CRs"
+  resources \
+    "CREATE  MCPServer/test-mcp-server (team-a) -- 5 tools" \
+    "CREATE  MCPServer/test-mcp-server2 (team-a) -- 7 tools" \
+    "  -> lifecycle operator creates Deployments + Services"
 
   echo "   Deploying test-mcp-server (5 tools: add, greet, headers, slow, time)..."
   oc apply -f - <<'EOF'
@@ -547,16 +633,16 @@ spec:
     replicas: 1
 EOF
 
-  echo "   Deploying test-server-2 (7 tools: hello_world, time, headers, auth1234, slow, set_time, pour_chocolate)..."
+  echo "   Deploying test-mcp-server2 (7 tools: hello_world, time, headers, auth1234, slow, set_time, pour_chocolate)..."
   oc apply -f - <<'EOF'
 apiVersion: mcp.x-k8s.io/v1alpha1
 kind: MCPServer
 metadata:
-  name: test-server-2
+  name: test-mcp-server2
   namespace: team-a
   annotations:
-    mcp.opendatahub.io/catalog-server: test-server-2
-    mcp.opendatahub.io/display-name: test-server-2
+    mcp.opendatahub.io/catalog-server: test-mcp-server2
+    mcp.opendatahub.io/display-name: test-mcp-server2
 spec:
   source:
     type: ContainerImage
@@ -574,11 +660,16 @@ spec:
 EOF
 
   wait_for "test-mcp-server" "oc get mcpserver test-mcp-server -n team-a -o jsonpath='{.status.phase}' 2>/dev/null | grep -q Running" 180
-  wait_for "test-server-2" "oc get mcpserver test-server-2 -n team-a -o jsonpath='{.status.phase}' 2>/dev/null | grep -q Running" 180
+  wait_for "test-mcp-server2" "oc get mcpserver test-mcp-server2 -n team-a -o jsonpath='{.status.phase}' 2>/dev/null | grep -q Running" 180
   ok "Both test servers running"
 
   # --- 2.3 Register ---
   step "2.3 Register test servers with gateway"
+  resources \
+    "CREATE  HTTPRoute/test-mcp-server (team-a)" \
+    "CREATE  MCPServerRegistration/test-mcp-server -- prefix: test_" \
+    "CREATE  HTTPRoute/test-mcp-server2 (team-a)" \
+    "CREATE  MCPServerRegistration/test-mcp-server2 -- prefix: test2_"
   oc apply -f - <<'EOF'
 apiVersion: gateway.networking.k8s.io/v1
 kind: HTTPRoute
@@ -610,36 +701,45 @@ spec:
 apiVersion: gateway.networking.k8s.io/v1
 kind: HTTPRoute
 metadata:
-  name: test-server-2
+  name: test-mcp-server2
   namespace: team-a
 spec:
-  hostnames: ["test-server-2.mcp.local"]
+  hostnames: ["test-mcp-server2.mcp.local"]
   parentRefs:
     - name: team-a-gateway
       sectionName: mcps
   rules:
     - backendRefs:
-        - name: test-server-2
+        - name: test-mcp-server2
           port: 9090
 ---
 apiVersion: mcp.kuadrant.io/v1alpha1
 kind: MCPServerRegistration
 metadata:
-  name: test-server-2
+  name: test-mcp-server2
   namespace: team-a
 spec:
   toolPrefix: test2_
   targetRef:
     group: gateway.networking.k8s.io
     kind: HTTPRoute
-    name: test-server-2
+    name: test-mcp-server2
 EOF
-  wait_for "test-mcp-server registration" "oc get mcpserverregistration test-mcp-server -n team-a -o jsonpath='{.status.conditions[?(@.type==\"Ready\")].status}' 2>/dev/null | grep -q True" 60
-  wait_for "test-server-2 registration" "oc get mcpserverregistration test-server-2 -n team-a -o jsonpath='{.status.conditions[?(@.type==\"Ready\")].status}' 2>/dev/null | grep -q True" 60
+  wait_for "test-mcp-server registration" "oc get mcpserverregistration test-mcp-server -n team-a -o jsonpath='{.status.conditions[?(@.type==\"Ready\")].status}' 2>/dev/null | grep -q True" 120
+  wait_for "test-mcp-server2 registration" "oc get mcpserverregistration test-mcp-server2 -n team-a -o jsonpath='{.status.conditions[?(@.type==\"Ready\")].status}' 2>/dev/null | grep -q True" 120
   ok "Both registered (test_ prefix: 5 tools, test2_ prefix: 7 tools)"
 
   # --- 2.4 Curation ---
   step "2.4 Update VirtualMCPServers + wristband clients + auth routing"
+  resources \
+    "CREATE  Keycloak client: team-a/test-mcp-server (5 roles)" \
+    "CREATE  Keycloak client: team-a/test-mcp-server2 (7 roles)" \
+    "ASSIGN  roles -> mcp-admin1 (test subset)" \
+    "ASSIGN  roles -> mcp-user1 (test + limited ocp)" \
+    "UPDATE  MCPVirtualServer/admin-tools -- add test tools (->26)" \
+    "CREATE  MCPVirtualServer/user-tools (team-a) -- 12 tools" \
+    "UPDATE  AuthPolicy/team-a-gateway-auth" \
+    "  -> add mcp-users -> user-tools routing"
 
   echo "   Creating wristband client + roles for test-mcp-server..."
   kc_create_client "team-a/test-mcp-server"
@@ -649,13 +749,13 @@ EOF
   done
   ok "Keycloak client team-a/test-mcp-server with 5 tool roles"
 
-  echo "   Creating wristband client + roles for test-server-2..."
-  kc_create_client "team-a/test-server-2"
-  TEST2_UUID=$(kc_get_client_uuid "team-a/test-server-2")
+  echo "   Creating wristband client + roles for test-mcp-server2..."
+  kc_create_client "team-a/test-mcp-server2"
+  TEST2_UUID=$(kc_get_client_uuid "team-a/test-mcp-server2")
   for role in hello_world time headers auth1234 slow set_time pour_chocolate_into_mold; do
     kc_create_role "$TEST2_UUID" "$role"
   done
-  ok "Keycloak client team-a/test-server-2 with 7 tool roles"
+  ok "Keycloak client team-a/test-mcp-server2 with 7 tool roles"
 
   echo "   Assigning test tool roles to mcp-admin1..."
   ADMIN1_ID=$(kc_get_user_id "mcp-admin1")
@@ -787,11 +887,22 @@ spec:
                       ? 'team-a/user-tools'
                       : ''
 EOF
-  wait_for "AuthPolicy enforced" "oc get authpolicy team-a-gateway-auth -n team-a -o jsonpath='{.status.conditions[?(@.type==\"Enforced\")].status}' 2>/dev/null | grep -q True" 60
+  wait_for "AuthPolicy enforced" "oc get authpolicy team-a-gateway-auth -n team-a -o jsonpath='{.status.conditions[?(@.type==\"Enforced\")].status}' 2>/dev/null | grep -q True" 120
   ok "Gateway auth updated (mcp-admins → admin-tools, mcp-users → user-tools)"
 
-  # --- 2.5 Verify ---
-  step "2.5 Verify — tool visibility is intersection of VirtualMCPServer + wristband"
+  # --- 2.5 Patch config Secret ---
+  step "2.5 Patch config Secret with updated VirtualMCPServer definitions"
+  resources \
+    "MODIFY  Secret/mcp-gateway-config (team-a)" \
+    "  -> rebuild virtualServers from all MCPVirtualServer CRs" \
+    "RESTART Deployment/mcp-gateway (team-a)"
+  echo "   Reading MCPVirtualServer CRs and patching mcp-gateway-config..."
+  patch_virtual_servers team-a
+  ok "Config Secret patched + broker restarted"
+  sleep 5
+
+  # --- 2.6 Verify ---
+  step "2.6 Verify — tool visibility is intersection of VirtualMCPServer + wristband"
 
   echo "   --- mcp-admin1 (VirtualMCPServer: admin-tools=26, wristband: ocp=5 + test1=3 + test2=3) ---"
   ADMIN_TOKEN=$(get_token "mcp-admin1" "admin1pass")
@@ -840,30 +951,113 @@ else:
   echo "   └──────────────┴─────────────────┴─────────────────┴───────────────┘"
 
   ok "Phase 2 complete — dual-layer tool filtering (VirtualMCPServer ∩ wristband)"
+
+  step "2.7 Use in Playground"
+  ui_step "Open Gen AI Studio → Playground"
+  ui_step "Paste a token below into the auth field to test as each user"
+  echo ""
+  echo "   Token for mcp-admin1:"
+  echo "   $(get_token 'mcp-admin1' 'admin1pass')"
+  echo ""
+  echo "   Token for mcp-user1:"
+  echo "   $(get_token 'mcp-user1' 'user1pass')"
+  echo ""
+  ui_step "Try: 'Greet team-a' (both users) or 'List pods in team-a' (admin only)"
   pause
 fi
 
 # =============================================================================
-# Phase 3: GitHub MCP Server (mcp-admin1 via mcp-github group)
+# Phase 3: GitHub MCP Server (mcp-github1 via mcp-github group)
 # =============================================================================
 if should_run 3; then
   header "Phase 3: GitHub MCP Server"
   echo "  Deploy the GitHub MCP server with Vault per-user credential injection."
   echo "  Each user's GitHub PAT is stored in Vault and injected at request time."
-  echo "  User: mcp-admin1 (group: mcp-github)"
+  echo "  User: mcp-github1 (group: mcp-github)"
 
   # --- 3.1 Catalog ---
-  step "3.1 Discover — GitHub MCP server in catalog"
-  echo "   (Catalog was already updated in Phase 2 with github-mcp-server entry)"
+  step "3.1 Add GitHub MCP server to the catalog"
+  resources \
+    "MODIFY  ConfigMap/mcp-catalog-sources (odh-model-registries)" \
+    "  -> append github-mcp-server entry" \
+    "RESTART Deployment/model-catalog (odh-model-registries)"
+  echo "   Adding github-mcp-server to catalog sources..."
+  CURRENT_CUSTOM=$(oc get configmap mcp-catalog-sources -n odh-model-registries -o jsonpath='{.data.custom-mcp-servers\.yaml}')
+  if echo "$CURRENT_CUSTOM" | grep -q "github-mcp-server"; then
+    ok "github-mcp-server already in catalog — skipping"
+  else
+    UPDATED_CUSTOM=$(echo "$CURRENT_CUSTOM" | python3 -c "
+import sys, yaml, json
+data = yaml.safe_load(sys.stdin.read())
+data['mcp_servers'].append({
+    'name': 'github-mcp-server',
+    'provider': 'GitHub',
+    'license': 'mit',
+    'license_link': 'https://opensource.org/licenses/MIT',
+    'description': 'Official GitHub MCP server providing access to repositories, issues, pull requests, code search, and user information via the GitHub API.',
+    'version': 'latest',
+    'transports': ['http'],
+    'repositoryUrl': 'https://github.com/github/github-mcp-server',
+    'tools': [
+        {'name': 'search_repositories', 'description': 'Search for GitHub repositories',
+         'parameters': [{'name': 'query', 'type': 'string', 'description': 'Search query', 'required': True}]},
+        {'name': 'get_file_contents', 'description': 'Get contents of a file or directory from a repository',
+         'parameters': [{'name': 'owner', 'type': 'string', 'description': 'Repository owner', 'required': True},
+                        {'name': 'repo', 'type': 'string', 'description': 'Repository name', 'required': True},
+                        {'name': 'path', 'type': 'string', 'description': 'File or directory path', 'required': True}]},
+        {'name': 'list_issues', 'description': 'List issues in a repository',
+         'parameters': [{'name': 'owner', 'type': 'string', 'description': 'Repository owner', 'required': True},
+                        {'name': 'repo', 'type': 'string', 'description': 'Repository name', 'required': True}]},
+        {'name': 'search_code', 'description': 'Search for code across GitHub repositories',
+         'parameters': [{'name': 'query', 'type': 'string', 'description': 'Search query', 'required': True}]},
+        {'name': 'get_me', 'description': 'Get details of the authenticated GitHub user', 'parameters': []},
+    ],
+    'artifacts': [{'uri': 'oci://ghcr.io/github/github-mcp-server:latest'}],
+    'runtimeMetadata': {'defaultPort': 8080, 'mcpPath': '/mcp'},
+})
+print(yaml.dump(data, default_flow_style=False, sort_keys=False))
+")
+    oc patch configmap mcp-catalog-sources -n odh-model-registries --type merge \
+      -p "{\"data\":{\"custom-mcp-servers.yaml\":$(echo "$UPDATED_CUSTOM" | python3 -c "import sys,json; print(json.dumps(sys.stdin.read()))")}}"
+    ok "github-mcp-server added to catalog"
+  fi
+
+  echo "   Restarting model-catalog to re-index..."
+  oc rollout restart deployment model-catalog -n odh-model-registries
+  oc rollout status deployment model-catalog -n odh-model-registries --timeout=60s
+  ok "model-catalog restarted"
+
+  CATALOG_URL="https://model-catalog.${CLUSTER_DOMAIN}"
+  CATALOG_TOKEN=$(oc create token model-catalog -n odh-model-registries)
+  wait_for "catalog to index github-mcp-server" "curl -sk -H 'Authorization: Bearer ${CATALOG_TOKEN}' '${CATALOG_URL}/api/mcp_catalog/v1alpha1/mcp_servers?sourceLabel=Custom' | python3 -c \"import sys,json; items=json.load(sys.stdin).get('items',[]); sys.exit(0 if any('github' in i.get('name','') for i in items) else 1)\"" 60
+
   ui_step "Open RHOAI Dashboard → MCP Catalog → see GitHub MCP Server"
   pause
 
   # --- 3.2 Deploy ---
   step "3.2 Deploy GitHub MCP server"
+  resources \
+    "CREATE  MCPServer/github-mcp-server (team-a)" \
+    "CREATE  Secret/github-mcp-credential (team-a)" \
+    "  -> lifecycle operator creates Deployment + Service"
   echo ""
   echo "   The GitHub MCP server needs a PAT for broker tool discovery."
   echo "   Enter a GitHub PAT (read-only scope is sufficient), or press Enter to use a placeholder:"
-  read -rp "   GitHub PAT: " GITHUB_PAT < /dev/tty
+  GITHUB_PAT=""
+  echo -n "   GitHub PAT: "
+  while IFS= read -rsn1 char < /dev/tty; do
+    [[ -z "$char" ]] && break
+    if [[ "$char" == $'\x7f' || "$char" == $'\b' ]]; then
+      if [[ -n "$GITHUB_PAT" ]]; then
+        GITHUB_PAT="${GITHUB_PAT%?}"
+        echo -ne '\b \b'
+      fi
+    else
+      GITHUB_PAT+="$char"
+      echo -n '*'
+    fi
+  done
+  echo ""
   GITHUB_PAT="${GITHUB_PAT:-ghp_PLACEHOLDER_REPLACE_ME}"
 
   oc apply -f - <<EOF
@@ -902,6 +1096,10 @@ EOF
 
   # --- 3.3 Register ---
   step "3.3 Register with gateway"
+  resources \
+    "CREATE  HTTPRoute/github-mcp-server (team-a)" \
+    "CREATE  MCPServerRegistration/github-mcp-server" \
+    "  -> toolPrefix: github_, credentialRef: github-mcp-credential"
   oc apply -f - <<'EOF'
 apiVersion: gateway.networking.k8s.io/v1
 kind: HTTPRoute
@@ -937,12 +1135,21 @@ spec:
     name: github-mcp-credential
     key: token
 EOF
-  wait_for "github registration" "oc get mcpserverregistration github-mcp-server -n team-a -o jsonpath='{.status.conditions[?(@.type==\"Ready\")].status}' 2>/dev/null | grep -q True" 60
+  wait_for "github registration" "oc get mcpserverregistration github-mcp-server -n team-a -o jsonpath='{.status.conditions[?(@.type==\"Ready\")].status}' 2>/dev/null | grep -q True" 120
   GH_TOOLS=$(oc get mcpserverregistration github-mcp-server -n team-a -o jsonpath='{.status.discoveredTools}')
   ok "Registered — ${GH_TOOLS} tools with github_ prefix"
 
   # --- 3.4 Auth + Curation ---
   step "3.4 Vault AuthPolicy + VirtualMCPServer + wristband + gateway routing"
+  resources \
+    "CREATE  Keycloak user: mcp-github1 (group: mcp-github)" \
+    "CREATE  MCPVirtualServer/github-tools (team-a) -- 18 tools" \
+    "CREATE  Keycloak client: team-a/github-mcp-server (18 roles)" \
+    "ASSIGN  roles -> mcp-github1 (5 tools)" \
+    "CREATE  AuthPolicy/github-mcp-vault-auth (team-a)" \
+    "  -> JWT -> Vault login -> read per-user secret -> inject PAT" \
+    "UPDATE  AuthPolicy/team-a-gateway-auth" \
+    "  -> add mcp-github -> github-tools routing"
 
   echo "   Creating mcp-github1 user (dedicated GitHub group user)..."
   KC_TKN=$(kc_admin_token)
@@ -1006,15 +1213,9 @@ EOF
     get_me list_pull_requests search_repositories get_file_contents list_commits
   ok "mcp-github1: get_me, list_pull_requests, search_repositories, get_file_contents, list_commits"
 
-  echo "   Assigning GitHub tool roles to mcp-admin1..."
-  ADMIN1_ID=$(kc_get_user_id "mcp-admin1")
-  kc_assign_roles "$ADMIN1_ID" "$GH_CLIENT_UUID" \
-    get_me list_pull_requests search_repositories
-  ok "mcp-admin1: get_me, list_pull_requests, search_repositories"
-
   echo "   Assigning limited test tool roles to mcp-github1..."
   TEST1_UUID=$(kc_get_client_uuid "team-a/test-mcp-server")
-  TEST2_UUID=$(kc_get_client_uuid "team-a/test-server-2")
+  TEST2_UUID=$(kc_get_client_uuid "team-a/test-mcp-server2")
   kc_assign_roles "$GITHUB1_ID" "$TEST1_UUID" greet time
   kc_assign_roles "$GITHUB1_ID" "$TEST2_UUID" hello_world
   ok "mcp-github1: limited test tools (greet, time, hello_world)"
@@ -1117,11 +1318,24 @@ spec:
                         ? 'team-a/user-tools'
                         : ''
 EOF
-  wait_for "AuthPolicies enforced" "oc get authpolicy team-a-gateway-auth -n team-a -o jsonpath='{.status.conditions[?(@.type==\"Enforced\")].status}' 2>/dev/null | grep -q True" 60
+  wait_for "AuthPolicies enforced" "oc get authpolicy team-a-gateway-auth -n team-a -o jsonpath='{.status.conditions[?(@.type==\"Enforced\")].status}' 2>/dev/null | grep -q True" 120
   ok "Gateway auth updated (mcp-admins → admin-tools, mcp-github → github-tools, mcp-users → user-tools)"
 
-  # --- 3.5 Store PATs in Vault ---
-  step "3.5 Store per-user GitHub PATs in Vault"
+  # --- 3.5 Patch config Secret ---
+  step "3.5 Patch config Secret with VirtualMCPServer definitions"
+  resources \
+    "MODIFY  Secret/mcp-gateway-config (team-a)" \
+    "  -> rebuild virtualServers (admin + user + github)" \
+    "RESTART Deployment/mcp-gateway (team-a)"
+  echo "   Reading MCPVirtualServer CRs and patching mcp-gateway-config..."
+  patch_virtual_servers team-a
+  ok "Config Secret patched + broker restarted"
+  sleep 5
+
+  # --- 3.6 Store PATs in Vault ---
+  step "3.6 Store per-user GitHub PATs in Vault"
+  resources \
+    "WRITE   Vault: mcp/users/mcp-github1/github (token)"
 
   VAULT_NS="openshift-operators"
   VAULT_POD="vault-0"
@@ -1132,21 +1346,30 @@ EOF
     read -rp "   Vault token: " VAULT_TOKEN < /dev/tty
   fi
 
-  echo "   Storing PAT for mcp-admin1..."
-  oc exec -n "$VAULT_NS" "$VAULT_POD" -- sh -c \
-    "export VAULT_TOKEN=$VAULT_TOKEN; vault kv put mcp/users/mcp-admin1/github token=${GITHUB_PAT}"
-  ok "PAT stored at mcp/users/mcp-admin1/github"
-
   echo "   Storing PAT for mcp-github1..."
   echo "   Enter a GitHub PAT for mcp-github1 (or press Enter to reuse the same PAT):"
-  read -rp "   GitHub PAT for mcp-github1: " GITHUB1_PAT < /dev/tty
+  GITHUB1_PAT=""
+  echo -n "   GitHub PAT for mcp-github1: "
+  while IFS= read -rsn1 char < /dev/tty; do
+    [[ -z "$char" ]] && break
+    if [[ "$char" == $'\x7f' || "$char" == $'\b' ]]; then
+      if [[ -n "$GITHUB1_PAT" ]]; then
+        GITHUB1_PAT="${GITHUB1_PAT%?}"
+        echo -ne '\b \b'
+      fi
+    else
+      GITHUB1_PAT+="$char"
+      echo -n '*'
+    fi
+  done
+  echo ""
   GITHUB1_PAT="${GITHUB1_PAT:-${GITHUB_PAT}}"
   oc exec -n "$VAULT_NS" "$VAULT_POD" -- sh -c \
     "export VAULT_TOKEN=$VAULT_TOKEN; vault kv put mcp/users/mcp-github1/github token=${GITHUB1_PAT}"
   ok "PAT stored at mcp/users/mcp-github1/github"
 
-  # --- 3.6 Verify ---
-  step "3.6 Verify — tool visibility across all users"
+  # --- 3.7 Verify ---
+  step "3.7 Verify — tool visibility across all users"
 
   echo "   --- mcp-github1 (VirtualMCPServer: github-tools=18, wristband: github:5+test:3) ---"
   GH_TOKEN=$(get_token "mcp-github1" "github1pass")
@@ -1175,11 +1398,11 @@ elif 'error' in r:
 " 2>/dev/null || echo "   → (check response)"
 
   echo ""
-  echo "   --- mcp-admin1 (VirtualMCPServer: admin-tools=26, wristband: ocp:5+test:6+github:3) ---"
+  echo "   --- mcp-admin1 (VirtualMCPServer: admin-tools=26, wristband: ocp:5+test:6) ---"
   ADMIN_TOKEN=$(get_token "mcp-admin1" "admin1pass")
   ADMIN_SESSION=$(mcp_init "$ADMIN_TOKEN")
   ADMIN_TOOLS=$(mcp_tools_list "$ADMIN_TOKEN" "$ADMIN_SESSION" | python3 -c "import sys,json; print(len(json.load(sys.stdin).get('result',{}).get('tools',[])))" 2>/dev/null || echo "?")
-  echo "   mcp-admin1: $ADMIN_TOOLS tools visible (intersection — admin-tools has no github tools)"
+  echo "   mcp-admin1: $ADMIN_TOOLS tools visible (no github access)"
 
   echo ""
   echo "   --- mcp-user1 (VirtualMCPServer: user-tools=12, wristband: test:7+ocp:2) ---"
@@ -1193,7 +1416,7 @@ elif 'error' in r:
   echo "   ┌──────────────┬──────────────────┬────────────────────┬───────────────┐"
   echo "   │ User         │ VirtualMCPServer │ Wristband roles    │ Result (∩)    │"
   echo "   ├──────────────┼──────────────────┼────────────────────┼───────────────┤"
-  echo "   │ mcp-admin1   │ admin-tools (26) │ ocp:5+test:6+gh:3  │ ${ADMIN_TOOLS} tools    │"
+  echo "   │ mcp-admin1   │ admin-tools (26) │ ocp:5+test:6       │ ${ADMIN_TOOLS} tools    │"
   echo "   │ mcp-github1  │ github-tools (18)│ gh:5+test:3        │ ${GH_TOOLS} tools     │"
   echo "   │ mcp-user1    │ user-tools (12)  │ test:7+ocp:2       │ ${USER_TOOLS} tools     │"
   echo "   └──────────────┴──────────────────┴────────────────────┴───────────────┘"
@@ -1202,11 +1425,25 @@ elif 'error' in r:
   echo "   User JWT → Authorino → Vault JWT login → Read per-user secret → Inject PAT"
 
   ok "Phase 3 complete — GitHub MCP with Vault credentials + dual-layer tool filtering"
+
+  step "3.8 Use in Playground"
+  ui_step "Open Gen AI Studio → Playground"
+  ui_step "Paste a token below into the auth field to test as each user"
+  echo ""
+  echo "   Token for mcp-github1:"
+  echo "   $(get_token 'mcp-github1' 'github1pass')"
+  echo ""
+  echo "   Token for mcp-user1:"
+  echo "   $(get_token 'mcp-user1' 'user1pass')"
+  echo ""
+  ui_step "Try: 'Who am I on GitHub?' (mcp-github1) or 'Greet team-a' (mcp-user1)"
+  pause
 fi
 
 # =============================================================================
-# Summary
+# Summary (only when running all phases or the last phase)
 # =============================================================================
+if ! $ONLY_PHASE || [[ $START_PHASE -eq 3 ]]; then
 header "Demo Complete"
 echo ""
 echo "  Phase 1: OpenShift MCP Server"
@@ -1233,3 +1470,4 @@ echo "    TOKEN=\$(curl -sk -X POST 'https://${KEYCLOAK_HOST}/realms/mcp-gateway
 echo "      -d 'grant_type=password&client_id=mcp-playground&username=mcp-admin1&password=admin1pass' \\"
 echo "      | python3 -c \"import sys,json; print(json.load(sys.stdin)['access_token'])\")"
 echo ""
+fi

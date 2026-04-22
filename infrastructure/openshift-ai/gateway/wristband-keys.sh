@@ -34,7 +34,7 @@ oc create secret generic trusted-headers-private-key \
 echo "=== Create public key secret in ${GATEWAY_NS} (for broker verification) ==="
 oc create secret generic trusted-headers-public-key \
   -n "$GATEWAY_NS" \
-  --from-file=key.pem="$TMPDIR/public.pem" \
+  --from-file=key="$TMPDIR/public.pem" \
   --dry-run=client -o yaml | oc apply -f -
 
 echo ""
