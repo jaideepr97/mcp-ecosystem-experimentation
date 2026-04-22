@@ -1,611 +1,324 @@
-#!/bin/bash
-# Setup script for the MCP ecosystem experimentation environment.
-# Deploys a multi-tenant MCP gateway ecosystem on a Kind cluster.
+#!/usr/bin/env bash
+# =============================================================================
+# MCP Ecosystem — Setup
+# =============================================================================
+# Installs all shared infrastructure on an OpenShift cluster:
+#   Phase 1: Operator subscriptions (MCP Gateway, RHBK)
+#   Phase 2: Keycloak (DB, realm, users, groups, claims)
+#   Phase 3: MCP Lifecycle Operator
+#   Phase 4: Vault (Helm, init, JWT auth, per-user policy)
+#   Phase 5: Kuadrant CR + MCP Gateway instance in team-a (Helm + Route + config Secret + RHOAI registration)
+#   Phase 6: Playground (RHOAI Gen AI Studio + LlamaStack)
 #
-# Architecture: shared control plane (mcp-system, keycloak, kuadrant, vault)
-# with per-team namespaces (team-a) each containing their own Gateway,
-# MCPGatewayExtension (broker/router), MCP servers, and auth policies.
-#
-# Prerequisites:
-#   - docker (or podman)
-#   - kind
-#   - kubectl
-#   - helm
-#   - jq
-#   - python3
+# The script runs continuously, pausing between phases for the user to
+# review progress. Prerequisites are shown at the start.
 #
 # Usage:
-#   ./scripts/setup.sh                # Full setup from scratch
-#   ./scripts/setup.sh --skip-cluster # Skip Kind cluster creation (reuse existing)
-
+#   ./setup.sh                   # guided run through all phases
+#   ./setup.sh --phase 3         # start from phase 3 onward
+#   ./setup.sh --phase 2 --only  # run only phase 2
+# =============================================================================
 set -euo pipefail
 
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-REPO_DIR="$(cd "${SCRIPT_DIR}/.." && pwd)"
-KIND_CLUSTER_NAME="mcp-ecosystem"
-CONTAINER_ENGINE="${CONTAINER_ENGINE:-docker}"
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+START_PHASE="${START_PHASE:-1}"
+ONLY_PHASE=false
 
-# Auto-detect podman: check if docker is missing or if docker is actually podman
-if ! command -v docker &>/dev/null && command -v podman &>/dev/null; then
-  export KIND_EXPERIMENTAL_PROVIDER=podman
-  CONTAINER_ENGINE="podman"
-elif command -v podman &>/dev/null && docker --version 2>/dev/null | grep -qi podman; then
-  export KIND_EXPERIMENTAL_PROVIDER=podman
-  CONTAINER_ENGINE="podman"
-fi
-
-# Versions
-GATEWAY_API_VERSION="v1.4.1"
-SAIL_VERSION="1.27.0"
-METALLB_VERSION="v0.15.2"
-CERT_MANAGER_VERSION="v1.17.2"
-
-# URLs
-KEYCLOAK_EXTERNAL="http://keycloak.127-0-0-1.sslip.io:8002"
-KEYCLOAK_ADMIN_URL=""  # Set after Keycloak is ready
-
-# Colors for output
-RED='\033[0;31m'
-GREEN='\033[0;32m'
-YELLOW='\033[1;33m'
-NC='\033[0m'
-
-info()  { echo -e "${GREEN}[INFO]${NC} $*"; }
-warn()  { echo -e "${YELLOW}[WARN]${NC} $*"; }
-error() { echo -e "${RED}[ERROR]${NC} $*"; exit 1; }
-wait_for() { echo -e "${YELLOW}[WAIT]${NC} $*"; }
-
-# Parse args
-SKIP_CLUSTER=false
-for arg in "$@"; do
-  case $arg in
-    --skip-cluster) SKIP_CLUSTER=true ;;
+while [[ $# -gt 0 ]]; do
+  case $1 in
+    --phase) START_PHASE="$2"; shift 2 ;;
+    --only)  ONLY_PHASE=true; shift ;;
+    *) echo "Unknown option: $1"; exit 1 ;;
   esac
 done
 
-########################################
-# Phase 1: Kind cluster
-########################################
-if [ "$SKIP_CLUSTER" = false ]; then
-  if kind get clusters 2>/dev/null | grep -q "^${KIND_CLUSTER_NAME}$"; then
-    warn "Kind cluster '${KIND_CLUSTER_NAME}' already exists. Delete it first with: kind delete cluster --name ${KIND_CLUSTER_NAME}"
-    warn "Or run with --skip-cluster to reuse it."
-    exit 1
-  fi
-  info "Phase 1: Creating Kind cluster '${KIND_CLUSTER_NAME}'..."
-  kind create cluster --name "${KIND_CLUSTER_NAME}" --config "${REPO_DIR}/infrastructure/kind/cluster.yaml"
-else
-  info "Phase 1: Skipping Kind cluster creation (--skip-cluster)"
-fi
+# --- Cluster-specific values (edit for your environment) ---
+CLUSTER_DOMAIN="${CLUSTER_DOMAIN:-apps.rosa.agentic-mcp.jolf.p3.openshiftapps.com}"
+KEYCLOAK_HOST="keycloak.${CLUSTER_DOMAIN}"
+GATEWAY_HOST="team-a-mcp.${CLUSTER_DOMAIN}"
 
-# Ensure we're using the right context
-kubectl config use-context "kind-${KIND_CLUSTER_NAME}"
-
-########################################
-# Phase 2: Gateway API CRDs
-########################################
-info "Phase 2: Installing Gateway API CRDs (${GATEWAY_API_VERSION})..."
-kubectl apply -f "https://github.com/kubernetes-sigs/gateway-api/releases/download/${GATEWAY_API_VERSION}/standard-install.yaml"
-kubectl wait --for=condition=Established --timeout=60s crd/gateways.gateway.networking.k8s.io
-
-########################################
-# Phase 3: Istio (Sail operator)
-########################################
-info "Phase 3: Installing Istio via Sail operator (${SAIL_VERSION})..."
-helm upgrade --install sail-operator \
-  --create-namespace \
-  --namespace istio-system \
-  --wait \
-  --timeout=300s \
-  "https://github.com/istio-ecosystem/sail-operator/releases/download/${SAIL_VERSION}/sail-operator-${SAIL_VERSION}.tgz"
-
-kubectl apply -f "${REPO_DIR}/infrastructure/kind/istio/istio.yaml"
-wait_for "Istio to become ready..."
-kubectl -n istio-system wait --for=condition=Ready istio/default --timeout=300s
-
-########################################
-# Phase 4: MetalLB
-########################################
-info "Phase 4: Installing MetalLB (${METALLB_VERSION})..."
-kubectl apply -f "https://raw.githubusercontent.com/metallb/metallb/${METALLB_VERSION}/config/manifests/metallb-native.yaml"
-wait_for "MetalLB controller..."
-kubectl -n metallb-system wait --for=condition=Available deployments controller --timeout=300s
-kubectl -n metallb-system wait --for=condition=ready pod --selector=app=metallb --timeout=120s
-
-info "Configuring MetalLB IP pool..."
-"${REPO_DIR}/infrastructure/kind/metallb/ipaddresspool.sh" kind | kubectl apply -n metallb-system -f -
-
-########################################
-# Phase 5: cert-manager
-########################################
-info "Phase 5: Installing cert-manager (${CERT_MANAGER_VERSION})..."
-helm repo add jetstack https://charts.jetstack.io 2>/dev/null || true
-helm repo update
-helm upgrade --install cert-manager jetstack/cert-manager \
-  --create-namespace \
-  --namespace cert-manager \
-  --set crds.enabled=true \
-  --wait \
-  --timeout=300s
-
-wait_for "cert-manager to be ready..."
-kubectl wait --for=condition=Available deployment/cert-manager -n cert-manager --timeout=120s
-kubectl wait --for=condition=Available deployment/cert-manager-webhook -n cert-manager --timeout=120s
-
-info "Creating CA issuer chain..."
-kubectl apply -f "${REPO_DIR}/infrastructure/kind/cert-manager/issuers.yaml"
-wait_for "CA certificate to be ready..."
-kubectl wait --for=condition=Ready certificate/mcp-ca-cert -n cert-manager --timeout=60s
-
-########################################
-# Phase 6: mcp-gateway CRDs + controller
-########################################
-info "Phase 6: Installing mcp-gateway CRDs and controller..."
-kubectl apply -f "${REPO_DIR}/infrastructure/kind/mcp-gateway/mcp.kuadrant.io_mcpserverregistrations.yaml"
-kubectl apply -f "${REPO_DIR}/infrastructure/kind/mcp-gateway/mcp.kuadrant.io_mcpvirtualservers.yaml"
-kubectl apply -f "${REPO_DIR}/infrastructure/kind/mcp-gateway/mcp.kuadrant.io_mcpgatewayextensions.yaml"
-kubectl apply -f "${REPO_DIR}/infrastructure/kind/mcp-gateway/deploy.yaml"
-wait_for "mcp-controller to be ready..."
-kubectl wait --for=condition=Available deployment/mcp-controller -n mcp-system --timeout=120s
-
-########################################
-# Phase 7: mcp-lifecycle-operator
-########################################
-info "Phase 7: Deploying mcp-lifecycle-operator..."
-OPERATOR_IMAGE="quay.io/jrao/mcp-lifecycle-operator:gateway-credential-ref"
-${CONTAINER_ENGINE} pull "${OPERATOR_IMAGE}" 2>/dev/null || true
-TMP_TAR="/tmp/operator-image-$$.tar"
-${CONTAINER_ENGINE} save "${OPERATOR_IMAGE}" -o "${TMP_TAR}"
-kind load image-archive "${TMP_TAR}" --name "${KIND_CLUSTER_NAME}"
-rm -f "${TMP_TAR}"
-
-kubectl apply -f "${REPO_DIR}/infrastructure/kind/lifecycle-operator/deploy.yaml"
-wait_for "Lifecycle operator to be ready..."
-kubectl wait --for=condition=Available deployment/mcp-lifecycle-operator-controller-manager \
-  -n mcp-lifecycle-operator-system --timeout=120s
-
-info "Applying operator-gateway RBAC..."
-kubectl apply -f "${REPO_DIR}/infrastructure/kind/operator-gateway/gateway-role.yaml"
-kubectl apply -f "${REPO_DIR}/infrastructure/kind/operator-gateway/gateway-role-binding.yaml"
-
-########################################
-# Phase 8: Catalog
-########################################
-info "Phase 8: Deploying catalog system and launcher..."
-kubectl create namespace catalog-system --dry-run=client -o yaml | kubectl apply -f -
-kubectl apply -f "${REPO_DIR}/infrastructure/kind/catalog/postgres.yaml"
-kubectl apply -f "${REPO_DIR}/infrastructure/kind/catalog/catalog-sources.yaml"
-kubectl apply -f "${REPO_DIR}/infrastructure/kind/catalog/catalog.yaml"
-wait_for "Catalog pods..."
-kubectl wait --for=condition=Ready pod -l app=mcp-catalog-postgres -n catalog-system --timeout=120s
-kubectl wait --for=condition=Ready pod -l app=mcp-catalog -n catalog-system --timeout=120s
-
-info "Deploying MCP Launcher..."
-kubectl apply -f "${REPO_DIR}/infrastructure/kind/launcher/rbac.yaml"
-kubectl apply -f "${REPO_DIR}/infrastructure/kind/launcher/deployment.yaml"
-wait_for "Launcher to be ready..."
-kubectl wait --for=condition=Ready pod -l app=mcp-launcher -n catalog-system --timeout=120s 2>/dev/null || \
-  warn "Launcher not ready yet — continuing"
-
-########################################
-# Phase 9: Keycloak (direct, no shared gateway)
-########################################
-info "Phase 9: Deploying Keycloak..."
-kubectl create namespace keycloak --dry-run=client -o yaml | kubectl apply -f -
-kubectl apply -f "${REPO_DIR}/infrastructure/kind/keycloak/realm-import.yaml"
-kubectl apply -f "${REPO_DIR}/infrastructure/kind/keycloak/deployment.yaml"
-
-# Keycloak-auth service (port 8002 → 8080) for in-cluster access
-kubectl apply -f "${REPO_DIR}/infrastructure/kind/keycloak/keycloak-auth-service.yaml"
-
-# NodePort for external access (30089 → 8002 → 8080, mapped to host port 8002)
-kubectl apply -f "${REPO_DIR}/infrastructure/kind/keycloak/nodeport.yaml"
-
-wait_for "Keycloak to be ready..."
-kubectl wait --for=condition=Ready pod -l app=keycloak -n keycloak --timeout=180s
-
-KEYCLOAK_ADMIN_URL="${KEYCLOAK_EXTERNAL}/admin/realms/mcp"
-
-########################################
-# Phase 10: Kuadrant + CoreDNS
-########################################
-info "Phase 10: Installing Kuadrant operator..."
-helm repo add kuadrant https://kuadrant.io/helm-charts 2>/dev/null || true
-helm repo update
-helm upgrade --install kuadrant-operator kuadrant/kuadrant-operator \
-  --create-namespace \
-  --wait \
-  --timeout=600s \
-  --namespace kuadrant-system
-
-info "Creating Kuadrant instance..."
-kubectl apply -f "${REPO_DIR}/infrastructure/kind/kuadrant/kuadrant.yaml"
-wait_for "Authorino to be ready..."
-kubectl wait --for=condition=Ready pod -l app=authorino -n kuadrant-system --timeout=120s 2>/dev/null || \
-  kubectl wait --for=condition=Ready pod -l authorino-resource -n kuadrant-system --timeout=120s 2>/dev/null || \
-  warn "Could not verify Authorino readiness — continuing"
-
-# Patch CoreDNS so Authorino can reach Keycloak via keycloak-auth service
-info "Patching CoreDNS for Keycloak resolution..."
-KEYCLOAK_AUTH_IP=$(kubectl get svc keycloak-auth -n keycloak -o jsonpath='{.spec.clusterIP}')
-if [ -n "${KEYCLOAK_AUTH_IP}" ]; then
-  kubectl get configmap coredns -n kube-system -o yaml | \
-    sed "s/ready/hosts {\n          ${KEYCLOAK_AUTH_IP} keycloak.127-0-0-1.sslip.io\n          fallthrough\n        }\n        ready/" | \
-    kubectl apply -f -
-  kubectl rollout restart deployment coredns -n kube-system
-  info "CoreDNS patched with keycloak-auth ClusterIP ${KEYCLOAK_AUTH_IP}"
-else
-  warn "Could not determine keycloak-auth ClusterIP — CoreDNS patch skipped"
-fi
-
-########################################
-# Phase 11: Vault
-########################################
-info "Phase 11: Deploying Vault..."
-kubectl apply -f "${REPO_DIR}/infrastructure/kind/vault/namespace.yaml"
-kubectl apply -f "${REPO_DIR}/infrastructure/kind/vault/deployment.yaml"
-wait_for "Vault to be ready..."
-kubectl wait --for=condition=Ready pod -l app=vault -n vault --timeout=120s
-
-info "Configuring Vault JWT auth..."
-"${REPO_DIR}/infrastructure/kind/vault/configure.sh"
-
-########################################
-# Phase 12: team-a namespace
-########################################
-info "Phase 12: Deploying team-a namespace..."
-kubectl apply -f "${REPO_DIR}/infrastructure/kind/team-a/namespace.yaml"
-kubectl apply -f "${REPO_DIR}/infrastructure/kind/team-a/gateway.yaml"
-wait_for "team-a Gateway to be programmed..."
-kubectl wait --for=condition=Programmed gateway/team-a-gateway -n team-a --timeout=300s
-
-info "Deploying MCPGatewayExtension (creates broker/router)..."
-kubectl apply -f "${REPO_DIR}/infrastructure/kind/team-a/mcpgatewayextension.yaml"
-wait_for "MCPGatewayExtension to be ready..."
-kubectl wait --for=condition=Ready mcpgatewayextension/team-a-gateway-extension -n team-a --timeout=120s
-
-info "Deploying NodePort for team-a gateway..."
-kubectl apply -f "${REPO_DIR}/infrastructure/kind/team-a/nodeport.yaml"
-
-info "Deploying MCP servers in team-a..."
-kubectl apply -f "${REPO_DIR}/infrastructure/kind/team-a/test-server-a1.yaml"
-kubectl apply -f "${REPO_DIR}/infrastructure/kind/team-a/test-server-a2.yaml"
-
-wait_for "MCP servers to be ready..."
-kubectl wait --for=condition=Ready mcpserver/test-server-a1 -n team-a --timeout=120s 2>/dev/null || \
-  warn "test-server-a1 MCPServer not ready yet"
-kubectl wait --for=condition=Ready mcpserver/test-server-a2 -n team-a --timeout=120s 2>/dev/null || \
-  warn "test-server-a2 MCPServer not ready yet"
-
-# Wait for broker to pick up server registrations
-wait_for "Broker to discover servers..."
-sleep 5
-
-########################################
-# Phase 13: Keycloak groups + users for team-a
-########################################
-info "Phase 13: Creating Keycloak groups and users for team-a..."
-
-# Get admin token
-get_admin_token() {
-  curl -s -X POST "${KEYCLOAK_EXTERNAL}/realms/master/protocol/openid-connect/token" \
-    -d "grant_type=password" \
-    -d "client_id=admin-cli" \
-    -d "username=admin" \
-    -d "password=admin" | python3 -c "import sys,json; print(json.load(sys.stdin)['access_token'])"
+header()  { echo ""; echo "══════════════════════════════════════════════════════════════"; echo "  $1"; echo "══════════════════════════════════════════════════════════════"; }
+step()    { echo ""; echo "── $1"; }
+ok()      { echo "   ✓ $1"; }
+pause()   { echo ""; read -rp "   ⏎ Press Enter to continue... " < /dev/tty; }
+wait_for() {
+  local what="$1" cmd="$2" timeout="${3:-120}"
+  echo -n "   Waiting for $what..."
+  local i=0
+  while ! eval "$cmd" &>/dev/null; do
+    sleep 5; i=$((i+5))
+    if [ $i -ge $timeout ]; then echo " TIMEOUT"; return 1; fi
+    echo -n "."
+  done
+  echo " ready"
 }
 
-ADMIN_TOKEN=$(get_admin_token)
+should_run() { local phase=$1; [[ $phase -ge $START_PHASE ]] && { $ONLY_PHASE && [[ $phase -ne $START_PHASE ]] && return 1; return 0; }; }
 
-# Create team-a groups
-for GROUP in team-a-developers team-a-ops team-a-leads; do
-  HTTP_CODE=$(curl -s -o /dev/null -w "%{http_code}" \
-    -X POST "${KEYCLOAK_ADMIN_URL}/groups" \
-    -H "Authorization: Bearer ${ADMIN_TOKEN}" \
-    -H "Content-Type: application/json" \
-    -d "{\"name\": \"${GROUP}\"}")
-  if [ "$HTTP_CODE" = "201" ]; then
-    info "  Created group: ${GROUP}"
-  elif [ "$HTTP_CODE" = "409" ]; then
-    info "  Group already exists: ${GROUP}"
+# =============================================================================
+# Prerequisites
+# =============================================================================
+header "Prerequisites"
+echo ""
+echo "  Verify the following are in place before proceeding:"
+echo ""
+echo "  1. oc / kubectl logged into the target cluster"
+echo "  2. helm v3 installed"
+echo "  3. python3 available"
+echo "  4. Red Hat Connectivity Link operator installed"
+echo "     (includes Kuadrant / Authorino / Limitador)"
+echo "  5. RHOAI 3.4 installed with mcpCatalog + Gen AI Studio enabled"
+echo "  6. A vLLM ServingRuntime + InferenceService deployed and running:"
+echo "     --served-model-name matching the InferenceService name"
+echo "     --enable-auto-tool-choice --tool-call-parser openai"
+echo "     label opendatahub.io/genai-asset=true on the InferenceService"
+echo ""
+echo "  Cluster: ${CLUSTER_DOMAIN}"
+pause
+
+# =============================================================================
+# Phase 1: Operator Subscriptions
+# =============================================================================
+if should_run 1; then
+  header "Phase 1: Operator Subscriptions"
+
+  step "1.1 MCP Gateway CatalogSource"
+  oc apply -f "${SCRIPT_DIR}/operator subscriptions/mcp-gateway-catalogsource.yaml"
+  ok "CatalogSource applied"
+
+  step "1.2 MCP Gateway Operator (mcp-system namespace)"
+  oc create namespace mcp-system --dry-run=client -o yaml | oc apply -f -
+  oc apply -f "${SCRIPT_DIR}/operator subscriptions/mcp-gateway-operator.yaml"
+  wait_for "MCP Gateway CSV" "oc get csv -n mcp-system -o jsonpath='{.items[0].status.phase}' 2>/dev/null | grep -q Succeeded" 300
+  ok "MCP Gateway operator installed"
+
+  step "1.3 RHBK Operator (keycloak namespace)"
+  oc create namespace keycloak --dry-run=client -o yaml | oc apply -f -
+  oc apply -f "${SCRIPT_DIR}/operator subscriptions/rhbk-operator.yaml"
+  wait_for "RHBK CSV" "oc get csv -n keycloak -o jsonpath='{.items[0].status.phase}' 2>/dev/null | grep -q Succeeded" 300
+  ok "RHBK operator installed"
+
+  ok "Phase 1 complete"
+  pause
+fi
+
+# =============================================================================
+# Phase 2: Keycloak
+# =============================================================================
+if should_run 2; then
+  header "Phase 2: Keycloak"
+
+  step "2.1 Deploy PostgreSQL + Keycloak CR + realm import"
+  oc apply -f "${SCRIPT_DIR}/keycloak/keycloak.yaml"
+  wait_for "Keycloak DB" "oc get deployment keycloak-db -n keycloak -o jsonpath='{.status.availableReplicas}' 2>/dev/null | grep -q 1" 120
+  ok "PostgreSQL DB running"
+  wait_for "Keycloak pod" "oc get keycloak keycloak -n keycloak -o jsonpath='{.status.conditions[?(@.type==\"Ready\")].status}' 2>/dev/null | grep -q True" 300
+  ok "Keycloak running at https://${KEYCLOAK_HOST}"
+
+  step "2.2 Wait for realm import"
+  wait_for "realm import" "oc get keycloakrealmimport mcp-gateway-realm -n keycloak -o jsonpath='{.status.conditions[?(@.type==\"Done\")].status}' 2>/dev/null | grep -q True" 120
+  ok "mcp-gateway realm imported (clients: mcp-gateway, mcp-playground; users: mcp-admin1, mcp-user1)"
+
+  step "2.3 Create Keycloak groups and assign users"
+  KEYCLOAK_HOST="$KEYCLOAK_HOST" bash "${SCRIPT_DIR}/keycloak/keycloak-groups.sh"
+  ok "Groups created: mcp-admins, mcp-github, mcp-users"
+
+  step "2.4 Add Vault-required claims to mcp-playground client"
+  KEYCLOAK_HOST="$KEYCLOAK_HOST" bash "${SCRIPT_DIR}/vault/keycloak-vault-claims.sh"
+  ok "Claims added: sub, preferred_username, mcp-playground audience"
+
+  ok "Phase 2 complete"
+  pause
+fi
+
+# =============================================================================
+# Phase 3: MCP Lifecycle Operator
+# =============================================================================
+if should_run 3; then
+  header "Phase 3: MCP Lifecycle Operator"
+
+  step "3.1 Deploy operator"
+  oc apply -f "${SCRIPT_DIR}/lifecycle operator/lifecycle-operator.yaml"
+  wait_for "lifecycle operator" "oc get deployment mcp-lifecycle-operator-controller-manager -n mcp-lifecycle-operator-system -o jsonpath='{.status.availableReplicas}' 2>/dev/null | grep -q 1" 120
+  ok "Lifecycle operator running (manages MCPServer CRs)"
+
+  ok "Phase 3 complete"
+  pause
+fi
+
+# =============================================================================
+# Phase 4: Vault
+# =============================================================================
+if should_run 4; then
+  header "Phase 4: Vault"
+
+  step "4.1 Install Vault via Helm"
+  helm repo add hashicorp https://helm.releases.hashicorp.com 2>/dev/null || true
+  helm repo update hashicorp
+  helm upgrade -i vault hashicorp/vault \
+    -n openshift-operators \
+    -f "${SCRIPT_DIR}/vault/vault-helm-values.yaml"
+  wait_for "Vault pod" "oc get pod vault-0 -n openshift-operators -o jsonpath='{.status.phase}' 2>/dev/null | grep -q Running" 120
+  ok "Vault pod running"
+
+  step "4.2 Initialize and configure Vault"
+  KEYCLOAK_HOST="$KEYCLOAK_HOST" bash "${SCRIPT_DIR}/vault/vault-configure.sh"
+  ok "Vault configured: KV v2 at mcp/, JWT auth with Keycloak JWKS, per-user policy"
+
+  ok "Phase 4 complete"
+  pause
+fi
+
+# =============================================================================
+# Phase 5: MCP Gateway Instance (team-a)
+# =============================================================================
+if should_run 5; then
+  header "Phase 5: MCP Gateway Instance (team-a)"
+
+  step "5.1 Create team-a namespace"
+  oc create namespace team-a --dry-run=client -o yaml | oc apply -f -
+  ok "team-a namespace ready"
+
+  step "5.2 Kuadrant CR"
+  oc apply -f "${SCRIPT_DIR}/operator subscriptions/kuadrant.yaml"
+  wait_for "Kuadrant ready" "oc get kuadrant kuadrant -n openshift-operators -o jsonpath='{.status.conditions[?(@.type==\"Ready\")].status}' 2>/dev/null | grep -q True" 180
+  ok "Kuadrant ready (Authorino + Limitador deployed)"
+
+  step "5.3 Install gateway via Helm"
+  helm upgrade -i team-a-gateway oci://ghcr.io/kuadrant/charts/mcp-gateway \
+    --version 0.6.0 --namespace team-a --skip-crds \
+    -f "${SCRIPT_DIR}/gateway/gateway-helm-values.yaml"
+  wait_for "Gateway programmed" "oc get gateway team-a-gateway -n team-a -o jsonpath='{.status.conditions[?(@.type==\"Programmed\")].status}' 2>/dev/null | grep -q True" 120
+  ok "Gateway programmed"
+
+  step "5.4 Create OpenShift Route"
+  # The ingress chart is not in the OCI registry — install from local mcp-gateway repo clone if available
+  MCP_GATEWAY_REPO="${MCP_GATEWAY_REPO:-/Users/jrao/projects/mcp-gateway}"
+  if [ -d "$MCP_GATEWAY_REPO/config/openshift/charts/mcp-gateway-ingress" ]; then
+    helm upgrade -i team-a-gateway-ingress \
+      "$MCP_GATEWAY_REPO/config/openshift/charts/mcp-gateway-ingress" \
+      --namespace team-a \
+      -f "${SCRIPT_DIR}/gateway/gateway-ingress-helm-values.yaml"
   else
-    warn "  Failed to create group ${GROUP} (HTTP ${HTTP_CODE})"
+    echo "   ⚠ mcp-gateway repo not found at $MCP_GATEWAY_REPO"
+    echo "     Set MCP_GATEWAY_REPO env var or install the ingress chart manually:"
+    echo "     helm upgrade -i team-a-gateway-ingress <path-to>/mcp-gateway-ingress -n team-a -f gateway/gateway-ingress-helm-values.yaml"
   fi
-done
 
-# Refresh token (may have expired during group creation)
-ADMIN_TOKEN=$(get_admin_token)
+  wait_for "Route" "oc get route team-a-gateway -n team-a -o jsonpath='{.status.ingress[0].conditions[0].status}' 2>/dev/null | grep -q True" 60
+  ok "Route: https://${GATEWAY_HOST}"
 
-# Get group IDs
-get_group_id() {
-  curl -s "${KEYCLOAK_ADMIN_URL}/groups?search=$1" \
-    -H "Authorization: Bearer ${ADMIN_TOKEN}" | \
-    python3 -c "import sys,json; groups=[g for g in json.load(sys.stdin) if g['name']=='$1']; print(groups[0]['id'] if groups else '')"
-}
+  step "5.5 Generate ECDSA keys for wristband tool filtering"
+  bash "${SCRIPT_DIR}/gateway/wristband-keys.sh"
+  ok "ECDSA key pair created (private in openshift-operators, public in team-a)"
 
-DEV_GROUP_ID=$(get_group_id "team-a-developers")
-OPS_GROUP_ID=$(get_group_id "team-a-ops")
-LEADS_GROUP_ID=$(get_group_id "team-a-leads")
+  step "5.6 Patch MCPGatewayExtension with trustedHeadersKey"
+  MCPGW_EXT_NAME=$(oc get mcpgatewayextension -n team-a -o jsonpath='{.items[0].metadata.name}')
+  oc patch mcpgatewayextension "$MCPGW_EXT_NAME" -n team-a --type merge \
+    -p '{"spec":{"trustedHeadersKey":{"generate":"Disabled","secretName":"trusted-headers-public-key"}}}'
+  wait_for "MCPGatewayExtension ready" "oc get mcpgatewayextension $MCPGW_EXT_NAME -n team-a -o jsonpath='{.status.conditions[?(@.type==\"Ready\")].status}' 2>/dev/null | grep -q True" 60
+  ok "MCPGatewayExtension ready (broker deployed, wristband verification configured)"
 
-# Create team-a users and assign to groups
-# dev1, dev2 → team-a-developers
-# ops1, ops2 → team-a-ops
-# lead1 → team-a-leads
-create_user_with_group() {
-  local username="$1"
-  local group_id="$2"
-  local group_name="$3"
+  step "5.7 Wait for config Secret"
+  wait_for "mcp-gateway-config" "oc get secret mcp-gateway-config -n team-a" 60
+  ok "Config Secret exists in team-a (patched with VirtualMCPServers during usage)"
 
-  HTTP_CODE=$(curl -s -o /dev/null -w "%{http_code}" \
-    -X POST "${KEYCLOAK_ADMIN_URL}/users" \
-    -H "Authorization: Bearer ${ADMIN_TOKEN}" \
-    -H "Content-Type: application/json" \
-    -d "{
-      \"username\": \"${username}\",
-      \"firstName\": \"${username}\",
-      \"lastName\": \"User\",
-      \"email\": \"${username}@example.com\",
-      \"emailVerified\": true,
-      \"enabled\": true,
-      \"credentials\": [{\"type\": \"password\", \"value\": \"${username}\", \"temporary\": false}]
-    }")
+  step "5.8 Register gateway in RHOAI Dashboard"
+  oc apply -f - <<EOF
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: gen-ai-aa-mcp-servers
+  namespace: redhat-ods-applications
+data:
+  Team-A-MCP-Gateway: |
+    {
+      "url": "https://${GATEWAY_HOST}/mcp",
+      "description": "Team-A MCP Gateway — OpenShift + test tools"
+    }
+EOF
+  ok "gen-ai-aa-mcp-servers ConfigMap applied"
 
-  if [ "$HTTP_CODE" = "201" ] || [ "$HTTP_CODE" = "409" ]; then
-    # Get user ID
-    local user_id
-    user_id=$(curl -s "${KEYCLOAK_ADMIN_URL}/users?username=${username}&exact=true" \
-      -H "Authorization: Bearer ${ADMIN_TOKEN}" | \
-      python3 -c "import sys,json; users=json.load(sys.stdin); print(users[0]['id'] if users else '')")
+  ok "Phase 5 complete"
+  pause
+fi
 
-    if [ -n "$user_id" ]; then
-      # Assign to group
-      curl -s -o /dev/null -X PUT \
-        "${KEYCLOAK_ADMIN_URL}/users/${user_id}/groups/${group_id}" \
-        -H "Authorization: Bearer ${ADMIN_TOKEN}" \
-        -H "Content-Type: application/json"
-      info "  User ${username} → ${group_name}"
+# =============================================================================
+# Phase 6: Playground (RHOAI Gen AI Studio + LlamaStack)
+# =============================================================================
+if should_run 6; then
+  header "Phase 6: Playground (RHOAI Gen AI Studio + LlamaStack)"
+
+  step "6.1 Create Playground via RHOAI Dashboard"
+  echo ""
+  echo "  ┌─────────────────────────────────────────────────────────────┐"
+  echo "  │  UI Steps                                                  │"
+  echo "  │                                                            │"
+  echo "  │  1. Open the RHOAI Dashboard → Gen AI Studio               │"
+  echo "  │  2. Click 'Create Playground'                              │"
+  echo "  │  3. Select the vLLM model endpoint (AI asset endpoint)     │"
+  echo "  │  4. Under MCP tools, add the Team-A MCP Gateway           │"
+  echo "  │  5. Click Create — this creates a LlamaStackDistribution  │"
+  echo "  │     CR, ConfigMap, and Route automatically                 │"
+  echo "  └─────────────────────────────────────────────────────────────┘"
+  echo ""
+  echo "  The LlamaStack distribution connects:"
+  echo "    - vLLM inference (tool-calling enabled model)"
+  echo "    - MCP tool_runtime (remote::model-context-protocol)"
+  echo "    - SQLite storage for agent state"
+  echo ""
+
+  pause
+
+  step "6.2 Validate LlamaStack"
+  echo "  Checking for LlamaStackDistribution CRs across the cluster..."
+  LLAMA_NS=$(oc get llamastackdistribution --all-namespaces -o jsonpath='{.items[0].metadata.namespace}' 2>/dev/null || true)
+  LLAMA_NAME=$(oc get llamastackdistribution --all-namespaces -o jsonpath='{.items[0].metadata.name}' 2>/dev/null || true)
+  if [ -n "$LLAMA_NS" ] && [ -n "$LLAMA_NAME" ]; then
+    ok "Found: $LLAMA_NAME in namespace $LLAMA_NS"
+    wait_for "LlamaStack pod" "oc get pod -n $LLAMA_NS -l app.kubernetes.io/instance=$LLAMA_NAME -o jsonpath='{.items[0].status.phase}' 2>/dev/null | grep -q Running" 180
+    ok "LlamaStack pod running"
+
+    LLAMA_ROUTE=$(oc get route -n "$LLAMA_NS" -l app.kubernetes.io/instance=$LLAMA_NAME -o jsonpath='{.items[0].spec.host}' 2>/dev/null || true)
+    if [ -n "$LLAMA_ROUTE" ]; then
+      ok "LlamaStack route: https://${LLAMA_ROUTE}"
+    else
+      echo "   ⚠ No LlamaStack route found — check the LlamaStackDistribution spec.network.exposeRoute"
     fi
   else
-    warn "  Failed to create user ${username} (HTTP ${HTTP_CODE})"
-  fi
-}
-
-ADMIN_TOKEN=$(get_admin_token)
-create_user_with_group "dev1" "$DEV_GROUP_ID" "team-a-developers"
-create_user_with_group "dev2" "$DEV_GROUP_ID" "team-a-developers"
-
-ADMIN_TOKEN=$(get_admin_token)
-create_user_with_group "ops1" "$OPS_GROUP_ID" "team-a-ops"
-create_user_with_group "ops2" "$OPS_GROUP_ID" "team-a-ops"
-
-ADMIN_TOKEN=$(get_admin_token)
-create_user_with_group "lead1" "$LEADS_GROUP_ID" "team-a-leads"
-
-########################################
-# Phase 18: Vault credential storage
-# Store team-level and per-user secrets in Vault for credential injection.
-# AuthPolicy metadata evaluators exchange JWT for Vault token, then read secrets.
-########################################
-info "Phase 18: Storing Vault credentials for team-a..."
-
-VAULT_NS="vault"
-VAULT_CMD="VAULT_ADDR=http://127.0.0.1:8200 VAULT_TOKEN=root"
-
-# Team-level secrets (shared by group)
-info "  Storing team-level secrets..."
-kubectl exec -n "$VAULT_NS" deploy/vault -- sh -c \
-  "${VAULT_CMD} vault kv put secret/mcp-gateway/teams/team-a-developers api_key=team-dev-shared-key-001"
-kubectl exec -n "$VAULT_NS" deploy/vault -- sh -c \
-  "${VAULT_CMD} vault kv put secret/mcp-gateway/teams/team-a-ops api_key=team-ops-shared-key-002"
-kubectl exec -n "$VAULT_NS" deploy/vault -- sh -c \
-  "${VAULT_CMD} vault kv put secret/mcp-gateway/teams/team-a-leads api_key=team-leads-shared-key-003"
-
-# Per-user secrets (keyed by Keycloak sub claim)
-info "  Storing per-user secrets..."
-ADMIN_TOKEN=$(get_admin_token)
-for username in dev1 dev2 ops1 ops2 lead1; do
-  USER_SUB=$(curl -s "${KEYCLOAK_ADMIN_URL}/users?username=${username}&exact=true" \
-    -H "Authorization: Bearer ${ADMIN_TOKEN}" | \
-    python3 -c "import sys,json; users=json.load(sys.stdin); print(users[0]['id'] if users else '')")
-  if [ -n "$USER_SUB" ]; then
-    kubectl exec -n "$VAULT_NS" deploy/vault -- sh -c \
-      "${VAULT_CMD} vault kv put secret/mcp-gateway/users/${USER_SUB} api_key=${username}-personal-key"
-    info "  User ${username} (${USER_SUB}) → personal key stored"
-  fi
-done
-
-########################################
-# Phase 14: VirtualMCPServers + AuthPolicies
-########################################
-info "Phase 14: Applying VirtualMCPServers and AuthPolicies..."
-
-# VirtualMCPServer CRs (filtering only — see Finding 48 workaround in Phase 15)
-kubectl apply -f "${REPO_DIR}/infrastructure/kind/team-a/virtualserver-dev.yaml"
-kubectl apply -f "${REPO_DIR}/infrastructure/kind/team-a/virtualserver-ops.yaml"
-kubectl apply -f "${REPO_DIR}/infrastructure/kind/team-a/virtualserver-leads.yaml"
-
-# Gateway-level AuthPolicy (JWT auth + x-mcp-virtualserver header injection)
-kubectl apply -f "${REPO_DIR}/infrastructure/kind/team-a/gateway-auth-policy.yaml"
-sleep 5  # Allow gateway-level policy to settle
-
-# Per-HTTPRoute AuthPolicies (tool-level authorization)
-kubectl apply -f "${REPO_DIR}/infrastructure/kind/team-a/authpolicy-server-a1.yaml"
-kubectl apply -f "${REPO_DIR}/infrastructure/kind/team-a/authpolicy-server-a2.yaml"
-
-########################################
-# Phase 15: Config Secret patch
-# Workaround for Finding 48: MCPVirtualServer controller writes to
-# mcp-system/mcp-gateway-config (hardcoded), not the team namespace.
-# We manually patch team-a's config Secret with virtualServers entries.
-########################################
-info "Phase 15: Patching team-a config Secret with VirtualMCPServer definitions..."
-
-wait_for "Config Secret to exist in team-a..."
-for i in $(seq 1 12); do
-  kubectl get secret mcp-gateway-config -n team-a &>/dev/null && break
-  sleep 5
-done
-
-# Read current config
-CURRENT_CONFIG=$(kubectl get secret mcp-gateway-config -n team-a -o jsonpath='{.data.config\.yaml}' | base64 -d)
-
-# Check if virtualServers already patched
-if echo "$CURRENT_CONFIG" | grep -q "virtualServers:"; then
-  info "  Config Secret already contains virtualServers — skipping patch"
-else
-  # Append virtualServers section
-  PATCHED_CONFIG="${CURRENT_CONFIG}
-virtualServers:
-  - name: team-a/team-a-dev-tools
-    description: Developer tools for team-a
-    tools:
-      - test_server_a1_greet
-      - test_server_a1_time
-      - test_server_a1_headers
-      - test_server_a2_hello_world
-      - test_server_a2_time
-      - test_server_a2_headers
-  - name: team-a/team-a-ops-tools
-    description: Operations tools for team-a
-    tools:
-      - test_server_a1_add_tool
-      - test_server_a1_slow
-      - test_server_a2_auth1234
-      - test_server_a2_set_time
-      - test_server_a2_slow
-      - test_server_a2_pour_chocolate_into_mold
-  - name: team-a/team-a-lead-tools
-    description: Full tool access for team-a leads
-    tools:
-      - test_server_a1_add_tool
-      - test_server_a1_greet
-      - test_server_a1_headers
-      - test_server_a1_slow
-      - test_server_a1_time
-      - test_server_a2_auth1234
-      - test_server_a2_headers
-      - test_server_a2_hello_world
-      - test_server_a2_pour_chocolate_into_mold
-      - test_server_a2_set_time
-      - test_server_a2_slow
-      - test_server_a2_time"
-
-  kubectl create secret generic mcp-gateway-config -n team-a \
-    --from-literal="config.yaml=${PATCHED_CONFIG}" \
-    --dry-run=client -o yaml | kubectl apply -f -
-  info "  Config Secret patched with 3 VirtualMCPServer definitions"
-
-  # Restart broker to pick up the new config
-  info "  Restarting broker to load VirtualMCPServer config..."
-  BROKER_DEPLOY=$(kubectl get deploy -n team-a -l app=mcp-gateway -o jsonpath='{.items[0].metadata.name}' 2>/dev/null)
-  if [ -n "$BROKER_DEPLOY" ]; then
-    kubectl rollout restart deployment "${BROKER_DEPLOY}" -n team-a
-    kubectl rollout status deployment "${BROKER_DEPLOY}" -n team-a --timeout=60s
+    echo "   ⚠ No LlamaStackDistribution found. Create one via the RHOAI Dashboard."
   fi
 fi
 
-########################################
-# Phase 16: TLS (HTTPS termination on team-a gateway)
-########################################
-info "Phase 16: Configuring TLS for team-a gateway..."
-
-# TLSPolicy references the mcp-ca-issuer ClusterIssuer from Phase 5
-kubectl apply -f "${REPO_DIR}/infrastructure/kind/team-a/tls-policy.yaml"
-
-# HTTPS NodePort (30443 → 8443, mapped to host port 8443)
-kubectl apply -f "${REPO_DIR}/infrastructure/kind/team-a/nodeport-tls.yaml"
-
-wait_for "TLSPolicy to be enforced..."
-for i in $(seq 1 12); do
-  STATUS=$(kubectl get tlspolicy team-a-gateway-tls -n team-a -o jsonpath='{.status.conditions[?(@.type=="Enforced")].status}' 2>/dev/null)
-  [ "$STATUS" = "True" ] && break
-  sleep 5
-done
-if [ "$STATUS" != "True" ]; then
-  warn "TLSPolicy not enforced yet — restarting Kuadrant operator..."
-  kubectl rollout restart deployment kuadrant-operator-controller-manager -n kuadrant-system
-  kubectl rollout status deployment kuadrant-operator-controller-manager -n kuadrant-system --timeout=60s
-  kubectl annotate tlspolicy team-a-gateway-tls -n team-a reconcile-trigger="$(date +%s)" --overwrite
-  sleep 10
+# =============================================================================
+# Summary (only when running all phases or the last phase)
+# =============================================================================
+if ! $ONLY_PHASE || [[ $START_PHASE -eq 6 ]]; then
+header "Setup Complete"
+echo ""
+echo "  Operators (installed by this script):"
+echo "    MCP Gateway Controller  → mcp-system"
+echo "    RHBK (Keycloak)         → keycloak"
+echo "    MCP Lifecycle Operator  → mcp-lifecycle-operator-system"
+echo ""
+echo "  Prerequisites (installed before running this script):"
+echo "    Connectivity Link       → openshift-operators (includes Kuadrant/Authorino/Limitador)"
+echo "    RHOAI 3.4               → mcpCatalog + Gen AI Studio enabled"
+echo "    vLLM model              → ServingRuntime + InferenceService running"
+echo ""
+echo "  Infrastructure:"
+echo "    Keycloak    → https://${KEYCLOAK_HOST}"
+echo "    Vault       → vault.openshift-operators.svc.cluster.local:8200"
+echo "    Gateway     → https://${GATEWAY_HOST}"
+echo "    Wristband   → ECDSA keys + trustedHeadersKey configured"
+echo "    Config      → mcp-gateway-config Secret in team-a (ready for VirtualMCPServer patching)"
+echo "    RHOAI       → gen-ai-aa-mcp-servers ConfigMap registered"
+echo "    Playground  → RHOAI Gen AI Studio (LlamaStack + vLLM)"
+echo ""
+echo "  Keycloak users:"
+echo "    mcp-admin1 / admin1pass  (groups: mcp-admins, mcp-github)"
+echo "    mcp-user1  / user1pass   (groups: mcp-users)"
+echo ""
+echo "  Next: run ./usage.sh to walk through the demo phases"
+echo ""
 fi
-
-wait_for "HTTPS certificate to be ready..."
-kubectl wait --for=condition=Ready certificate/team-a-gateway-mcp-https-tls -n team-a --timeout=120s 2>/dev/null || \
-  warn "HTTPS certificate not ready yet"
-
-wait_for "Gateway to be programmed with HTTPS listener..."
-kubectl wait --for=condition=Programmed gateway/team-a-gateway -n team-a --timeout=120s
-
-# Clone the controller-created EnvoyFilter for the HTTPS listener (port 8443)
-# The mcp-controller creates ext_proc for port 8080; HTTPS needs the same on 8443
-info "Creating ext_proc EnvoyFilter for HTTPS listener..."
-EXISTING_EF=$(kubectl get envoyfilter -n team-a -o jsonpath='{.items[0].metadata.name}' 2>/dev/null || \
-              kubectl get envoyfilter -n istio-system -l gateway.io/name=team-a-gateway -o jsonpath='{.items[0].metadata.name}' 2>/dev/null)
-if [ -n "$EXISTING_EF" ]; then
-  # Determine which namespace the EnvoyFilter is in
-  EF_NS="team-a"
-  kubectl get envoyfilter "$EXISTING_EF" -n team-a &>/dev/null || EF_NS="istio-system"
-
-  # Check if TLS EnvoyFilter already exists
-  TLS_EF_EXISTS=$(kubectl get envoyfilter "${EXISTING_EF}-tls" -n "$EF_NS" -o name 2>/dev/null)
-  if [ -z "$TLS_EF_EXISTS" ]; then
-    kubectl get envoyfilter "$EXISTING_EF" -n "$EF_NS" -o yaml | \
-      sed "s/name: ${EXISTING_EF}/name: ${EXISTING_EF}-tls/" | \
-      sed 's/portNumber: 8080/portNumber: 8443/' | \
-      grep -v "resourceVersion:" | \
-      grep -v "uid:" | \
-      grep -v "creationTimestamp:" | \
-      kubectl apply -f -
-    info "  Created ${EXISTING_EF}-tls EnvoyFilter for port 8443"
-  else
-    info "  TLS EnvoyFilter already exists — skipping"
-  fi
-else
-  warn "Could not find controller-created EnvoyFilter — HTTPS ext_proc may not work"
-fi
-
-# Extract CA cert for client use
-info "Extracting CA certificate for client verification..."
-kubectl get secret mcp-ca-secret -n cert-manager -o jsonpath='{.data.ca\.crt}' | \
-  base64 -d > /tmp/mcp-ca.crt 2>/dev/null || \
-  kubectl get secret mcp-ca-secret -n cert-manager -o jsonpath='{.data.tls\.crt}' | \
-  base64 -d > /tmp/mcp-ca.crt 2>/dev/null || \
-  warn "Could not extract CA cert"
-if [ -f /tmp/mcp-ca.crt ]; then
-  info "CA certificate saved to /tmp/mcp-ca.crt (use with curl --cacert)"
-fi
-
-########################################
-# Done
-########################################
-echo ""
-info "========================================="
-info "  MCP Ecosystem setup complete!"
-info "========================================="
-echo ""
-info "Architecture: Multi-tenant model"
-info "  Shared:  mcp-system (controller), keycloak, kuadrant, vault, catalog, launcher"
-info "  team-a:  Gateway + broker/router + 2 MCP servers + 3 VirtualMCPServers + 3 AuthPolicies + TLS"
-echo ""
-info "Endpoints (HTTP):"
-info "  team-a MCP Gateway: http://team-a.mcp.127-0-0-1.sslip.io:8001/mcp"
-info "  Keycloak:           ${KEYCLOAK_EXTERNAL} (admin/admin)"
-info "  Launcher:           http://localhost:8004"
-echo ""
-info "Endpoints (HTTPS — self-signed CA):"
-info "  team-a MCP Gateway: https://team-a.mcp.127-0-0-1.sslip.io:8443/mcp"
-info "  CA cert:            /tmp/mcp-ca.crt"
-echo ""
-info "Vault:"
-info "  Internal:  http://vault.vault.svc.cluster.local:8200 (root token: root)"
-echo ""
-info "team-a users (password = username):"
-info "  dev1, dev2  (team-a-developers) — 6 tools (utility/inspection)"
-info "  ops1, ops2  (team-a-ops)        — 6 tools (admin/management)"
-info "  lead1       (team-a-leads)      — 12 tools (all)"
-echo ""
-info "Quick test:"
-info "  ./scripts/mcp-client.sh"
-echo ""
-info "Run tests:"
-info "  ./scripts/test-pipeline.sh"
