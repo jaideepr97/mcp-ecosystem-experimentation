@@ -16,6 +16,7 @@
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+INFRA_DIR="${SCRIPT_DIR}/../infrastructure/openshift-ai"
 CLUSTER_DOMAIN="${CLUSTER_DOMAIN:-apps.rosa.agentic-mcp.jolf.p3.openshiftapps.com}"
 KEYCLOAK_HOST="keycloak.${CLUSTER_DOMAIN}"
 
@@ -131,7 +132,6 @@ clean_usage_3() {
     del "authpolicy github-mcp-vault-auth -n team-a"
     del "mcpvirtualserver github-tools -n team-a"
     kc_delete_client "team-a/github-mcp-server"
-    kc_delete_user "mcp-github1"
   fi
 
   if should_clean_step "3.3"; then
@@ -341,7 +341,7 @@ clean_setup_4() {
 # =============================================================================
 clean_setup_3() {
   header "Clean Setup Phase 3: MCP Lifecycle Operator"
-  oc delete -f "${SCRIPT_DIR}/lifecycle operator/lifecycle-operator.yaml" --ignore-not-found 2>/dev/null && ok "Lifecycle operator resources deleted" || skip "Lifecycle operator"
+  oc delete -f "${INFRA_DIR}/lifecycle operator/lifecycle-operator.yaml" --ignore-not-found 2>/dev/null && ok "Lifecycle operator resources deleted" || skip "Lifecycle operator"
   del_ns "mcp-lifecycle-operator-system"
 }
 
@@ -350,7 +350,7 @@ clean_setup_3() {
 # =============================================================================
 clean_setup_2() {
   header "Clean Setup Phase 2: Keycloak"
-  oc delete -f "${SCRIPT_DIR}/keycloak/keycloak.yaml" --ignore-not-found 2>/dev/null && ok "Keycloak resources deleted" || skip "Keycloak resources"
+  oc delete -f "${INFRA_DIR}/keycloak/keycloak.yaml" --ignore-not-found 2>/dev/null && ok "Keycloak resources deleted" || skip "Keycloak resources"
 }
 
 # =============================================================================

@@ -55,7 +55,7 @@ spec:
 
 ### DataScienceCluster
 
-Enable KServe, LlamaStack operator, Dashboard, and MLflow. The `mcpCatalog` component is enabled automatically by RHOAI 3.4.
+Enable KServe, LlamaStack operator, Dashboard, and MLflow.
 
 ```yaml
 apiVersion: datasciencecluster.opendatahub.io/v1
@@ -83,11 +83,21 @@ spec:
       managementState: Managed
 ```
 
-Verify Gen AI Studio is enabled after reconciliation:
+### Enable Gen AI Studio + MCP Catalog
+
+After the DataScienceCluster reconciles, enable both feature flags:
 
 ```bash
-oc get odhdashboardconfig -n redhat-ods-applications -o yaml | grep genAiStudio
-# Should show: genAiStudio: true
+oc patch odhdashboardconfig odh-dashboard-config -n redhat-ods-applications --type merge \
+  -p '{"spec":{"dashboardConfig":{"genAiStudio":true,"mcpCatalog":true}}}'
+```
+
+Verify:
+
+```bash
+oc get odhdashboardconfig odh-dashboard-config -n redhat-ods-applications \
+  -o jsonpath='{.spec.dashboardConfig.genAiStudio} {.spec.dashboardConfig.mcpCatalog}'
+# Should show: true true
 ```
 
 ## vLLM model serving

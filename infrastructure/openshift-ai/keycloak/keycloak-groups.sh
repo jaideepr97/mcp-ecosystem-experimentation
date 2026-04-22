@@ -76,6 +76,7 @@ echo "=== Assign users ==="
 add_user_to_group "mcp-admin1" "mcp-admins"
 add_user_to_group "mcp-admin1" "mcp-github"
 add_user_to_group "mcp-user1" "mcp-users"
+add_user_to_group "mcp-github1" "mcp-github"
 
 echo "=== Add groups client scope ==="
 # Ensure the groups claim is included in tokens
@@ -102,3 +103,4 @@ curl -sk -X POST -H "Authorization: Bearer $KC_TOKEN" -H "Content-Type: applicat
 echo ""
 echo "=== Done ==="
 echo "Test: get a token for mcp-admin1 and decode it — should have groups: [mcp-admins, mcp-github]"
+echo "      get a token for mcp-github1 and decode it — should have groups: [mcp-github]"
