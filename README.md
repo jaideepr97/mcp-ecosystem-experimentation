@@ -26,7 +26,6 @@ RHOAI Gen AI Studio     — "AI playground with MCP tool calling"
 ## Cluster
 
 **Platform**: ROSA (Red Hat OpenShift on AWS)
-**Cluster**: `agentic-mcp.jolf.p3.openshiftapps.com`
 
 See [docs/component-versions.md](docs/component-versions.md) for all deployed component versions and images.
 
