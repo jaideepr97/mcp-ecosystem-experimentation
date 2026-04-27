@@ -1,0 +1,75 @@
+%%{ init: { 'theme': 'base', 'themeVariables': { 'primaryColor': '#e8f4fd', 'primaryBorderColor': '#2196F3', 'lineColor': '#555' } } }%%
+
+graph LR
+    user["AI Engineer"]
+
+    subgraph catalog["MCP Catalog"]
+        browse["Browse / Discover<br/>MCP Servers"]
+    end
+
+    subgraph lifecycle["Lifecycle Management"]
+        operator["MCP Lifecycle<br/>Operator"]
+    end
+
+    subgraph oai["OpenShift AI"]
+        playground["Gen AI Studio<br/>(Playground)"]
+        llamastack["Llama Stack<br/>(MCP Client)"]
+        vllm["vLLM<br/>(LLM Inference)"]
+    end
+
+    subgraph gateway["MCP Gateway"]
+        broker["Broker / Router"]
+        envoy["Envoy Proxy"]
+        registrations["Server<br/>Registrations"]
+        virtual["Virtual MCP<br/>Servers"]
+    end
+
+    subgraph auth["Auth & Policy"]
+        keycloak["Keycloak<br/>(Identity)"]
+        authorino["Authorino<br/>(Policy Enforcement)"]
+    end
+
+    subgraph servers["MCP Servers"]
+        builtin["Catalog Servers<br/>(e.g. OpenShift MCP)"]
+        custom["Custom / BYOS<br/>Servers"]
+    end
+
+    %% Setup flow: Catalog → Deploy → Register
+    user -->|"discovers"| browse
+    browse -->|"selects server"| operator
+    operator -->|"deploys"| builtin
+    operator -->|"deploys"| custom
+    operator -->|"registers"| registrations
+
+    %% Consumption flow: Prompt → AI → Gateway → Servers
+    user -->|"prompts"| playground
+    user -.->|"authenticates"| keycloak
+    playground -->|"chat + tools"| llamastack
+    llamastack -->|"inference"| vllm
+    vllm -->|"tool calls"| llamastack
+    llamastack -->|"MCP protocol"| envoy
+    envoy -->|"auth check"| authorino
+    authorino -.->|"validates JWT"| keycloak
+    envoy -->|"routes tools"| broker
+    broker -->|"dispatches"| builtin
+    broker -->|"dispatches"| custom
+    registrations -.->|"configures"| broker
+    virtual -.->|"aggregates / filters"| registrations
+
+    classDef person fill:#f3e5f5,stroke:#9C27B0,stroke-width:2px
+    classDef ai fill:#e1f5fe,stroke:#0277BD,stroke-width:2px
+    classDef gw fill:#e8f5e9,stroke:#4CAF50,stroke-width:2px
+    classDef authStyle fill:#fff9c4,stroke:#FBC02D,stroke-width:2px
+    classDef server fill:#fff3e0,stroke:#FF9800,stroke-width:2px
+    classDef catalogStyle fill:#e0f2f1,stroke:#00897B,stroke-width:2px
+    classDef lifecycleStyle fill:#ede7f6,stroke:#5E35B1,stroke-width:2px
+    classDef group fill:none,stroke:#999,stroke-width:2px,stroke-dasharray:5 5
+
+    class user person
+    class playground,llamastack,vllm ai
+    class broker,envoy,registrations,virtual gw
+    class keycloak,authorino authStyle
+    class builtin,custom server
+    class browse catalogStyle
+    class operator lifecycleStyle
+    class oai,gateway,auth,servers,catalog,lifecycle group
