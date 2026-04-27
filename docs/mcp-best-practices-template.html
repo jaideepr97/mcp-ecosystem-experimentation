@@ -1,0 +1,122 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<title>MCP Ecosystem Best Practices Document</title>
+<style>
+  body { font-family: Arial, sans-serif; max-width: 800px; margin: 40px auto; padding: 0 20px; }
+  h1 { font-size: 24pt; }
+  h2 { font-size: 18pt; margin-top: 36px; }
+  h3 { font-size: 14pt; margin-top: 24px; }
+</style>
+</head>
+<body>
+
+<h1>MCP Ecosystem Best Practices Document</h1>
+
+<h2>1. Value Proposition &amp; Motivation</h2>
+
+<h3>1.1 What MCP Is and Why It Matters for AI Workflows</h3>
+
+<h3>1.2 How MCP Fits Into Agent-Based and Tool-Enabled AI Workflows</h3>
+
+<h3>1.3 Value of the Ecosystem vs. Doing It Without</h3>
+
+<h3>1.4 Problems the Ecosystem Solves</h3>
+
+<h2>2. MCP Ecosystem Architecture Overview</h2>
+
+<h3>2.1 High-Level Architecture and Component Interactions</h3>
+
+<h3>2.2 Role of Each Component: MCP Catalog, MCP Deployment, MCP Gateway, Gen AI Studio</h3>
+
+<h3>2.3 End-to-End Flow: Catalog → Deploy → Gateway → Consume</h3>
+
+<h3>2.4 MCP Servers as Standard OpenShift Workloads</h3>
+
+<h2>3. Personas &amp; Responsibilities</h2>
+
+<h3>3.1 Platform Engineer / AI Ops / AI Officer Persona</h3>
+
+<h3>3.2 AI Engineer / Practitioner Persona</h3>
+
+<h3>3.3 Separation of Deployer vs. Consumer Roles</h3>
+
+<h2>4. Supported Workflows</h2>
+
+<h3>4.1 Discovering MCP Servers via the MCP Catalog</h3>
+
+<h3>4.2 Deploying MCP Servers onto OpenShift</h3>
+
+<h3>4.3 Registering MCP Servers with the MCP Gateway</h3>
+
+<h3>4.4 Creating and Using Virtual MCP Servers</h3>
+
+<h3>4.5 Consuming MCP Capabilities in Gen AI Studio / Playground</h3>
+
+<h3>4.6 Bringing Your Own MCP Server</h3>
+
+<h2>5. MCP Gateway Integration</h2>
+
+<h3>5.1 Purpose of the MCP Gateway in the Ecosystem</h3>
+
+<h3>5.2 Registration and Exposure of MCP Servers</h3>
+
+<h3>5.3 Virtual MCP Server Concepts and Usage</h3>
+
+<h3>5.4 Authentication and Authorization via Authorino</h3>
+
+<h3>5.5 Observability and Cross-Cutting Controls</h3>
+
+<h3>5.6 Policy and Access Control</h3>
+
+<h2>6. Best Practices &amp; Constraints</h2>
+
+<h3>6.1 HTTP-Based MCP Servers Only</h3>
+
+<h3>6.2 Guidance Against stdio-Based MCP Servers</h3>
+
+<h3>6.3 Security Considerations and Recommended Patterns</h3>
+
+<h3>6.4 Observability Considerations</h3>
+
+<h3>6.5 Compliance Considerations for Enterprise and Regulated Environments</h3>
+
+<h3>6.6 Constraints and Gotchas</h3>
+
+<h3>6.7 Guidance Against Unsupported or Non-Recommended Patterns</h3>
+
+<h2>7. MVP Scope &amp; Explicit Non-Goals</h2>
+
+<h3>7.1 What the MVP Delivers and Its Intended Audience</h3>
+
+<h3>7.2 Non-Goal: Full Lifecycle Management</h3>
+
+<h3>7.3 Non-Goal: Dedicated MCP Registry</h3>
+
+<h3>7.4 Non-Goal: stdio-Based MCP Server Support</h3>
+
+<h3>7.5 Non-Goal: Advanced Multi-Gateway / Per-Namespace Abstractions</h3>
+
+<h3>7.6 Non-Goal: Perfect Persona Separation or Final UX Polish</h3>
+
+<h2>8. Bring Your Own MCP Server</h2>
+
+<h3>8.1 Packaging a Custom MCP Server as a Container Image</h3>
+
+<h3>8.2 Requirements and Conventions</h3>
+
+<h3>8.3 Deploy, Register, and Make Available</h3>
+
+<h3>8.4 Integration with Catalog / Discovery</h3>
+
+<h2>9. Future Direction</h2>
+
+<h3>9.1 Intentionally Deferred Items</h3>
+
+<h3>9.2 How the MVP Fits Into the Longer-Term Roadmap</h3>
+
+<h3>9.3 Guidance for Scaling Beyond the Summit MVP</h3>
+
+</body>
+</html>

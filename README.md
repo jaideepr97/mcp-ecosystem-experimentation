@@ -4,6 +4,13 @@ A reproducible experiment exploring how MCP ecosystem projects work together end
 
 Powered heavily by Claude Code
 
+## Demos
+
+| Video | Persona | Description |
+|-------|---------|-------------|
+| [MCP Ecosystem Setup](https://youtu.be/ncwSVtc_6Qo) | Platform Engineer | Infrastructure setup: operators, Keycloak, MCP Gateway, lifecycle operator, Vault |
+| [MCP Ecosystem Usage](https://youtu.be/Fb3GXLJxfyQ) | Platform Engineer + AI Engineer | End-to-end demo: deploy MCP servers, configure auth, consume tools in Gen AI Studio |
+
 ## Overview
 
 ```

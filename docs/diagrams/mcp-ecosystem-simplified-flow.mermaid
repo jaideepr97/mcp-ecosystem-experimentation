@@ -1,0 +1,53 @@
+%%{ init: { 'theme': 'base', 'sequence': { 'mirrorActors': false } } }%%
+
+sequenceDiagram
+    actor U as AI Engineer
+    participant Cat as MCP Catalog
+    participant Op as Lifecycle Operator
+    participant S as MCP Server
+    participant GW as MCP Gateway
+    participant KC as Keycloak
+    participant AU as Authorino
+    participant P as Gen AI Studio
+    participant LS as Llama Stack
+    participant LLM as vLLM
+
+    Note over U,LLM: Phase 1 — Discover & Deploy
+
+    U->>Cat: Browse available MCP servers
+    Cat-->>U: Server list (capabilities, transport, metadata)
+    U->>Cat: Select server to deploy
+    Cat->>Op: Deploy request
+    Op->>S: Deploy server on OpenShift
+    Op->>GW: Register server with gateway
+    GW-->>Op: Registration confirmed
+
+    Note over U,LLM: Phase 2 — Authenticate
+
+    U->>KC: Authenticate (obtain JWT)
+    KC-->>U: Access token (roles: mcp-user, mcp-admin)
+
+    Note over U,LLM: Phase 3 — Consume via Gen AI Studio
+
+    U->>P: "What pods are running?"
+    P->>LS: Chat request + available tools
+    LS->>LLM: Inference request (prompt + tool definitions)
+    LLM-->>LS: Tool call: pods_list_in_namespace
+
+    Note over U,LLM: Phase 4 — Gateway Routes Tool Call
+
+    LS->>GW: MCP tools/call (Bearer token)
+    GW->>AU: Auth check (JWT)
+    AU->>KC: Validate token + roles
+    KC-->>AU: Valid
+    AU-->>GW: Authorized
+    GW->>S: Dispatch tool call
+    S-->>GW: Tool result
+    GW-->>LS: Tool result
+
+    Note over U,LLM: Phase 5 — AI Responds
+
+    LS->>LLM: Tool result + original prompt
+    LLM-->>LS: Natural language response
+    LS-->>P: Response
+    P-->>U: "There are 5 pods running..."

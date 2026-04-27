@@ -1034,8 +1034,6 @@ The following capabilities are intentionally deferred from the Summit MVP. They 
 
 | Capability | Description | Status |
 |-----------|-------------|--------|
-| **MCP Catalog UI** | Browsable catalog of MCP servers integrated into the RHOAI Dashboard | Pending `mcpCatalog` feature flag in a future RHOAI release |
-| **Identity-aware tool filtering** | Broker-side filtering of `tools/list` based on user identity, eliminating the need for VirtualMCPServer selection | Requires gateway Auth Phase 2 |
 | **Advanced authorization (OPA/SpiceDB)** | Policy engines beyond CEL pattern matching for complex authorization rules | Out of scope for MVP |
 | **Multi-cluster deployment** | ACM-managed MCP Gateway deployments across multiple clusters with DNSPolicy | Out of scope for MVP |
 | **Registry and lifecycle management** | Automated MCP server lifecycle: versioning, update policies, health-based deregistration | Out of scope for MVP |
@@ -1108,3 +1106,130 @@ Maximum autonomy. The AI team owns the entire namespace — gateway, servers, au
 **When to use**: Large, autonomous AI/ML platform teams with Kubernetes expertise. "Namespace-as-a-service" model.
 
 **Trade-off**: Higher autonomy, higher required expertise. The AI team must understand AuthPolicies, Vault integration, and VirtualMCPServers.
+
+---
+
+## Appendix: Rubric Evaluation
+
+Evaluated against the consolidated rubric derived from RHAISTRAT-1101, RHAISTRAT-1149, RHAIENG-3831, RHAIENG-3832, plus additional requirements. See `mcp-best-practices-rubric.md` for the full rubric definition.
+
+### Summary Scorecard
+
+| Section | Total Items | Covered | Partial | Missing |
+|---------|------------|---------|---------|---------|
+| 1. Value Proposition & Motivation | 4 | 2 | 2 | 0 |
+| 2. Architecture Overview | 4 | 4 | 0 | 0 |
+| 3. Personas & Responsibilities | 3 | 3 | 0 | 0 |
+| 4. Supported Workflows | 6 | 4 | 2 | 0 |
+| 5. Gateway Integration | 6 | 6 | 0 | 0 |
+| 6. Best Practices & Constraints | 7 | 6 | 1 | 0 |
+| 7. MVP Scope & Non-Goals | 6 | 3 | 2 | 1 |
+| 8. Bring Your Own MCP Server | 4 | 1 | 2 | 1 |
+| 9. Future Direction | 3 | 2 | 1 | 0 |
+| **TOTAL** | **43** | **31** | **10** | **2** |
+
+### Detailed Findings
+
+#### 1. Value Proposition & Motivation
+
+| # | Requirement | Status | Notes |
+|---|------------|--------|-------|
+| 1.1 | What MCP is and why it matters | **Covered** | "What Is MCP?" section clearly explains the protocol and its value. |
+| 1.2 | How MCP fits into agent-based AI workflows | **Covered** | "How MCP Fits Into Agent-Based AI Workflows" walks through a concrete interaction flow. |
+| 1.3 | Value of ecosystem vs. doing it without | **Partial** | The Gateway section briefly mentions "Without the gateway, each MCP server would need its own endpoint..." but there is no dedicated section articulating the full value proposition of the ecosystem as a whole vs. ad-hoc management. Benefits are implicit throughout but never stated head-on for a customer audience. |
+| 1.4 | Problems the ecosystem solves | **Partial** | Fragmentation is hinted at in the Gateway purpose section, but the document doesn't explicitly frame the problems (ad-hoc deployments, static ConfigMaps, fragmented tooling — per RHAISTRAT-1101's problem statement) as a cohesive narrative. |
+
+#### 2. Architecture Overview
+
+| # | Requirement | Status | Notes |
+|---|------------|--------|-------|
+| 2.1 | High-level architecture and component interaction | **Covered** | ASCII diagram + Component Roles table + linked Mermaid diagrams. |
+| 2.2 | Role of each component | **Covered** | Component Roles table covers all four core components plus supporting ones. |
+| 2.3 | End-to-end flow | **Covered** | Workflow sections walk through the full lifecycle. |
+| 2.4 | MCP servers as standard OpenShift workloads | **Covered** | Workflow 1 explicitly states "standard Kubernetes workloads" with Deployment+Service YAML. |
+
+#### 3. Personas & Responsibilities
+
+| # | Requirement | Status | Notes |
+|---|------------|--------|-------|
+| 3.1 | Platform Engineer persona | **Covered** | Detailed section with bullet-point responsibilities. |
+| 3.2 | AI Engineer persona | **Covered** | Clearly describes the consumption-only experience. |
+| 3.3 | Clear deployer vs. consumer separation | **Covered** | Responsibility Matrix draws a clear line. Deployment patterns reinforce across maturity levels. |
+
+#### 4. Supported Workflows
+
+| # | Requirement | Status | Notes |
+|---|------------|--------|-------|
+| 4.1 | Discovering MCP servers via Catalog | **Partial** | Catalog is mentioned as a component and acknowledged as lacking a UI (Known Limitations), but there is no dedicated discovery workflow. The document jumps straight to deployment. |
+| 4.2 | Deploying MCP servers onto OpenShift | **Covered** | Workflow 1 is very detailed with two deployment options and full YAML examples. |
+| 4.3 | Registering with the MCP Gateway | **Covered** | Workflow 2 covers HTTPRoute + MCPServerRegistration with verification steps. |
+| 4.4 | Creating and using virtual MCP servers | **Covered** | Workflow 4 covers creation, selection, and the "presentation only" caveat. |
+| 4.5 | Consuming in Gen AI Studio | **Covered** | Workflow 5 covers ConfigMap registration, auth token, and natural language consumption. |
+| 4.6 | Bringing your own MCP server | **Partial** | The building blocks exist across Workflows 1, 2, and 5 and the generic Deployment YAML covers any container image, but there is no consolidated "Bring Your Own Server" guide. A customer would need to stitch together three separate workflows. |
+
+#### 5. Gateway Integration
+
+| # | Requirement | Status | Notes |
+|---|------------|--------|-------|
+| 5.1 | Purpose of the MCP Gateway | **Covered** | Clearly states the three problems it solves (aggregation, routing, policy). |
+| 5.2 | Registration and exposure | **Covered** | Workflow 2 + Gateway section with cross-references. |
+| 5.3 | Virtual MCP server concepts | **Covered** | Workflow 4 + Gateway section. |
+| 5.4 | Authentication and authorization via Authorino | **Covered** | Workflow 3 covers Keycloak + Authorino + AuthPolicy in detail with YAML. |
+| 5.5 | Observability and cross-cutting controls | **Covered** | Observability section covers available touchpoints (broker logs, AuthPolicy enforcement, MCPServerRegistration status). Full-spectrum observability (MLFlow, Prometheus dashboards, distributed tracing) is out of scope for this effort. |
+| 5.6 | High-level policy and access control | **Covered** | "Policy and Access Control" section covers the three-layer model with RateLimitPolicy example. |
+
+#### 6. Best Practices & Constraints
+
+| # | Requirement | Status | Notes |
+|---|------------|--------|-------|
+| 6.1 | HTTP-based MCP servers only | **Covered** | MCP Server Requirements item 1 explains HTTP-only and why stdio doesn't work. |
+| 6.2 | Explicit guidance against stdio | **Covered** | "Do not deploy stdio-based servers" with reasoning. |
+| 6.3 | Security considerations | **Covered** | Security Considerations has 8 detailed recommendations. |
+| 6.4 | Observability considerations | **Covered** | Mentions available log sources and status checks. Full monitoring/tracing guidance is out of scope for this effort. |
+| 6.5 | Compliance considerations | **Partial** | Compliance is touched on in deployment patterns ("SOC2, HIPAA, FedRAMP") and audit logging, but no dedicated compliance section. No discussion of data residency, audit requirements, or how to satisfy specific frameworks. |
+| 6.6 | Constraints and gotchas | **Covered** | Known Limitations table covers 6 specific gotchas with impact and workarounds. |
+| 6.7 | Guidance against unsupported patterns | **Covered** | Multiple explicit callouts throughout. |
+
+#### 7. MVP Scope & Non-Goals
+
+| # | Requirement | Status | Notes |
+|---|------------|--------|-------|
+| 7.1 | What the MVP delivers and intended audience | **Partial** | Document overview mentions Summit readiness and experimentation, but does not explicitly frame this as an MVP optimized for "Summit demos, hands-on experimentation, early customer and field enablement" per RHAISTRAT-1101. |
+| 7.2 | Non-goal: full lifecycle management | **Covered** | Future Direction table lists this as out of scope. |
+| 7.3 | Non-goal: dedicated MCP Registry | **Covered** | Future Direction table covers this. |
+| 7.4 | Non-goal: stdio support | **Covered** | Covered extensively in best practices and constraints. |
+| 7.5 | Non-goal: advanced multi-gateway abstractions | **Partial** | Multi-cluster is listed as out of scope in Future Direction, but multi-gateway / per-namespace abstraction limitations are not explicitly called out as a non-goal. The namespace isolation section actually discusses this as a supported pattern. |
+| 7.6 | Non-goal: perfect persona separation or UX polish | **Missing** | Not mentioned. The document doesn't acknowledge that persona separation is imperfect in the MVP or that UX polish is deferred. |
+
+#### 8. Bring Your Own MCP Server
+
+| # | Requirement | Status | Notes |
+|---|------------|--------|-------|
+| 8.1 | Packaging a custom MCP server as a container image | **Partial** | The generic Deployment YAML shows how to deploy any image, but no guidance on packaging — Dockerfile conventions, base image recommendations, OpenShift restricted SCC compatibility, or going from "I have a Python/Node MCP server" to "I have a container image." |
+| 8.2 | Requirements and conventions the server must follow | **Covered** | MCP Server Requirements cover HTTP, binding, non-root, health checks, and credential headers. |
+| 8.3 | Steps to deploy, register, and make consumable | **Partial** | Building blocks exist across Workflows 1, 2, and 5 but no consolidated end-to-end BYOS guide. |
+| 8.4 | Integration with catalog / discovery | **Missing** | No guidance on how a custom server appears (or doesn't) in the MCP Catalog or what metadata to provide. |
+
+#### 9. Future Direction
+
+| # | Requirement | Status | Notes |
+|---|------------|--------|-------|
+| 9.1 | What is intentionally deferred | **Covered** | Future Direction table lists 9 deferred capabilities with descriptions and status. |
+| 9.2 | How MVP fits into longer-term roadmap | **Covered** | "How the MVP Fits Into the Longer-Term Roadmap" explains foundational patterns and forward compatibility. |
+| 9.3 | Guidance for scaling beyond Summit MVP | **Partial** | Deployment patterns give organizational scaling guidance (Platform-Managed → Self-Service → Catalog-Driven → Namespace Admin), but no explicit section on technical scaling — many MCP servers, high request volume, HA requirements, multi-replica brokers, etc. |
+
+### Priority Gaps to Address
+
+**Missing (2 items):**
+1. **7.6** — Acknowledge imperfect persona separation and deferred UX polish as explicit MVP non-goals.
+2. **8.4** — Explain how (or whether) a customer's own MCP server integrates with the Catalog for discovery.
+
+**High-impact Partial items:**
+3. **1.3 + 1.4** — Add a dedicated "Why Use the MCP Ecosystem?" section that makes the value proposition explicit and frames the problems it solves.
+4. **4.6 + 8.1 + 8.3** — Add a consolidated "Bring Your Own MCP Server" workflow covering packaging, deployment, registration, and consumption end-to-end.
+5. **4.1** — Add a discovery workflow (even if brief) that explains how users find available MCP servers today and what the Catalog experience will look like.
+6. **6.5** — Add compliance guidance for regulated environments beyond name-dropping frameworks.
+7. **9.3** — Add technical scaling guidance for production deployments beyond the MVP.
+
+**Out of scope (noted in rubric):**
+- Full-spectrum observability (MLFlow, Prometheus dashboards, distributed tracing, Grafana integration) — may be a separate follow-up effort.
